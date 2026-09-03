@@ -20,6 +20,8 @@ from opd_tools.generate_eval import (
     _verify_shard,
     _write_shard,
     cleanup_stale_atomic_files,
+    expected_engine_mode,
+    expected_sampling_source,
     native_soft_diagnostics,
 )
 
@@ -54,6 +56,24 @@ def generation_record(**overrides):
 
 
 class EvaluationFormulaTests(unittest.TestCase):
+    def test_mode_specific_upstream_sampler_provenance(self):
+        self.assertEqual(
+            expected_sampling_source("native_soft", "released_anchor"),
+            "Soft-Thinking+noise+loss-main/run_sample_gumbel_raw.sh",
+        )
+        self.assertEqual(
+            expected_sampling_source("hard_token", "released_anchor"),
+            "Soft-Thinking+noise+loss-main/run_sample_discrete-token_raw.sh",
+        )
+        self.assertEqual(
+            expected_engine_mode("native_soft"),
+            {"enable_soft_thinking": True, "add_noise_gumbel_softmax": True},
+        )
+        self.assertEqual(
+            expected_engine_mode("hard_token"),
+            {"enable_soft_thinking": False, "add_noise_gumbel_softmax": False},
+        )
+
     def test_locked_common_seed_inventory(self):
         self.assertEqual(COMMON_GENERATION_SEEDS, tuple(range(11, 43)))
         self.assertEqual(HARD_TOKEN_GENERATION_SEEDS, (11,))

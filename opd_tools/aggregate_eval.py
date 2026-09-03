@@ -38,7 +38,15 @@ from .evaluation import (
     graders_for_benchmark,
     paired_bootstrap_difference,
 )
-from .generate_eval import _atomic_write, _canonical_json, _verify_shard
+from .generate_eval import (
+    EVALUATION_SAMPLING_PROTOCOLS,
+    GENERATION_IMPLEMENTATION,
+    _atomic_write,
+    _canonical_json,
+    _verify_shard,
+    expected_engine_mode,
+    expected_sampling_source,
+)
 from .graders import grade_gsm8k_interfaces, math_verify_full_response_grade
 from .manifest import file_sha256
 
@@ -201,6 +209,7 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
     by_model: Dict[str, set[str]] = defaultdict(set)
     for item in generation_manifests:
         content = item["content"]
+        sampling_protocol = content.get("sampling_protocol")
         expected_seeds = (
             list(COMMON_GENERATION_SEEDS)
             if content["mode"] == "native_soft"
@@ -208,6 +217,17 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
         )
         if content.get("generation_seeds") != expected_seeds:
             raise ValueError("generation manifest has the wrong common seed set")
+        if (
+            sampling_protocol not in EVALUATION_SAMPLING_PROTOCOLS
+            or content.get("sampling")
+            != EVALUATION_SAMPLING_PROTOCOLS[sampling_protocol]
+            or content.get("sampling_source")
+            != expected_sampling_source(content["mode"], sampling_protocol)
+            or content.get("generation_implementation")
+            != GENERATION_IMPLEMENTATION
+            or content.get("engine_mode") != expected_engine_mode(content["mode"])
+        ):
+            raise ValueError("generation manifest sampler provenance differs")
         model = content.get("model")
         if not isinstance(model, Mapping) or not isinstance(
             model.get("tree_sha256"), str

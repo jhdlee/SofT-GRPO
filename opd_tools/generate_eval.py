@@ -75,6 +75,39 @@ EVALUATION_SAMPLING_PROTOCOLS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+GENERATION_IMPLEMENTATION = (
+    "Soft-Thinking+noise+loss-main/sglang_soft_thinking_pkg/python/sglang"
+)
+
+
+def expected_sampling_source(mode: str, sampling_protocol: str) -> str:
+    """Return the exact upstream launcher represented by an evaluation mode."""
+
+    if mode not in INFERENCE_MODES:
+        raise ValueError("unsupported inference mode: %r" % mode)
+    if sampling_protocol not in EVALUATION_SAMPLING_PROTOCOLS:
+        raise ValueError("unsupported evaluation sampling protocol: %r" % sampling_protocol)
+    if sampling_protocol == "training_matched":
+        return "seed-11 training configuration"
+    filename = (
+        "run_sample_gumbel_raw.sh"
+        if mode == "native_soft"
+        else "run_sample_discrete-token_raw.sh"
+    )
+    return "Soft-Thinking+noise+loss-main/%s" % filename
+
+
+def expected_engine_mode(mode: str) -> Dict[str, bool]:
+    """Manifest the flags that distinguish native-soft and hard sampling."""
+
+    if mode not in INFERENCE_MODES:
+        raise ValueError("unsupported inference mode: %r" % mode)
+    native_soft = mode == "native_soft"
+    return {
+        "enable_soft_thinking": native_soft,
+        "add_noise_gumbel_softmax": native_soft,
+    }
+
 
 _ATOMIC_TEMP_RE = re.compile(
     r"^[.](?:seed_[0-9]+[.](?:jsonl|manifest[.]json)|generation_manifest[.]json)"
@@ -487,14 +520,11 @@ def run(args: argparse.Namespace) -> None:
         "evaluation_protocol": EVALUATION_PROTOCOL,
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "softgrpo_upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
-        "generation_implementation": (
-            "Soft-Thinking+noise+loss-main/sglang_soft_thinking_pkg/python/sglang"
+        "generation_implementation": GENERATION_IMPLEMENTATION,
+        "sampling_source": expected_sampling_source(
+            args.mode, args.sampling_protocol
         ),
-        "sampling_source": (
-            "Soft-Thinking+noise+loss-main/run_sample_gumbel_raw.sh"
-            if args.sampling_protocol == "released_anchor"
-            else "seed-11 training configuration"
-        ),
+        "engine_mode": expected_engine_mode(args.mode),
         "model_label": args.model_label,
         "model": model,
         "mode": args.mode,
