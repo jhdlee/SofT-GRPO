@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .icl import (
-    BENCHMARKS,
     CORE_CONDITIONS,
     ICLMatrixCell,
-    PROMPT_CONDITIONS,
+    STUDY_BENCHMARKS,
+    SUPPORTED_CORE_CONDITIONS,
     build_icl_matrix,
     load_icl_dataset,
     materialize_prompts,
@@ -142,7 +142,7 @@ def _cell_prompts(
     ]
     selected_ids: Sequence[str] | None = (
         None
-        if cell.condition in CORE_CONDITIONS
+        if cell.condition in SUPPORTED_CORE_CONDITIONS
         else mechanism_ids[cell.benchmark]
     )
     eligible = benchmark_examples
@@ -342,6 +342,16 @@ def run_generate(args: argparse.Namespace) -> None:
     settings = SamplingSettings()
     context_length = required_context_length(tokenizer, all_rendered, settings)
     model_config = AutoConfig.from_pretrained(str(model_path), local_files_only=True)
+    key_value_heads = int(
+        getattr(model_config, "num_key_value_heads", 0)
+        or getattr(model_config, "num_attention_heads", 0)
+        or 0
+    )
+    if key_value_heads and key_value_heads % args.tensor_parallel_size:
+        raise RuntimeError(
+            "tensor parallel size %d does not divide %d key/value heads"
+            % (args.tensor_parallel_size, key_value_heads)
+        )
     maximum = int(getattr(model_config, "max_position_embeddings", 0) or 0)
     if maximum and context_length > maximum:
         raise RuntimeError(
@@ -350,7 +360,7 @@ def run_generate(args: argparse.Namespace) -> None:
             % (settings.max_new_tokens, context_length, maximum)
         )
     config = {
-        "protocol": "opd-softgrpo-native-soft-icl-generation-v2-32768",
+        "protocol": "opd-softgrpo-native-soft-icl-generation-v3-math-aime-matched",
         "source_provenance": source_provenance(),
         "asset_manifest_sha256": assets["content_sha256"],
         "data_manifest_sha256": data_manifest["content_sha256"],
@@ -358,7 +368,12 @@ def run_generate(args: argparse.Namespace) -> None:
         "model_tree_sha256": assets["models"][args.model]["tree_sha256"],
         "mode": args.mode,
         "smoke": bool(args.smoke),
-        "num_gpus": args.num_gpus,
+        "parallelism": {
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "data_parallel_size": args.data_parallel_size,
+            "world_size": args.tensor_parallel_size * args.data_parallel_size,
+            "load_balance_method": "round_robin",
+        },
         "chunk_size": args.chunk_size,
         "max_running_requests": args.max_running_requests,
         "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -389,16 +404,23 @@ def run_generate(args: argparse.Namespace) -> None:
         engine = ReleasedSofTGRPOEngine(
             model_path=str(model_path),
             mode=args.mode,
-            num_gpus=args.num_gpus,
+            tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=args.data_parallel_size,
             context_length=context_length,
             settings=settings,
             max_running_requests=args.max_running_requests,
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
         for cell, _, prompts, rendered in cell_payloads:
-            for sample_index in range(cell.sample_count):
-                for chunk_index, start in enumerate(range(0, len(prompts), args.chunk_size)):
-                    stop = min(start + args.chunk_size, len(prompts))
+            # Keep all common-random-number samples for a prompt chunk adjacent
+            # so each data-parallel replica can reuse the long ICL prefix in its
+            # radix cache. Chunk identities and request seeds remain unchanged.
+            for chunk_index, start in enumerate(
+                range(0, len(prompts), args.chunk_size)
+            ):
+                stop = min(start + args.chunk_size, len(prompts))
+                chunk_prompts = prompts[start:stop]
+                for sample_index in range(cell.sample_count):
                     key = "%s/%s/%s/%s/sample_%02d/chunk_%05d" % (
                         args.model,
                         args.mode,
@@ -407,7 +429,6 @@ def run_generate(args: argparse.Namespace) -> None:
                         sample_index,
                         chunk_index,
                     )
-                    chunk_prompts = prompts[start:stop]
                     identity = {
                         "generation_manifest_sha256": hashlib.sha256(
                             canonical_json_bytes(config)
@@ -1042,8 +1063,17 @@ def _comparison_rows(
         return []
     result = []
 
+    def boundary_gate_valid(
+        key: tuple[str, str, str, str], state: Mapping[str, Any]
+    ) -> bool:
+        if key[1] != "native_soft":
+            return True
+        return state["capped_or_all_soft"] / state["count"] <= 0.05
+
     def compare(key_t: tuple[str, str, str, str], key_c: tuple[str, str, str, str], name: str) -> None:
         treatment, control = states[key_t], states[key_c]
+        treatment_gate = boundary_gate_valid(key_t, treatment)
+        control_gate = boundary_gate_valid(key_c, control)
         common_graders = sorted(set(treatment["outcomes"]) & set(control["outcomes"]))
         for grader in common_graders:
             bootstrap = paired_bootstrap_difference(
@@ -1060,6 +1090,9 @@ def _comparison_rows(
                     "benchmark": key_t[2],
                     "grader": grader,
                     "estimand": "pass_at_1",
+                    "treatment_boundary_gate_valid": treatment_gate,
+                    "control_boundary_gate_valid": control_gate,
+                    "comparison_boundary_gate_valid": treatment_gate and control_gate,
                     **bootstrap,
                     **rescue,
                 }
@@ -1077,6 +1110,10 @@ def _comparison_rows(
                         "benchmark": key_t[2],
                         "grader": grader,
                         "estimand": "pass_at_8",
+                        "treatment_boundary_gate_valid": treatment_gate,
+                        "control_boundary_gate_valid": control_gate,
+                        "comparison_boundary_gate_valid": treatment_gate
+                        and control_gate,
                         **pass8_bootstrap,
                     }
                 )
@@ -1086,111 +1123,67 @@ def _comparison_rows(
         for family in ("sdft", "sdpg"):
             matched = (model, mode, benchmark, family + "_matched")
             no_demo = (model, mode, benchmark, "no_demo")
-            shuffled = (model, mode, benchmark, family + "_shuffled")
             compare(matched, no_demo, family + "_matched_minus_no_demo")
-            compare(matched, shuffled, family + "_matched_minus_shuffled")
         compare(
             (model, mode, benchmark, "sdft_matched"),
             (model, mode, benchmark, "sdpg_matched"),
             "sdft_matched_minus_sdpg_matched",
         )
 
-    # Mechanism controls use fixed subsets. Restrict the full matched arm to
-    # exactly the control IDs before any paired estimand is computed.
-    for model in ("starting", "softgrpo"):
-        for benchmark in BENCHMARKS:
-            for family in ("sdft", "sdpg"):
-                matched = states[(model, "native_soft", benchmark, family + "_matched")]
-                for control_suffix in ("answer_only", "rationale_only"):
-                    control = states[(model, "native_soft", benchmark, family + "_" + control_suffix)]
-                    for grader in _graders(benchmark):
-                        treatment_pass = _example_pass1(matched, grader)
-                        control_pass = _example_pass1(control, grader)
-                        subset_ids = set(control_pass)
-                        if not subset_ids or not subset_ids.issubset(treatment_pass):
-                            raise RuntimeError("mechanism controls are not a subset of matched ICL")
-                        restricted_pass = {key: treatment_pass[key] for key in subset_ids}
-                        treatment_outcomes = _outcome_vectors(matched, grader)
-                        control_outcomes = _outcome_vectors(control, grader)
-                        restricted_outcomes = {
-                            key: treatment_outcomes[key] for key in subset_ids
-                        }
-                        bootstrap = paired_bootstrap_difference(
-                            restricted_pass, control_pass
-                        )
-                        rescue = rescue_harm_rates(
-                            restricted_outcomes, control_outcomes
-                        )
-                        result.append(
-                            {
-                                "comparison": "%s_matched_minus_%s"
-                                % (family, control_suffix),
-                                "model_label": model,
-                                "inference_mode": "native_soft",
-                                "benchmark": benchmark,
-                                "grader": grader,
-                                "estimand": "pass_at_1",
-                                **bootstrap,
-                                **rescue,
-                            }
-                        )
-                        treatment_pass8 = _example_pass8(matched, grader)
-                        control_pass8 = _example_pass8(control, grader)
-                        restricted_pass8 = {
-                            key: treatment_pass8[key] for key in subset_ids
-                        }
-                        pass8_bootstrap = paired_bootstrap_difference(
-                            restricted_pass8,
-                            control_pass8,
-                        )
-                        result.append(
-                            {
-                                "comparison": "%s_matched_minus_%s"
-                                % (family, control_suffix),
-                                "model_label": model,
-                                "inference_mode": "native_soft",
-                                "benchmark": benchmark,
-                                "grader": grader,
-                                "estimand": "pass_at_8",
-                                **pass8_bootstrap,
-                            }
-                        )
-
-    for benchmark in BENCHMARKS:
+    for benchmark in STUDY_BENCHMARKS:
         for family in ("sdft", "sdpg"):
-            for control_condition, control_label in (
-                ("no_demo", "no_demo"),
-                (family + "_shuffled", "shuffled"),
-            ):
-                post_t = states[("softgrpo", "native_soft", benchmark, family + "_matched")]
-                post_c = states[("softgrpo", "native_soft", benchmark, control_condition)]
-                start_t = states[("starting", "native_soft", benchmark, family + "_matched")]
-                start_c = states[("starting", "native_soft", benchmark, control_condition)]
-                for grader in _graders(benchmark):
-                    for estimand, extractor in (
-                        ("pass_at_1", _example_pass1),
-                        ("pass_at_8", _example_pass8),
-                    ):
-                        bootstrap = paired_bootstrap_difference_in_differences(
-                            extractor(post_t, grader),
-                            extractor(post_c, grader),
-                            extractor(start_t, grader),
-                            extractor(start_c, grader),
-                        )
-                        result.append(
-                            {
-                                "comparison": (
-                                    "post_minus_start_%s_matched_minus_%s"
-                                    % (family, control_label)
-                                ),
-                                "model_label": "difference_in_differences",
-                                "inference_mode": "native_soft",
-                                "benchmark": benchmark,
-                                "grader": grader,
-                                "estimand": estimand,
-                                **bootstrap,
-                            }
-                        )
+            post_t = states[("softgrpo", "native_soft", benchmark, family + "_matched")]
+            post_c = states[("softgrpo", "native_soft", benchmark, "no_demo")]
+            start_t = states[("starting", "native_soft", benchmark, family + "_matched")]
+            start_c = states[("starting", "native_soft", benchmark, "no_demo")]
+            post_t_gate = boundary_gate_valid(
+                ("softgrpo", "native_soft", benchmark, family + "_matched"),
+                post_t,
+            )
+            post_c_gate = boundary_gate_valid(
+                ("softgrpo", "native_soft", benchmark, "no_demo"), post_c
+            )
+            start_t_gate = boundary_gate_valid(
+                ("starting", "native_soft", benchmark, family + "_matched"),
+                start_t,
+            )
+            start_c_gate = boundary_gate_valid(
+                ("starting", "native_soft", benchmark, "no_demo"), start_c
+            )
+            for grader in _graders(benchmark):
+                for estimand, extractor in (
+                    ("pass_at_1", _example_pass1),
+                    ("pass_at_8", _example_pass8),
+                ):
+                    bootstrap = paired_bootstrap_difference_in_differences(
+                        extractor(post_t, grader),
+                        extractor(post_c, grader),
+                        extractor(start_t, grader),
+                        extractor(start_c, grader),
+                    )
+                    contrast_definition = bootstrap.pop("estimand")
+                    result.append(
+                        {
+                            "comparison": (
+                                "post_minus_start_%s_matched_minus_no_demo"
+                                % family
+                            ),
+                            "model_label": "difference_in_differences",
+                            "inference_mode": "native_soft",
+                            "benchmark": benchmark,
+                            "grader": grader,
+                            "estimand": estimand,
+                            "contrast_definition": contrast_definition,
+                            "post_treatment_boundary_gate_valid": post_t_gate,
+                            "post_control_boundary_gate_valid": post_c_gate,
+                            "start_treatment_boundary_gate_valid": start_t_gate,
+                            "start_control_boundary_gate_valid": start_c_gate,
+                            "comparison_boundary_gate_valid": all(
+                                (post_t_gate, post_c_gate, start_t_gate, start_c_gate)
+                            ),
+                            **bootstrap,
+                        }
+                    )
     return result
 
 
@@ -1518,7 +1511,20 @@ def _flatten_wandb(
             row["grader"],
             row["estimand"],
         )
-        for name in ("difference", "ci_low", "ci_high", "rescue_rate", "harm_rate"):
+        for name in (
+            "difference",
+            "ci_low",
+            "ci_high",
+            "rescue_rate",
+            "harm_rate",
+            "treatment_boundary_gate_valid",
+            "control_boundary_gate_valid",
+            "post_treatment_boundary_gate_valid",
+            "post_control_boundary_gate_valid",
+            "start_treatment_boundary_gate_valid",
+            "start_control_boundary_gate_valid",
+            "comparison_boundary_gate_valid",
+        ):
             if (
                 name in row
                 and isinstance(row[name], (int, float))
@@ -1546,7 +1552,6 @@ def _from_getgo_assessment(
     metrics: Sequence[Mapping[str, Any]],
     diagnostics: Sequence[Mapping[str, Any]],
     comparisons: Sequence[Mapping[str, Any]],
-    replay: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     metric_index = {
         (
@@ -1573,51 +1578,45 @@ def _from_getgo_assessment(
         ): row
         for row in comparisons
     }
-    replay_index = {
-        (row["model_label"], row["benchmark"], row["condition"]): row
-        for row in replay
-    }
     result = []
-    for benchmark in BENCHMARKS:
+    for benchmark in STUDY_BENCHMARKS:
         for family in ("sdft", "sdpg"):
             condition = family + "_matched"
             metric = metric_index[("starting", "native_soft", benchmark, condition, "math_verify")]
-            diagnostic = diagnostic_index[("starting", "native_soft", benchmark, condition)]
+            matched_diagnostic = diagnostic_index[
+                ("starting", "native_soft", benchmark, condition)
+            ]
+            no_demo_diagnostic = diagnostic_index[
+                ("starting", "native_soft", benchmark, "no_demo")
+            ]
             comparison = comparison_index[
                 (
                     "starting",
                     "native_soft",
                     benchmark,
-                    family + "_matched_minus_shuffled",
+                    family + "_matched_minus_no_demo",
                     "math_verify",
                     "pass_at_1",
                 )
             ]
-            matched_replay = replay_index[("starting", benchmark, condition)]
-            shuffled_replay = replay_index[("starting", benchmark, family + "_shuffled")]
             positive_paired_ci = comparison["ci_low"] > 0.0
-            boundary_valid = bool(diagnostic["boundary_gate_valid"])
-            # There was no absolute KL cutoff in the preregistration. Use the
-            # shuffled context only as a transparent relative proximity
-            # diagnostic rather than inventing an absolute threshold post hoc.
-            relative_proximity = (
-                matched_replay["forward_kl_slot_mean"]
-                <= shuffled_replay["forward_kl_slot_mean"]
+            matched_boundary_valid = bool(
+                matched_diagnostic["boundary_gate_valid"]
             )
+            no_demo_boundary_valid = bool(
+                no_demo_diagnostic["boundary_gate_valid"]
+            )
+            boundary_valid = matched_boundary_valid and no_demo_boundary_valid
             result.append(
                 {
                     "benchmark": benchmark,
                     "prompt_family": family,
                     "native_soft_pass_at_1": metric["pass_at_1"],
-                    "matched_minus_shuffled_ci_low": comparison["ci_low"],
+                    "matched_minus_no_demo_ci_low": comparison["ci_low"],
                     "positive_paired_95ci": positive_paired_ci,
+                    "matched_boundary_gate_valid": matched_boundary_valid,
+                    "no_demo_boundary_gate_valid": no_demo_boundary_valid,
                     "boundary_gate_valid": boundary_valid,
-                    "matched_forward_kl_slot_mean": matched_replay["forward_kl_slot_mean"],
-                    "shuffled_forward_kl_slot_mean": shuffled_replay["forward_kl_slot_mean"],
-                    "matched_no_farther_than_shuffled_diagnostic": relative_proximity,
-                    "overall_criterion": (
-                        "not_pre_registered_due_to_unspecified_reward_and_kl_thresholds"
-                    ),
                 }
             )
     return result
@@ -1630,11 +1629,6 @@ def run_aggregate(args: argparse.Namespace) -> None:
         Path(args.generation_dir).expanduser().resolve()
         if args.generation_dir
         else asset_root / "generation"
-    )
-    replay_root = (
-        Path(args.replay_dir).expanduser().resolve()
-        if args.replay_dir
-        else asset_root / "replay"
     )
     output_root = (
         Path(args.output_dir).expanduser().resolve()
@@ -1661,7 +1655,6 @@ def run_aggregate(args: argparse.Namespace) -> None:
     by_id = {example.example_id: example for example in examples}
     store = AtomicChunkStore(generation_root)
     states = {}
-    expected_ids_by_cell: dict[tuple[str, str, str, str], list[str]] = {}
     scored_rows = []
     diagnostic_rows = []
     for cell in cells:
@@ -1696,7 +1689,6 @@ def run_aggregate(args: argparse.Namespace) -> None:
             mechanism_ids=mechanism_ids,
         )
         expected_example_ids = [prompt.example_id for prompt in expected_prompts]
-        expected_ids_by_cell[key4] = expected_example_ids
         chunks = math.ceil(cell.example_count / manifest["chunk_size"])
         seen = set()
         for sample_index in range(cell.sample_count):
@@ -1860,21 +1852,11 @@ def run_aggregate(args: argparse.Namespace) -> None:
 
     metric_rows = _cell_metric_rows(states, smoke=args.smoke)
     comparison_rows = _comparison_rows(states, smoke=args.smoke)
-    replay_rows = _aggregate_replay(
-        replay_root,
-        generation_root,
-        manifests,
-        states,
-        expected_ids_by_cell,
-        assets=assets,
-        data_manifest=data_manifest,
-    )
+    replay_rows: list[dict[str, Any]] = []
     from_getgo = (
         []
         if args.smoke
-        else _from_getgo_assessment(
-            metric_rows, diagnostic_rows, comparison_rows, replay_rows
-        )
+        else _from_getgo_assessment(metric_rows, diagnostic_rows, comparison_rows)
     )
     compact_provenance = {
         "source": provenance,
@@ -1894,26 +1876,10 @@ def run_aggregate(args: argparse.Namespace) -> None:
             )
             for key in sorted(manifests)
         },
-        "replay": {
-            model: json.loads(
-                (replay_root / model / "replay_manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            for model in ("starting", "softgrpo")
-        },
-        "replay_completion": {
-            model: json.loads(
-                (replay_root / model / "completion.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            for model in ("starting", "softgrpo")
-        },
     }
     compact_provenance_bytes = canonical_json_bytes(compact_provenance)
     config = {
-        "protocol": "opd-softgrpo-native-soft-icl-report-v1",
+        "protocol": "opd-softgrpo-native-soft-icl-report-v2-math-aime-matched",
         "source_provenance": provenance,
         "asset_manifest_sha256": assets["content_sha256"],
         "data_manifest_sha256": data_manifest["content_sha256"],
@@ -1944,11 +1910,19 @@ def run_aggregate(args: argparse.Namespace) -> None:
             "pass_at_8": "probability at least one of eight succeeds; omitted for smoke n=2",
             "native_soft_scoring": "boundary-invalid samples are incorrect in every primary grader",
             "native_soft_cell_gate": (
-                "invalid only when capped-or-all-soft rate exceeds 5%; smoke "
-                "separately requires a demonstrated categorical boxed transition "
-                "per checkpoint"
+                "invalid when capped-or-all-soft rate exceeds 5%; boundary-invalid "
+                "samples are scored incorrect and transition diagnostics are reported"
             ),
             "aime2024": "30-example intervals are exploratory and imprecise",
+            "condition_control": (
+                "matched conditions are compared with no_demo; without shuffled "
+                "controls, effects cannot be attributed specifically to gold relevance"
+            ),
+            "inference": (
+                "paired confidence intervals are pointwise and unadjusted; the "
+                "assessment table is descriptive and defines no omnibus success rule"
+            ),
+            "replay": "deferred from this core ICL evaluation",
             "seed": "single-seed-11 exploratory evaluation",
         },
     }
@@ -2016,12 +1990,15 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--model", required=True, choices=("starting", "softgrpo"))
     generate.add_argument("--mode", required=True, choices=("native_soft", "hard_token"))
     generate.add_argument("--output-dir")
-    generate.add_argument("--benchmarks", nargs="+", default=["all"], choices=("all",) + BENCHMARKS)
     generate.add_argument(
-        "--conditions", nargs="+", default=["all"], choices=("all",) + PROMPT_CONDITIONS
+        "--benchmarks", nargs="+", default=["all"], choices=("all",) + STUDY_BENCHMARKS
     )
-    generate.add_argument("--num-gpus", type=int, default=1)
-    generate.add_argument("--chunk-size", type=int, default=8)
+    generate.add_argument(
+        "--conditions", nargs="+", default=["all"], choices=("all",) + CORE_CONDITIONS
+    )
+    generate.add_argument("--tensor-parallel-size", type=int, default=1)
+    generate.add_argument("--data-parallel-size", type=int, default=1)
+    generate.add_argument("--chunk-size", type=int, default=64)
     generate.add_argument("--max-running-requests", type=int, default=16)
     generate.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     generate.add_argument("--smoke", action="store_true")
@@ -2032,7 +2009,9 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--model", required=True, choices=("starting", "softgrpo"))
     replay.add_argument("--generation-dir")
     replay.add_argument("--output-dir")
-    replay.add_argument("--benchmarks", nargs="+", default=["all"], choices=("all",) + BENCHMARKS)
+    replay.add_argument(
+        "--benchmarks", nargs="+", default=["all"], choices=("all",) + STUDY_BENCHMARKS
+    )
     replay.add_argument("--hidden-chunk-size", type=int, default=32)
     replay.add_argument("--vocab-chunk-size", type=int, default=8192)
     replay.add_argument(
@@ -2045,7 +2024,6 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate = commands.add_parser("aggregate", help="grade and aggregate the complete matrix")
     aggregate.add_argument("--root", required=True)
     aggregate.add_argument("--generation-dir")
-    aggregate.add_argument("--replay-dir")
     aggregate.add_argument("--output-dir")
     aggregate.add_argument("--smoke", action="store_true")
     aggregate.set_defaults(handler=run_aggregate)
@@ -2055,7 +2033,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "generate":
-        if args.num_gpus <= 0 or args.chunk_size <= 0 or args.max_running_requests <= 0:
+        if (
+            args.tensor_parallel_size <= 0
+            or args.data_parallel_size <= 0
+            or args.chunk_size <= 0
+            or args.max_running_requests <= 0
+        ):
             raise ValueError("GPU, chunk, and running-request counts must be positive")
         if not 0.0 < args.gpu_memory_utilization < 1.0:
             raise ValueError("gpu-memory-utilization must be in (0, 1)")
@@ -2064,8 +2047,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         if "all" in args.conditions and args.conditions != ["all"]:
             raise ValueError("all cannot be combined with explicit conditions")
         allocated = os.environ.get("SLURM_GPUS_ON_NODE")
-        if allocated is not None and int(allocated) != args.num_gpus:
-            raise RuntimeError("--num-gpus disagrees with SLURM_GPUS_ON_NODE")
+        world_size = args.tensor_parallel_size * args.data_parallel_size
+        if allocated is not None and int(allocated) != world_size:
+            raise RuntimeError(
+                "tensor-parallel-size * data-parallel-size disagrees with "
+                "SLURM_GPUS_ON_NODE"
+            )
     if args.command == "replay" and (
         args.hidden_chunk_size <= 0 or args.vocab_chunk_size <= 0
     ):

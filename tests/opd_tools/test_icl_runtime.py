@@ -1,11 +1,14 @@
 import ast
 import json
+import sys
 import tempfile
+import types
 from pathlib import Path
 import numpy as np
 import pytest
 
 from opd_tools.icl import request_seed
+import opd_tools.icl_runtime as icl_runtime
 from opd_tools.icl_runtime import (
     AtomicChunkStore,
     SamplingSettings,
@@ -14,10 +17,54 @@ from opd_tools.icl_runtime import (
     generation_chunk_metrics,
     parse_sglang_completion,
     required_context_length,
+    ReleasedSofTGRPOEngine,
     source_provenance,
     stable_request_seed,
     validate_generation_cell,
 )
+
+
+def test_engine_uses_replica_parallelism_with_round_robin(monkeypatch):
+    captured = {}
+
+    class _Engine:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.server_args = types.SimpleNamespace(
+                tp_size=kwargs["tp_size"],
+                dp_size=kwargs["dp_size"],
+                load_balance_method=kwargs["load_balance_method"],
+            )
+
+        def shutdown(self):
+            captured["shutdown"] = True
+
+    package = (
+        Path(icl_runtime.__file__).resolve().parents[1]
+        / "Soft-Thinking+noise+loss-main"
+        / "sglang_soft_thinking_pkg"
+        / "python"
+        / "sglang"
+    )
+    fake = types.SimpleNamespace(
+        __file__=str(package / "__init__.py"), Engine=_Engine
+    )
+    monkeypatch.setitem(sys.modules, "sglang", fake)
+    settings = SamplingSettings(max_new_tokens=7)
+    engine = ReleasedSofTGRPOEngine(
+        model_path="/model",
+        mode="native_soft",
+        tensor_parallel_size=1,
+        data_parallel_size=8,
+        context_length=9,
+        settings=settings,
+    )
+    assert captured["tp_size"] == 1
+    assert captured["dp_size"] == 8
+    assert captured["load_balance_method"] == "round_robin"
+    assert captured["enable_soft_thinking"]
+    engine.shutdown()
+    assert captured["shutdown"]
 
 
 class _ReleasedTextTokenizer:
@@ -197,7 +244,7 @@ def test_matrix_guard_rejects_unregistered_hard_token_cells():
     validate_generation_cell("starting", "hard_token", "sdft_matched")
     with pytest.raises(ValueError, match="post-trained"):
         validate_generation_cell("softgrpo", "hard_token", "sdft_matched")
-    with pytest.raises(ValueError, match="mechanism"):
+    with pytest.raises(ValueError, match="unregistered"):
         validate_generation_cell("starting", "hard_token", "sdft_answer_only")
 
 

@@ -8,7 +8,6 @@ import pytest
 import opd_tools.icl_eval as cli
 from opd_tools.icl import CORE_CONDITIONS, ICLEvaluationExample, ICLMatrixCell, request_seed
 from opd_tools.icl_eval import (
-    _cell_prompts,
     _finish_generation_resources,
     _generation_chunk_identity,
     _grade,
@@ -446,7 +445,6 @@ def test_aggregate_excludes_invalid_soft_boundary_from_overlap_but_counts_copy(
 ):
     root = tmp_path / "assets"
     generation_root = tmp_path / "generation"
-    replay_root = tmp_path / "replay"
     report_root = tmp_path / "reports"
     example = ICLEvaluationExample(
         example_id="math500-0",
@@ -527,12 +525,6 @@ def test_aggregate_excludes_invalid_soft_boundary_from_overlap_but_counts_copy(
     completion_path = generation_root / "starting" / "native_soft" / "completion.json"
     completion_path.parent.mkdir(parents=True, exist_ok=True)
     completion_path.write_text("{}", encoding="utf-8")
-    for model_label in ("starting", "softgrpo"):
-        model_replay = replay_root / model_label
-        model_replay.mkdir(parents=True, exist_ok=True)
-        (model_replay / "replay_manifest.json").write_text("{}", encoding="utf-8")
-        (model_replay / "completion.json").write_text("{}", encoding="utf-8")
-
     class _WandbRun:
         def __init__(self):
             self.summary = {}
@@ -566,13 +558,11 @@ def test_aggregate_excludes_invalid_soft_boundary_from_overlap_but_counts_copy(
     monkeypatch.setattr(cli, "_primary_grade", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(cli, "_cell_metric_rows", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cli, "_comparison_rows", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cli, "_aggregate_replay", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cli, "init_online_wandb", lambda **_kwargs: _WandbRun())
     cli.run_aggregate(
         argparse.Namespace(
             root=str(root),
             generation_dir=str(generation_root),
-            replay_dir=str(replay_root),
             output_dir=str(report_root),
             smoke=True,
         )
@@ -586,36 +576,17 @@ def test_aggregate_excludes_invalid_soft_boundary_from_overlap_but_counts_copy(
     assert diagnostic["rationale_overlap_f1_mean"] is None
 
 
-def test_production_mechanism_cell_keeps_all_128_registered_examples():
-    examples = [
-        ICLEvaluationExample(
-            example_id="math-%03d" % index,
+def test_mechanism_cells_are_not_registerable_in_the_reduced_study():
+    with pytest.raises(ValueError, match="unregistered ICL prompt condition"):
+        ICLMatrixCell(
+            model_label="starting",
+            inference_mode="native_soft",
+            condition="sdft_answer_only",
             benchmark="math500",
-            source_index=index,
-            question="Question %d" % index,
-            gold_cot="Reasoning %d" % index,
-            gold_answer=str(index + 1),
+            subset="mechanism",
+            example_count=128,
+            sample_count=8,
         )
-        for index in range(200)
-    ]
-    mechanism_ids = [example.example_id for example in examples[:128]]
-    cell = ICLMatrixCell(
-        model_label="starting",
-        inference_mode="native_soft",
-        condition="sdft_answer_only",
-        benchmark="math500",
-        subset="mechanism",
-        example_count=128,
-        sample_count=8,
-    )
-    selected, prompts = _cell_prompts(
-        cell,
-        examples=examples,
-        shuffled_pairs={"math500": {}},
-        mechanism_ids={"math500": mechanism_ids},
-    )
-    assert len(selected) == len(prompts) == 128
-    assert [example.example_id for example in selected] == mechanism_ids
 
 
 def test_public_cli_exposes_all_four_commands_and_output_overrides():
@@ -637,6 +608,9 @@ def test_public_cli_exposes_all_four_commands_and_output_overrides():
         ]
     )
     assert generate.smoke and generate.output_dir.endswith("generation")
+    assert generate.tensor_parallel_size == 1
+    assert generate.data_parallel_size == 1
+    assert generate.chunk_size == 64
     replay = parser.parse_args(
         [
             "replay",
@@ -658,11 +632,202 @@ def test_public_cli_exposes_all_four_commands_and_output_overrides():
             "/scratch/root",
             "--generation-dir",
             "/scratch/smoke/generation",
-            "--replay-dir",
-            "/scratch/smoke/replay",
             "--output-dir",
             "/scratch/smoke/reports",
             "--smoke",
         ]
     )
     assert aggregate.smoke and aggregate.output_dir.endswith("reports")
+
+
+def test_generate_cli_binds_tp_times_dp_to_slurm_allocation(monkeypatch):
+    observed = []
+    monkeypatch.setattr(cli, "run_generate", lambda args: observed.append(args))
+    monkeypatch.setenv("SLURM_GPUS_ON_NODE", "8")
+    cli.main(
+        [
+            "generate",
+            "--root",
+            "/scratch/root",
+            "--model",
+            "starting",
+            "--mode",
+            "native_soft",
+            "--tensor-parallel-size",
+            "1",
+            "--data-parallel-size",
+            "8",
+        ]
+    )
+    assert len(observed) == 1
+    assert observed[0].tensor_parallel_size == 1
+    assert observed[0].data_parallel_size == 8
+
+    with pytest.raises(RuntimeError, match="SLURM_GPUS_ON_NODE"):
+        cli.main(
+            [
+                "generate",
+                "--root",
+                "/scratch/root",
+                "--model",
+                "starting",
+                "--mode",
+                "native_soft",
+                "--tensor-parallel-size",
+                "1",
+                "--data-parallel-size",
+                "4",
+            ]
+        )
+
+
+def test_generate_cli_rejects_removed_benchmark_and_shuffled_condition():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "generate",
+                "--root",
+                "/scratch/root",
+                "--model",
+                "starting",
+                "--mode",
+                "native_soft",
+                "--benchmarks",
+                "gsm8k_test",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "generate",
+                "--root",
+                "/scratch/root",
+                "--model",
+                "starting",
+                "--mode",
+                "native_soft",
+                "--conditions",
+                "sdft_shuffled",
+            ]
+        )
+
+
+def test_difference_in_differences_keeps_pass_estimator_identity(monkeypatch):
+    bootstrap = {
+        "difference": 0.0,
+        "ci_low": -0.1,
+        "ci_high": 0.1,
+        "confidence": 0.95,
+        "resamples": 10_000,
+        "bootstrap_seed": 11,
+        "example_count": 1,
+    }
+
+    monkeypatch.setattr(
+        cli,
+        "paired_bootstrap_difference",
+        lambda *_args, **_kwargs: dict(bootstrap),
+    )
+    monkeypatch.setattr(
+        cli,
+        "paired_bootstrap_difference_in_differences",
+        lambda *_args, **_kwargs: {
+            **bootstrap,
+            "estimand": (
+                "(post_treatment-post_control)-"
+                "(start_treatment-start_control)"
+            ),
+        },
+    )
+
+    states = {}
+    values = {index: index % 2 == 0 for index in range(8)}
+    for model, mode in (
+        ("starting", "native_soft"),
+        ("starting", "hard_token"),
+        ("softgrpo", "native_soft"),
+    ):
+        for benchmark in ("math500", "aime2024"):
+            outcomes = {
+                grader: {benchmark + "-0": dict(values)}
+                for grader in ("math_verify", "released_last_boxed")
+            }
+            for condition in CORE_CONDITIONS:
+                states[(model, mode, benchmark, condition)] = {
+                    "sample_count": 8,
+                    "outcomes": outcomes,
+                    "count": 8,
+                    "capped_or_all_soft": 0,
+                }
+
+    rows = cli._comparison_rows(states, smoke=False)
+    did = [row for row in rows if row["model_label"] == "difference_in_differences"]
+    assert len(did) == 16
+    assert {row["estimand"] for row in did} == {"pass_at_1", "pass_at_8"}
+    assert {row["contrast_definition"] for row in did} == {
+        "(post_treatment-post_control)-(start_treatment-start_control)"
+    }
+    assert all(row["comparison_boundary_gate_valid"] for row in did)
+    flattened = cli._flatten_wandb([], [], did, [])
+    assert sum(key.endswith("/difference") for key in flattened) == len(did)
+    assert sum(
+        key.endswith("/comparison_boundary_gate_valid") for key in flattened
+    ) == len(did)
+
+
+def test_from_getgo_assessment_reports_both_boundary_gates_without_omnibus_rule():
+    metrics = []
+    diagnostics = []
+    comparisons = []
+    for benchmark in ("math500", "aime2024"):
+        diagnostics.append(
+            {
+                "model_label": "starting",
+                "inference_mode": "native_soft",
+                "benchmark": benchmark,
+                "condition": "no_demo",
+                "boundary_gate_valid": benchmark == "aime2024",
+            }
+        )
+        for family in ("sdft", "sdpg"):
+            condition = family + "_matched"
+            metrics.append(
+                {
+                    "model_label": "starting",
+                    "inference_mode": "native_soft",
+                    "benchmark": benchmark,
+                    "condition": condition,
+                    "grader": "math_verify",
+                    "pass_at_1": 0.5,
+                }
+            )
+            diagnostics.append(
+                {
+                    "model_label": "starting",
+                    "inference_mode": "native_soft",
+                    "benchmark": benchmark,
+                    "condition": condition,
+                    "boundary_gate_valid": True,
+                }
+            )
+            comparisons.append(
+                {
+                    "model_label": "starting",
+                    "inference_mode": "native_soft",
+                    "benchmark": benchmark,
+                    "comparison": family + "_matched_minus_no_demo",
+                    "grader": "math_verify",
+                    "estimand": "pass_at_1",
+                    "ci_low": 0.01,
+                }
+            )
+
+    rows = cli._from_getgo_assessment(metrics, diagnostics, comparisons)
+    math_rows = [row for row in rows if row["benchmark"] == "math500"]
+    aime_rows = [row for row in rows if row["benchmark"] == "aime2024"]
+    assert all(row["matched_boundary_gate_valid"] for row in rows)
+    assert all(not row["no_demo_boundary_gate_valid"] for row in math_rows)
+    assert all(row["no_demo_boundary_gate_valid"] for row in aime_rows)
+    assert all(row["positive_paired_95ci"] for row in rows)
+    assert all("overall_criterion" not in row for row in rows)

@@ -14,6 +14,7 @@ from opd_tools.icl import (
     ICLEvaluationExample,
     MECHANISM_CONDITIONS,
     MODEL_LABELS,
+    STUDY_BENCHMARKS,
     SOFTGRPO_MODEL_REVISION,
     STARTING_MODEL_REVISION,
     build_gsm8k_icl_examples,
@@ -375,10 +376,29 @@ class ICLPromptTests(unittest.TestCase):
 
 
 class ICLMatrixTests(unittest.TestCase):
-    def test_production_matrix_contains_only_the_allowed_69_cells(self):
+    def test_production_matrix_contains_only_the_18_registered_cells(self):
         matrix = build_icl_matrix()
-        self.assertEqual(len(matrix), 69)
+        self.assertEqual(len(matrix), 18)
         self.assertTrue(all(cell.sample_count == 8 for cell in matrix))
+        self.assertEqual({cell.benchmark for cell in matrix}, set(STUDY_BENCHMARKS))
+        self.assertEqual({cell.condition for cell in matrix}, set(CORE_CONDITIONS))
+        self.assertNotIn("gsm8k_test", {cell.benchmark for cell in matrix})
+        self.assertFalse(any("shuffled" in cell.condition for cell in matrix))
+        self.assertFalse(
+            any(cell.condition in MECHANISM_CONDITIONS for cell in matrix)
+        )
+        trajectories_by_run = {}
+        for model, mode in (
+            ("starting", "native_soft"),
+            ("starting", "hard_token"),
+            ("softgrpo", "native_soft"),
+        ):
+            trajectories_by_run[(model, mode)] = sum(
+                cell.example_count * cell.sample_count
+                for cell in matrix
+                if cell.model_label == model and cell.inference_mode == mode
+            )
+        self.assertEqual(set(trajectories_by_run.values()), {12_720})
         self.assertFalse(
             any(
                 cell.model_label == "softgrpo" and cell.inference_mode == "hard_token"
@@ -394,12 +414,9 @@ class ICLMatrixTests(unittest.TestCase):
             set(CORE_CONDITIONS),
         )
         for cell in matrix:
-            expected = (
-                EXPECTED_EXAMPLE_COUNTS[cell.benchmark]
-                if cell.condition in CORE_CONDITIONS
-                else min(128, EXPECTED_EXAMPLE_COUNTS[cell.benchmark])
+            self.assertEqual(
+                cell.example_count, EXPECTED_EXAMPLE_COUNTS[cell.benchmark]
             )
-            self.assertEqual(cell.example_count, expected)
 
     def test_smoke_uses_16_examples_and_two_samples(self):
         matrix = build_icl_matrix(smoke=True)
@@ -409,9 +426,17 @@ class ICLMatrixTests(unittest.TestCase):
     def test_matrix_validator_rejects_prohibited_hard_token_cells(self):
         with self.assertRaisesRegex(ValueError, "post-trained"):
             validate_matrix_cell("softgrpo", "hard_token", "no_demo", "math500")
-        with self.assertRaisesRegex(ValueError, "native-soft only"):
+        with self.assertRaisesRegex(ValueError, "unregistered ICL prompt condition"):
             validate_matrix_cell(
                 "starting", "hard_token", MECHANISM_CONDITIONS[0], "math500"
+            )
+        with self.assertRaisesRegex(ValueError, "unregistered ICL prompt condition"):
+            validate_matrix_cell(
+                "starting", "native_soft", "sdft_shuffled", "math500"
+            )
+        with self.assertRaisesRegex(ValueError, "unregistered ICL benchmark"):
+            validate_matrix_cell(
+                "starting", "native_soft", "no_demo", "gsm8k_test"
             )
 
     def test_request_seeds_are_common_across_conditions_and_unique_by_sample(self):

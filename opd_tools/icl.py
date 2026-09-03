@@ -81,14 +81,24 @@ AIME2024_RELEASED_CORRECTION = {
 }
 
 MODEL_LABELS = ("starting", "softgrpo")
+# ``BENCHMARKS`` and ``PROMPT_CONDITIONS`` describe the immutable materialized
+# data artifact.  The smaller study registries below deliberately leave the
+# old donor/control material available for provenance-compatible reuse without
+# scheduling those cells in this evaluation.
 BENCHMARKS = ("math500", "gsm8k_test", "aime2024")
+STUDY_BENCHMARKS = ("math500", "aime2024")
 INFERENCE_MODES = ("native_soft", "hard_token")
-CORE_CONDITIONS = (
+SUPPORTED_CORE_CONDITIONS = (
     "no_demo",
     "sdft_matched",
     "sdft_shuffled",
     "sdpg_matched",
     "sdpg_shuffled",
+)
+CORE_CONDITIONS = (
+    "no_demo",
+    "sdft_matched",
+    "sdpg_matched",
 )
 MECHANISM_CONDITIONS = (
     "sdft_answer_only",
@@ -96,7 +106,7 @@ MECHANISM_CONDITIONS = (
     "sdpg_answer_only",
     "sdpg_rationale_only",
 )
-PROMPT_CONDITIONS = CORE_CONDITIONS + MECHANISM_CONDITIONS
+PROMPT_CONDITIONS = SUPPORTED_CORE_CONDITIONS + MECHANISM_CONDITIONS
 
 DATA_SELECTION_SEED = 42
 EXPERIMENT_SEED = 11
@@ -291,9 +301,8 @@ class ICLMatrixCell:
             self.condition,
             self.benchmark,
         )
-        expected_subset = "full" if self.condition in CORE_CONDITIONS else "mechanism"
-        if self.subset != expected_subset:
-            raise ValueError("condition uses the wrong evaluation subset")
+        if self.subset != "full":
+            raise ValueError("registered conditions use the full evaluation subset")
         if type(self.example_count) is not int or self.example_count <= 0:
             raise ValueError("example_count must be positive")
         if type(self.sample_count) is not int or not 1 <= self.sample_count <= 8:
@@ -313,14 +322,12 @@ def validate_matrix_cell(
         raise ValueError("unsupported ICL model label: %r" % model_label)
     if inference_mode not in INFERENCE_MODES:
         raise ValueError("unsupported ICL inference mode: %r" % inference_mode)
-    if condition not in PROMPT_CONDITIONS:
-        raise ValueError("unsupported ICL prompt condition: %r" % condition)
-    if benchmark not in BENCHMARKS:
-        raise ValueError("unsupported ICL benchmark: %r" % benchmark)
+    if condition not in CORE_CONDITIONS:
+        raise ValueError("unregistered ICL prompt condition: %r" % condition)
+    if benchmark not in STUDY_BENCHMARKS:
+        raise ValueError("unregistered ICL benchmark: %r" % benchmark)
     if model_label == "softgrpo" and inference_mode == "hard_token":
         raise ValueError("the post-trained checkpoint has no hard-token evaluation arm")
-    if inference_mode == "hard_token" and condition in MECHANISM_CONDITIONS:
-        raise ValueError("mechanism controls are native-soft only")
 
 
 def build_icl_matrix(*, smoke: bool = False) -> Tuple[ICLMatrixCell, ...]:
@@ -332,14 +339,10 @@ def build_icl_matrix(*, smoke: bool = False) -> Tuple[ICLMatrixCell, ...]:
         for inference_mode in INFERENCE_MODES:
             if model_label == "softgrpo" and inference_mode == "hard_token":
                 continue
-            conditions = (
-                CORE_CONDITIONS
-                if inference_mode == "hard_token"
-                else PROMPT_CONDITIONS
-            )
+            conditions = CORE_CONDITIONS
             for condition in conditions:
-                for benchmark in BENCHMARKS:
-                    subset = "full" if condition in CORE_CONDITIONS else "mechanism"
+                for benchmark in STUDY_BENCHMARKS:
+                    subset = "full"
                     expected = (
                         EXPECTED_EXAMPLE_COUNTS[benchmark]
                         if subset == "full"
@@ -1162,7 +1165,7 @@ def _materialized_prompt_contract(
         for condition in PROMPT_CONDITIONS:
             selected_ids = (
                 None
-                if condition in CORE_CONDITIONS
+                if condition in SUPPORTED_CORE_CONDITIONS
                 else mechanism[benchmark]
             )
             prompts = materialize_prompts(
@@ -1173,7 +1176,7 @@ def _materialized_prompt_contract(
             )
             expected = (
                 len(grouped[benchmark])
-                if condition in CORE_CONDITIONS
+                if condition in SUPPORTED_CORE_CONDITIONS
                 else len(mechanism[benchmark])
             )
             if len(prompts) != expected:
@@ -1731,6 +1734,8 @@ __all__ = [
     "SOFTGRPO_MODEL_SUBFOLDER",
     "STARTING_MODEL_ID",
     "STARTING_MODEL_REVISION",
+    "STUDY_BENCHMARKS",
+    "SUPPORTED_CORE_CONDITIONS",
     "build_gsm8k_icl_examples",
     "build_icl_examples",
     "build_icl_examples_with_report",

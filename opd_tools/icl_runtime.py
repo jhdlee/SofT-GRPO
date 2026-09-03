@@ -961,7 +961,8 @@ class ReleasedSofTGRPOEngine:
         *,
         model_path: str,
         mode: str,
-        num_gpus: int,
+        tensor_parallel_size: int,
+        data_parallel_size: int,
         context_length: int,
         settings: SamplingSettings,
         max_running_requests: int = 32,
@@ -969,8 +970,12 @@ class ReleasedSofTGRPOEngine:
     ) -> None:
         if mode not in INFERENCE_MODES:
             raise ValueError("unsupported inference mode")
-        if num_gpus <= 0 or context_length <= settings.max_new_tokens:
-            raise ValueError("GPU count/context length is invalid")
+        if (
+            tensor_parallel_size <= 0
+            or data_parallel_size <= 0
+            or context_length <= settings.max_new_tokens
+        ):
+            raise ValueError("parallelism/context length is invalid")
         if not 0.0 < gpu_memory_utilization < 1.0:
             raise ValueError("gpu_memory_utilization must be in (0, 1)")
         try:
@@ -998,7 +1003,9 @@ class ReleasedSofTGRPOEngine:
         self.settings = settings
         self.engine = sgl.Engine(
             model_path=model_path,
-            tp_size=num_gpus,
+            tp_size=tensor_parallel_size,
+            dp_size=data_parallel_size,
+            load_balance_method="round_robin",
             trust_remote_code=True,
             random_seed=11,
             context_length=context_length,
@@ -1011,6 +1018,14 @@ class ReleasedSofTGRPOEngine:
             max_topk=settings.top_k,
             sampling_backend="flashinfer",
         )
+        observed = self.engine.server_args
+        if (
+            int(observed.tp_size) != tensor_parallel_size
+            or int(observed.dp_size) != data_parallel_size
+            or observed.load_balance_method != "round_robin"
+        ):
+            self.engine.shutdown()
+            raise RuntimeError("SGLang did not preserve the requested TP/DP topology")
 
     def generate(self, prompts: Sequence[str], seeds: Sequence[int]) -> list[Mapping[str, Any]]:
         if not prompts or len(prompts) != len(seeds):
