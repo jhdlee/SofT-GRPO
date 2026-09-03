@@ -39,7 +39,7 @@ def _softmax(values, temperature=0.1):
 def test_context_length_matches_upstream_text_api_tokenizer_defaults():
     tokenizer = _ReleasedTextTokenizer()
     settings = SamplingSettings(max_new_tokens=7)
-    assert required_context_length(tokenizer, ["rendered prompt"], settings) == 10
+    assert required_context_length(tokenizer, ["rendered prompt"], settings) == 11
     assert tokenizer.add_special_tokens_values == [True]
 
 
@@ -179,7 +179,7 @@ def test_multi_tokenizer_plumbs_all_compact_soft_metadata_fields():
         )
 
 
-def test_locked_sampling_params_match_released_training_path():
+def test_locked_sampling_params_match_controlled_released_evaluation_path():
     settings = SamplingSettings()
     params = settings.request_params(17)
     assert (params["top_p"], params["top_k"], params["temperature"]) == (
@@ -188,7 +188,7 @@ def test_locked_sampling_params_match_released_training_path():
         1.0,
     )
     assert params["gumbel_softmax_temperature"] == 0.1
-    assert params["max_new_tokens"] == 8192
+    assert params["max_new_tokens"] == 32768
     assert params["noise_gumbel"] and params["noise_on_logits"]
     assert not params["noise_gaussian"] and not params["noise_on_inputs"]
 

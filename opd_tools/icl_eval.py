@@ -76,6 +76,25 @@ def _atomic_json(path: Path, value: Any) -> None:
     _atomic_bytes(path, canonical_json_bytes(value))
 
 
+def _finish_generation_resources(
+    *, wandb_run: Any, engine: Any | None, succeeded: bool
+) -> None:
+    """Flush W&B before SGLang terminates all child processes."""
+
+    if not succeeded:
+        wandb_run.summary["generation/completed"] = False
+    try:
+        wandb_run.finish()
+    except Exception:
+        # Preserve the generation/gate exception instead of replacing it with
+        # a secondary W&B mailbox error during failure cleanup.
+        if succeeded:
+            raise
+    finally:
+        if engine is not None:
+            engine.shutdown()
+
+
 def _render(tokenizer: Any, user_content: str) -> str:
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": user_content}],
@@ -326,11 +345,12 @@ def run_generate(args: argparse.Namespace) -> None:
     maximum = int(getattr(model_config, "max_position_embeddings", 0) or 0)
     if maximum and context_length > maximum:
         raise RuntimeError(
-            "maximum tokenized prompt + 8192 requires %d positions, model supports %d"
-            % (context_length, maximum)
+            "maximum tokenized prompt + %d completion tokens + one guard "
+            "position requires %d positions, model supports %d"
+            % (settings.max_new_tokens, context_length, maximum)
         )
     config = {
-        "protocol": "opd-softgrpo-native-soft-icl-generation-v1",
+        "protocol": "opd-softgrpo-native-soft-icl-generation-v2-32768",
         "source_provenance": source_provenance(),
         "asset_manifest_sha256": assets["content_sha256"],
         "data_manifest_sha256": data_manifest["content_sha256"],
@@ -493,11 +513,13 @@ def run_generate(args: argparse.Namespace) -> None:
         )
         succeeded = True
     finally:
-        if engine is not None:
-            engine.shutdown()
-        if not succeeded:
-            wandb_run.summary["generation/completed"] = False
-        wandb_run.finish()
+        # The bundled SGLang Engine.shutdown() terminates every child of this
+        # process, which includes W&B's service process. Flush W&B first so a
+        # successful generation is publishable and a generation error is not
+        # obscured by HandleAbandonedError during cleanup.
+        _finish_generation_resources(
+            wandb_run=wandb_run, engine=engine, succeeded=succeeded
+        )
 
 
 def _load_hf_replay_model(model_path: Path, attention_implementation: str):

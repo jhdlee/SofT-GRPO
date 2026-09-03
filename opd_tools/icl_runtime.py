@@ -207,13 +207,13 @@ def validate_generation_cell(
 
 @dataclass(frozen=True)
 class SamplingSettings:
-    """The training-matched released SofT-GRPO sampling protocol."""
+    """Controlled SofT-GRPO sampling with the released evaluation cap."""
 
     top_p: float = 0.95
     top_k: int = 5
     temperature: float = 1.0
     gumbel_temperature: float = 0.1
-    max_new_tokens: int = 8192
+    max_new_tokens: int = 32_768
     think_end: str = "</think>"
 
     def __post_init__(self) -> None:
@@ -946,7 +946,11 @@ def required_context_length(
         len(tokenizer.encode(prompt))
         for prompt in rendered_prompts
     )
-    return maximum + settings.max_new_tokens
+    # The bundled SGLang validator rejects equality as well as overflow:
+    # ``prompt_tokens + max_new_tokens >= context_len``. Reserve one guard
+    # position so the longest registered prompt is accepted without reducing
+    # the requested released-evaluation completion cap.
+    return maximum + settings.max_new_tokens + 1
 
 
 class ReleasedSofTGRPOEngine:

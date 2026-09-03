@@ -9,6 +9,7 @@ import opd_tools.icl_eval as cli
 from opd_tools.icl import CORE_CONDITIONS, ICLEvaluationExample, ICLMatrixCell, request_seed
 from opd_tools.icl_eval import (
     _cell_prompts,
+    _finish_generation_resources,
     _generation_chunk_identity,
     _grade,
     _primary_grade,
@@ -41,6 +42,25 @@ class _Tokenizer:
     def encode(self, text, add_special_tokens=False):
         assert add_special_tokens is False
         return [1, 2]
+
+
+def test_generation_cleanup_flushes_wandb_before_sglang_shutdown():
+    events = []
+
+    class _Run:
+        summary = {}
+
+        def finish(self):
+            events.append("wandb")
+
+    class _Engine:
+        def shutdown(self):
+            events.append("sglang")
+
+    _finish_generation_resources(
+        wandb_run=_Run(), engine=_Engine(), succeeded=True
+    )
+    assert events == ["wandb", "sglang"]
 
 
 def _generation_inputs():
