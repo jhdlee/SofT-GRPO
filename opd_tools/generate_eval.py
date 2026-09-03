@@ -110,8 +110,8 @@ def expected_engine_mode(mode: str) -> Dict[str, bool]:
 
 
 _ATOMIC_TEMP_RE = re.compile(
-    r"^[.](?:seed_[0-9]+[.](?:jsonl|manifest[.]json)|generation_manifest[.]json)"
-    r"[.][A-Za-z0-9_-]+[.]tmp$"
+    r"^[.](?:seed_[0-9]+[.](?:jsonl|manifest[.]json)|generation_manifest[.]json|"
+    r"completion[.]json)[.][A-Za-z0-9_-]+[.]tmp$"
 )
 
 
@@ -424,21 +424,67 @@ def _write_shard(path: Path, records: Sequence[GenerationRecord]) -> Dict[str, A
     return _verify_shard(path, manifest_path)
 
 
-def _stable_wandb_id(
-    *, model_label: str, model_sha256: str, mode: str, sampling_protocol: str
-) -> str:
-    digest = hashlib.sha256(
-        _canonical_json(
-            {
-                "protocol": EVALUATION_PROTOCOL,
-                "model_label": model_label,
-                "model_sha256": model_sha256,
-                "mode": mode,
-                "sampling_protocol": sampling_protocol,
-            }
-        )
-    ).hexdigest()[:16]
-    return "eval-%s-%s-%s" % (model_label, mode.replace("_", "-"), digest)
+def _resume_shard(
+    data_path: Path,
+    manifest_path: Path,
+    *,
+    model_label: str,
+    mode: str,
+    benchmark: str,
+    sample_index: int,
+    generation_seed: int,
+    example_ids: Sequence[str],
+) -> Dict[str, Any] | None:
+    """Verify a commit or safely adopt data atomically published before SIGTERM."""
+
+    if not data_path.exists() and not manifest_path.exists():
+        return None
+    if manifest_path.exists() and not data_path.exists():
+        raise ValueError("generation shard sidecar exists without data")
+    if data_path.is_symlink() or not data_path.is_file():
+        raise ValueError("generation shard data must be a regular file")
+    if manifest_path.exists():
+        return _verify_shard(data_path, manifest_path)
+
+    records = []
+    with data_path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            records.append(GenerationRecord.from_mapping(json.loads(line)))
+    if len(records) != len(example_ids):
+        raise ValueError("orphan generation shard has the wrong row count")
+    for expected_id, record in zip(example_ids, records):
+        expected = {
+            "model_label": model_label,
+            "inference_mode": mode,
+            "benchmark": benchmark,
+            "sample_index": sample_index,
+            "generation_seed": generation_seed,
+            "example_id": expected_id,
+        }
+        if any(getattr(record, name) != value for name, value in expected.items()):
+            raise ValueError("orphan generation shard has the wrong row identity")
+    manifest = {
+        "schema_version": EVALUATION_SCHEMA_VERSION,
+        "protocol": EVALUATION_PROTOCOL,
+        "size": data_path.stat().st_size,
+        "sha256": file_sha256(data_path),
+        "row_count": len(records),
+    }
+    _atomic_write(manifest_path, _canonical_json(manifest))
+    return _verify_shard(data_path, manifest_path)
+
+
+def _stable_wandb_id(config: Mapping[str, Any]) -> str:
+    """Bind a resumable W&B run to the complete generation contract."""
+
+    if "wandb_run_id" in config:
+        raise ValueError("W&B identity input may not contain its own run ID")
+    digest = hashlib.sha256(_canonical_json(dict(config))).hexdigest()[:16]
+    return "eval-%s-%s-%s" % (
+        config["model_label"],
+        str(config["mode"]).replace("_", "-"),
+        digest,
+    )
 
 
 def _init_wandb(config: Mapping[str, Any]):
@@ -452,7 +498,7 @@ def _init_wandb(config: Mapping[str, Any]):
         raise RuntimeError("evaluation requires the wandb package") from error
     return wandb.init(
         project=os.environ.get("WANDB_PROJECT", "opd-softgrpo-math"),
-        group="seed-11",
+        group=os.environ.get("WANDB_GROUP", "seed-11"),
         id=config["wandb_run_id"],
         resume="allow",
         job_type="evaluation-generation",
@@ -481,6 +527,47 @@ def _render_prompts(tokenizer: Any, rows: Sequence[Mapping[str, Any]]) -> list[s
     return prompts
 
 
+def resolve_parallelism(
+    *,
+    legacy_num_gpus: int | None,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+) -> tuple[int, int, int]:
+    """Resolve legacy TP-only and explicit TP/DP execution arguments."""
+
+    for name, value in (
+        ("tensor_parallel_size", tensor_parallel_size),
+        ("data_parallel_size", data_parallel_size),
+    ):
+        if isinstance(value, bool) or value <= 0:
+            raise ValueError("%s must be a positive integer" % name)
+    if legacy_num_gpus is not None:
+        if isinstance(legacy_num_gpus, bool) or legacy_num_gpus <= 0:
+            raise ValueError("num_gpus must be a positive integer")
+        if tensor_parallel_size != 1 or data_parallel_size != 1:
+            raise ValueError(
+                "--num-gpus is legacy TP-only syntax and cannot be combined "
+                "with explicit TP/DP"
+            )
+        tensor_parallel_size = legacy_num_gpus
+    return (
+        tensor_parallel_size,
+        data_parallel_size,
+        tensor_parallel_size * data_parallel_size,
+    )
+
+
+def required_context_length(
+    tokenizer: Any, rendered_prompts: Sequence[str], max_new_tokens: int
+) -> int:
+    """Reserve the guard position required by the bundled SGLang validator."""
+
+    if not rendered_prompts or max_new_tokens <= 0:
+        raise ValueError("context sizing requires prompts and a positive token cap")
+    maximum_prompt = max(len(tokenizer.encode(prompt)) for prompt in rendered_prompts)
+    return maximum_prompt + int(max_new_tokens) + 1
+
+
 def run(args: argparse.Namespace) -> None:
     model_root = Path(args.model_path).expanduser().resolve()
     data_root = Path(args.data_dir).expanduser().resolve()
@@ -499,11 +586,17 @@ def run(args: argparse.Namespace) -> None:
         else HARD_TOKEN_GENERATION_SEEDS
     )
 
+    tensor_parallel_size, data_parallel_size, world_size = resolve_parallelism(
+        legacy_num_gpus=args.num_gpus,
+        tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+    )
+
     allocated = os.environ.get("SLURM_GPUS_ON_NODE")
-    if allocated is not None and int(allocated) != args.num_gpus:
+    if allocated is not None and int(allocated) != world_size:
         raise RuntimeError(
-            "--num-gpus disagrees with SLURM_GPUS_ON_NODE (%d != %s)"
-            % (args.num_gpus, allocated)
+            "TP*DP disagrees with SLURM_GPUS_ON_NODE (%d != %s)"
+            % (world_size, allocated)
         )
     if "CUDA_VISIBLE_DEVICES" in os.environ and os.environ.get("SLURM_JOB_ID"):
         # Slurm itself sets this for job steps.  The launcher never does; retain
@@ -516,10 +609,69 @@ def run(args: argparse.Namespace) -> None:
     from .prepare import verify_materialized_data
 
     data_manifest = verify_materialized_data(data_root)
+    try:
+        import sglang as sgl
+        from transformers import AutoConfig, AutoTokenizer
+    except ImportError as error:
+        raise RuntimeError(
+            "generation requires the pinned SofT-GRPO SGLang environment"
+        ) from error
+    expected_sglang = (
+        Path(__file__).resolve().parents[1]
+        / "Soft-Thinking+noise+loss-main"
+        / "sglang_soft_thinking_pkg"
+        / "python"
+        / "sglang"
+    ).resolve()
+    observed_sglang = Path(sgl.__file__).resolve()
+    if not observed_sglang.is_relative_to(expected_sglang):
+        raise RuntimeError(
+            "generation imported a non-upstream SGLang package: %s"
+            % observed_sglang
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_root), local_files_only=True)
+    for tag in ("<think>", "</think>"):
+        ids = tokenizer.encode(tag, add_special_tokens=False)
+        if len(ids) != 1:
+            raise RuntimeError("%s must be one atomic tokenizer ID" % tag)
+    datasets = {
+        benchmark: _load_benchmark(data_root / DATA_FILES[benchmark], benchmark)
+        for benchmark in benchmarks
+    }
+    rendered = {
+        benchmark: _render_prompts(tokenizer, rows)
+        for benchmark, rows in datasets.items()
+    }
+    rendered_prompts = [
+        prompt for benchmark in benchmarks for prompt in rendered[benchmark]
+    ]
+    context_length = required_context_length(
+        tokenizer, rendered_prompts, int(protocol["max_new_tokens"])
+    )
+    model_config = AutoConfig.from_pretrained(str(model_root), local_files_only=True)
+    key_value_heads = int(
+        getattr(model_config, "num_key_value_heads", 0)
+        or getattr(model_config, "num_attention_heads", 0)
+        or 0
+    )
+    if key_value_heads and key_value_heads % tensor_parallel_size:
+        raise RuntimeError(
+            "tensor parallel size %d does not divide %d key/value heads"
+            % (tensor_parallel_size, key_value_heads)
+        )
+    maximum_context = int(getattr(model_config, "max_position_embeddings", 0) or 0)
+    if maximum_context and context_length > maximum_context:
+        raise RuntimeError(
+            "generation needs context length %d but the model supports %d"
+            % (context_length, maximum_context)
+        )
     config = {
         "evaluation_protocol": EVALUATION_PROTOCOL,
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "softgrpo_upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
+        "parent_commit": os.environ.get("OPD_PARENT_COMMIT"),
+        "fork_commit": os.environ.get("OPD_SUBMODULE_COMMIT"),
         "generation_implementation": GENERATION_IMPLEMENTATION,
         "sampling_source": expected_sampling_source(
             args.mode, args.sampling_protocol
@@ -532,17 +684,20 @@ def run(args: argparse.Namespace) -> None:
         "generation_seeds": list(seeds),
         "sampling_protocol": args.sampling_protocol,
         "sampling": dict(protocol),
-        "num_gpus": args.num_gpus,
+        "parallelism": {
+            "tensor_parallel_size": tensor_parallel_size,
+            "data_parallel_size": data_parallel_size,
+            "world_size": world_size,
+            "load_balance_method": "round_robin",
+        },
         "batch_size": args.batch_size,
+        "max_running_requests": args.max_running_requests,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "context_length": context_length,
         "data_manifest_content_sha256": data_manifest.get("manifest_content_sha256"),
         "cuda_visible_devices_source": cuda_visibility_source,
     }
-    config["wandb_run_id"] = _stable_wandb_id(
-        model_label=args.model_label,
-        model_sha256=model["tree_sha256"],
-        mode=args.mode,
-        sampling_protocol=args.sampling_protocol,
-    )
+    config["wandb_run_id"] = _stable_wandb_id(config)
     manifest_path = (
         output_root / "raw" / args.model_label / args.mode / "generation_manifest.json"
     )
@@ -560,38 +715,17 @@ def run(args: argparse.Namespace) -> None:
     engine = None
     started = time.monotonic()
     completed = 0
+    committed_shards: list[Dict[str, Any]] = []
     succeeded = False
     try:
-        try:
-            import sglang as sgl
-            from transformers import AutoTokenizer
-        except ImportError as error:
-            raise RuntimeError(
-                "generation requires the pinned SofT-GRPO SGLang environment"
-            ) from error
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(model_root), local_files_only=True
-        )
-        for tag in ("<think>", "</think>"):
-            ids = tokenizer.encode(tag, add_special_tokens=False)
-            if len(ids) != 1:
-                raise RuntimeError("%s must be one atomic tokenizer ID" % tag)
-
-        datasets = {
-            benchmark: _load_benchmark(data_root / DATA_FILES[benchmark], benchmark)
-            for benchmark in benchmarks
-        }
-        rendered = {
-            benchmark: _render_prompts(tokenizer, rows)
-            for benchmark, rows in datasets.items()
-        }
-
         engine = sgl.Engine(
             model_path=str(model_root),
-            tp_size=args.num_gpus,
+            tp_size=tensor_parallel_size,
+            dp_size=data_parallel_size,
+            load_balance_method="round_robin",
             trust_remote_code=True,
             random_seed=11,
+            context_length=context_length,
             max_running_requests=args.max_running_requests,
             mem_fraction_static=args.gpu_memory_utilization,
             disable_cuda_graph=True,
@@ -601,6 +735,13 @@ def run(args: argparse.Namespace) -> None:
             max_topk=int(protocol["top_k"]),
             sampling_backend="flashinfer",
         )
+        observed_topology = engine.server_args
+        if (
+            int(observed_topology.tp_size) != tensor_parallel_size
+            or int(observed_topology.dp_size) != data_parallel_size
+            or observed_topology.load_balance_method != "round_robin"
+        ):
+            raise RuntimeError("SGLang did not preserve the requested TP/DP topology")
 
         for benchmark in benchmarks:
             rows = datasets[benchmark]
@@ -613,13 +754,30 @@ def run(args: argparse.Namespace) -> None:
                     benchmark,
                     generation_seed,
                 )
-                if data_path.exists() or sidecar_path.exists():
-                    shard = _verify_shard(data_path, sidecar_path)
+                shard = _resume_shard(
+                    data_path,
+                    sidecar_path,
+                    model_label=args.model_label,
+                    mode=args.mode,
+                    benchmark=benchmark,
+                    sample_index=sample_index,
+                    generation_seed=generation_seed,
+                    example_ids=[row["example_id"] for row in rows],
+                )
+                if shard is not None:
                     if shard["row_count"] != len(rows):
                         raise RuntimeError(
                             "committed generation shard has wrong row count"
                         )
                     completed += 1
+                    committed_shards.append(
+                        {
+                            "path": data_path.relative_to(output_root).as_posix(),
+                            "size": shard["size"],
+                            "sha256": shard["sha256"],
+                            "row_count": shard["row_count"],
+                        }
+                    )
                     continue
 
                 records: list[GenerationRecord] = []
@@ -693,6 +851,14 @@ def run(args: argparse.Namespace) -> None:
                         cap_total += int(capped)
                 shard = _write_shard(data_path, records)
                 completed += 1
+                committed_shards.append(
+                    {
+                        "path": data_path.relative_to(output_root).as_posix(),
+                        "size": shard["size"],
+                        "sha256": shard["sha256"],
+                        "row_count": shard["row_count"],
+                    }
+                )
                 elapsed = time.monotonic() - shard_started
                 wandb_run.log(
                     {
@@ -711,6 +877,20 @@ def run(args: argparse.Namespace) -> None:
         wandb_run.summary["evaluation/completed"] = True
         wandb_run.summary["evaluation/elapsed_seconds"] = time.monotonic() - started
         wandb_run.summary["evaluation/output_root"] = str(output_root)
+        completion_path = manifest_path.parent / "completion.json"
+        completion = {
+            "evaluation_protocol": EVALUATION_PROTOCOL,
+            "generation_manifest_sha256": file_sha256(manifest_path),
+            "model_label": args.model_label,
+            "mode": args.mode,
+            "benchmarks": benchmarks,
+            "sampling_protocol": args.sampling_protocol,
+            "shards_committed": completed,
+            "expected_shards": len(benchmarks) * len(seeds),
+            "rows_committed": sum(row["row_count"] for row in committed_shards),
+            "shards": committed_shards,
+        }
+        _atomic_write(completion_path, _canonical_json(completion))
         wandb_run.log_artifact(
             str(manifest_path),
             name="%s-%s-generation-manifest" % (args.model_label, args.mode),
@@ -719,12 +899,14 @@ def run(args: argparse.Namespace) -> None:
         succeeded = True
     finally:
         try:
-            if engine is not None:
-                engine.shutdown()
-        finally:
             if not succeeded:
                 wandb_run.summary["evaluation/completed"] = False
+            # The bundled SGLang shutdown terminates child processes, including
+            # W&B's service. Flush W&B before asking the engine to shut down.
             wandb_run.finish()
+        finally:
+            if engine is not None:
+                engine.shutdown()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -742,7 +924,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(EVALUATION_SAMPLING_PROTOCOLS),
         default="released_anchor",
     )
-    parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Legacy TP-only GPU count; prefer explicit TP/DP arguments.",
+    )
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-running-requests", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
@@ -751,8 +940,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.num_gpus <= 0 or args.batch_size <= 0 or args.max_running_requests <= 0:
-        raise ValueError("GPU and batch/request counts must be positive")
+    resolve_parallelism(
+        legacy_num_gpus=args.num_gpus,
+        tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+    )
+    if args.batch_size <= 0 or args.max_running_requests <= 0:
+        raise ValueError("batch/request counts must be positive")
     if not 0.0 < args.gpu_memory_utilization < 1.0:
         raise ValueError("gpu-memory-utilization must be in (0, 1)")
     run(args)

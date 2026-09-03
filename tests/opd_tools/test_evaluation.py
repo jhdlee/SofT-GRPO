@@ -17,12 +17,16 @@ from opd_tools.evaluation import (
 )
 from opd_tools.generate_eval import (
     EVALUATION_SAMPLING_PROTOCOLS,
+    _stable_wandb_id,
+    _resume_shard,
     _verify_shard,
     _write_shard,
     cleanup_stale_atomic_files,
     expected_engine_mode,
     expected_sampling_source,
     native_soft_diagnostics,
+    required_context_length,
+    resolve_parallelism,
 )
 
 
@@ -168,6 +172,37 @@ class EvaluationSchemaTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "authentication"):
                 _verify_shard(path, path.with_suffix(".manifest.json"))
 
+    def test_resume_adopts_only_an_exact_orphan_data_shard(self):
+        record = generation_record()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "seed_11.jsonl"
+            path.write_text(json.dumps(record.to_dict()) + "\n", encoding="utf-8")
+            sidecar = path.with_suffix(".manifest.json")
+            manifest = _resume_shard(
+                path,
+                sidecar,
+                model_label="initial",
+                mode="native_soft",
+                benchmark="math500",
+                sample_index=0,
+                generation_seed=11,
+                example_ids=["math500-0"],
+            )
+            self.assertEqual(manifest["row_count"], 1)
+            self.assertTrue(sidecar.is_file())
+            with self.assertRaisesRegex(ValueError, "wrong row identity"):
+                sidecar.unlink()
+                _resume_shard(
+                    path,
+                    sidecar,
+                    model_label="initial",
+                    mode="native_soft",
+                    benchmark="math500",
+                    sample_index=0,
+                    generation_seed=11,
+                    example_ids=["different"],
+                )
+
     def test_hard_token_schema_rejects_latent_diagnostics(self):
         with self.assertRaisesRegex(ValueError, "hard-token"):
             generation_record(
@@ -204,6 +239,36 @@ class EvaluationSchemaTests(unittest.TestCase):
             (matched["top_k"], matched["gumbel_softmax_temperature"]),
             (5, 0.1),
         )
+
+    def test_paper_anchor_uses_data_parallel_whole_node(self):
+        self.assertEqual(
+            resolve_parallelism(
+                legacy_num_gpus=None,
+                tensor_parallel_size=1,
+                data_parallel_size=8,
+            ),
+            (1, 8, 8),
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            resolve_parallelism(
+                legacy_num_gpus=8,
+                tensor_parallel_size=1,
+                data_parallel_size=8,
+            )
+
+    def test_context_guard_and_full_config_wandb_identity(self):
+        class Tokenizer:
+            @staticmethod
+            def encode(value):
+                return value.split()
+
+        self.assertEqual(
+            required_context_length(Tokenizer(), ["one two", "one two three"], 10),
+            14,
+        )
+        base = {"model_label": "initial", "mode": "native_soft", "top_k": 30}
+        changed = dict(base, top_k=5)
+        self.assertNotEqual(_stable_wandb_id(base), _stable_wandb_id(changed))
 
     def test_cleanup_stale_atomic_files_is_narrow(self):
         with tempfile.TemporaryDirectory() as directory:
