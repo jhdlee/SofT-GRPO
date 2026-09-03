@@ -195,6 +195,26 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            output_topk_gumbel_list=(
+                [output.output_topk_gumbel_list[i]]
+                if output.output_topk_gumbel_list
+                else None
+            ),
+            output_topk_gumbel_noise_list=(
+                [output.output_topk_gumbel_noise_list[i]]
+                if output.output_topk_gumbel_noise_list
+                else None
+            ),
+            output_topk_probs_list=(
+                [output.output_topk_probs_list[i]]
+                if output.output_topk_probs_list
+                else None
+            ),
+            output_topk_indices_list=(
+                [output.output_topk_indices_list[i]]
+                if output.output_topk_indices_list
+                else None
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
@@ -309,6 +329,26 @@ def _handle_output_by_index(output, i):
             output_hidden_states=(
                 [output.output_hidden_states[i]]
                 if output.output_hidden_states
+                else None
+            ),
+            output_topk_gumbel_list=(
+                [output.output_topk_gumbel_list[i]]
+                if output.output_topk_gumbel_list
+                else None
+            ),
+            output_topk_gumbel_noise_list=(
+                [output.output_topk_gumbel_noise_list[i]]
+                if output.output_topk_gumbel_noise_list
+                else None
+            ),
+            output_topk_probs_list=(
+                [output.output_topk_probs_list[i]]
+                if output.output_topk_probs_list
+                else None
+            ),
+            output_topk_indices_list=(
+                [output.output_topk_indices_list[i]]
+                if output.output_topk_indices_list
                 else None
             ),
             placeholder_tokens_idx=None,

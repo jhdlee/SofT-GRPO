@@ -233,6 +233,7 @@ class DetokenizerManager:
             # begin of soft thinking
             # ==========
             output_topk_gumbel_list=recv_obj.output_topk_gumbel_list,
+            output_topk_gumbel_noise_list=recv_obj.output_topk_gumbel_noise_list,
             output_topk_probs_list=recv_obj.output_topk_probs_list,
             output_topk_indices_list=recv_obj.output_topk_indices_list,
             # ==========

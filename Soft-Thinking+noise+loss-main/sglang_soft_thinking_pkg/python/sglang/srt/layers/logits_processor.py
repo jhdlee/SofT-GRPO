@@ -80,6 +80,11 @@ class LogitsProcessorOutput:
     # ==========
     topk_probs: Optional[torch.Tensor] = None
     topk_gumbels: Optional[torch.Tensor] = None
+    # Observational metadata only: the clipped Gumbel draw, sorted in exactly
+    # the same order as ``topk_gumbels`` and ``topk_indices``.  Keeping this
+    # compact top-k tensor lets an external replay recover the sampler's
+    # pre-noise log probabilities without persisting vocabulary logits.
+    topk_gumbel_noise: Optional[torch.Tensor] = None
     topk_indices: Optional[torch.Tensor] = None
     # ==========
     # end of soft thinking

@@ -207,6 +207,10 @@ class Sampler(nn.Module):
                     # max top k
                     topk_probs, topk_indices = torch.topk(probs, k=sampling_info.max_topk, dim=-1)  # slow
                     topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True))
+                    # Always define a sentinel for non-Gumbel and categorical
+                    # rows.  This is observational metadata and is not read by
+                    # the sampling path.
+                    logits_output.topk_gumbel_noise = torch.zeros_like(topk_probs)
 
                     # dirichlet noise (not used in paper)
                     if add_noise_dirichlet:  # slow
@@ -251,7 +255,12 @@ class Sampler(nn.Module):
                         topk_indices = torch.gather(topk_indices, dim=1, index=sorted_idx)
                         # if sampling_info.noise_factor.sum() != 0:
                         topk_gumbels = torch.gather(topk_gumbels, dim=1, index=sorted_idx)
+                        # Observational only: use the identical sort as the
+                        # support and perturbed logits.  It is never consumed
+                        # to select or embed an action.
+                        gumbels = torch.gather(gumbels, dim=1, index=sorted_idx)
                         logits_output.topk_gumbels = topk_gumbels
+                        logits_output.topk_gumbel_noise = gumbels
 
                     else:  # gaussian noise
                         if torch.any(sampling_info.deterministic_random_mask):
@@ -285,6 +294,7 @@ class Sampler(nn.Module):
                         # For rows where soft_thinking_modes is False
                         topk_probs[non_soft_mask] = 0.0
                         topk_indices[non_soft_mask] = 0
+                        logits_output.topk_gumbel_noise[non_soft_mask] = 0.0
 
                         # Assign the first element of each row to sampled_token_ids and set it to 1.0 in topk_probs
                         topk_probs[non_soft_mask, 0] = 1.0

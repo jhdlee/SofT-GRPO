@@ -539,6 +539,7 @@ class SchedulerOutputProcessorMixin:
         # Always initialize soft thinking output lists so they exist regardless of flag
         output_topk_probs_list = []
         output_topk_gumbel_list = []
+        output_topk_gumbel_noise_list = []
         output_topk_indices_list = []
         # ==========
         # end of soft thinking
@@ -610,6 +611,9 @@ class SchedulerOutputProcessorMixin:
                 # ==========
                 if self.enable_soft_thinking:
                     output_topk_gumbel_list.append(req.get_output_topk_gumbel_list())
+                    output_topk_gumbel_noise_list.append(
+                        req.get_output_topk_gumbel_noise_list()
+                    )
                     output_topk_probs_list.append(req.get_output_topk_prob_list())
                     output_topk_indices_list.append(req.get_output_topk_idx_list())
                 # ==========
@@ -652,6 +656,7 @@ class SchedulerOutputProcessorMixin:
                     # begin of soft thinking
                     # ==========
                     output_topk_gumbel_list,
+                    output_topk_gumbel_noise_list,
                     output_topk_probs_list,
                     output_topk_indices_list,
                     # ==========

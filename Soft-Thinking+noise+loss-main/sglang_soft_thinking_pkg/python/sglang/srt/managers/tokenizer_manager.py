@@ -1082,6 +1082,9 @@ class TokenizerManager:
                 meta_info["output_topk_gumbel_list"] = (
                     recv_obj.output_topk_gumbel_list[i]
                 )
+                meta_info["output_topk_gumbel_noise_list"] = (
+                    recv_obj.output_topk_gumbel_noise_list[i]
+                )
                 meta_info["output_topk_idx_list"] = (
                     recv_obj.output_topk_indices_list[i]
                 )
