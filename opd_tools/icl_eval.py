@@ -1709,8 +1709,9 @@ def run_aggregate(args: argparse.Namespace) -> None:
                     chunk_index=chunk_index,
                     example_ids=chunk_example_ids,
                 )
-                store.verify(chunk_key, expected_identity=chunk_identity)
-                records, _ = store.load(chunk_key)
+                records, _ = store.load(
+                    chunk_key, expected_identity=chunk_identity
+                )
                 _validate_completion_records(
                     records,
                     model_label=cell.model_label,

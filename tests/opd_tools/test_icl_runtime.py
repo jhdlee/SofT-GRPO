@@ -401,10 +401,17 @@ def test_atomic_chunk_commit_resume_and_authentication():
         first = store.commit("cell/chunk_0000", [record], [trajectory], identity=identity)
         second = store.commit("cell/chunk_0000", [record], [trajectory], identity=identity)
         assert first == second
-        records, arrays = store.load("cell/chunk_0000")
+        records, arrays = store.load(
+            "cell/chunk_0000", expected_identity=identity
+        )
         assert records == [record]
         assert arrays["latent_support_ids"].shape == (2, 5)
         assert arrays["latent_gumbel_noise"].shape == (2, 5)
+        with pytest.raises(RuntimeError, match="identity"):
+            store.load(
+                "cell/chunk_0000",
+                expected_identity={"cell": "wrong", "chunk": 0},
+            )
 
         records_path, _, _ = store.paths("cell/chunk_0000")
         with records_path.open("a", encoding="utf-8") as stream:

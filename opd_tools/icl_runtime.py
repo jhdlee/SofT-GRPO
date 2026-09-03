@@ -826,7 +826,12 @@ class AtomicChunkStore:
                         temporary.unlink()
         return None
 
-    def verify(self, chunk_key: str, *, expected_identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _verified_payload(
+        self,
+        chunk_key: str,
+        *,
+        expected_identity: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], list[CompletionRecord], dict[str, np.ndarray]]:
         records_path, replay_path, manifest_path = self.paths(chunk_key)
         existence = [path.is_file() for path in (records_path, replay_path, manifest_path)]
         if not all(existence):
@@ -869,6 +874,12 @@ class AtomicChunkStore:
                 raise RuntimeError("response token count differs from replay metadata")
             if len(trajectory.latent_support_ids) != record.latent_token_count:
                 raise RuntimeError("latent token count differs from replay metadata")
+        return manifest, records, arrays
+
+    def verify(self, chunk_key: str, *, expected_identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        manifest, _, _ = self._verified_payload(
+            chunk_key, expected_identity=expected_identity
+        )
         return manifest
 
     def commit(
@@ -910,13 +921,15 @@ class AtomicChunkStore:
         _atomic_bytes(manifest_path, canonical_json_bytes(manifest))
         return self.verify(chunk_key, expected_identity=identity)
 
-    def load(self, chunk_key: str) -> tuple[list[CompletionRecord], dict[str, np.ndarray]]:
-        self.verify(chunk_key)
-        records_path, replay_path, _ = self.paths(chunk_key)
-        with records_path.open("r", encoding="utf-8") as stream:
-            records = [CompletionRecord.from_mapping(json.loads(line)) for line in stream]
-        with np.load(replay_path, allow_pickle=False) as archive:
-            arrays = {name: archive[name] for name in archive.files}
+    def load(
+        self,
+        chunk_key: str,
+        *,
+        expected_identity: Mapping[str, Any] | None = None,
+    ) -> tuple[list[CompletionRecord], dict[str, np.ndarray]]:
+        _, records, arrays = self._verified_payload(
+            chunk_key, expected_identity=expected_identity
+        )
         return records, arrays
 
 
