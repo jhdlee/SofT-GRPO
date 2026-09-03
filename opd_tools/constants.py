@@ -8,6 +8,8 @@ MATH_VERIFY_VERSION: Final = "0.8.0"
 
 MODEL_ID: Final = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 MODEL_REVISION: Final = "c46dac620b4e4f12c5662a2133376a2823458d0e"
+TRAIN_MAX_PROMPT_TOKENS: Final = 2_048
+TRAIN_MAX_RESPONSE_TOKENS: Final = 8_192
 
 MATH_DATASET_ID: Final = "DigitalLearningGmbH/MATH-lighteval"
 MATH_DATASET_CONFIG: Final = "default"

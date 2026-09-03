@@ -50,7 +50,8 @@ if [[ "${OPD_ASSETS_PREFLIGHTED:-0}" != 1 ]]; then
     --cache-dir "${CACHE_ROOT}"
   "${PYTHON_BIN}" -m opd_tools.preflight \
     --model-dir "${MODEL_ROOT}" \
-    --data-dir "${DATA_ROOT}"
+    --data-dir "${DATA_ROOT}" \
+    --max-prompt-length 2048
 fi
 
 if [[ "${ARM}" == "baseline" ]]; then
@@ -82,7 +83,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   data.val_files="${DATA_ROOT}/math_lighteval_validation.parquet" \
   data.train_batch_size=64 \
   data.val_batch_size=128 \
-  data.max_prompt_length=1024 \
+  data.max_prompt_length=2048 \
   data.max_response_length=8192 \
   data.filter_overlong_prompts=true \
   data.truncation=error \

@@ -110,7 +110,10 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(result["student_payloads_checked"], 12)
         self.assertEqual(result["math_train_math500_overlap"], 0)
         self.assertEqual(result["tokenizer"]["token_ids"], {"<think>": 101, "</think>": 102})
-        self.assertLessEqual(result["max_rendered_train_prompt_tokens"], 1_024)
+        self.assertEqual(result["max_prompt_length"], 2_048)
+        self.assertLessEqual(
+            result["max_rendered_train_validation_prompt_tokens"], 2_048
+        )
 
 
 if __name__ == "__main__":

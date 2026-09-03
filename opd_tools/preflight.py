@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .assets import verify_model_snapshot
-from .constants import MATH_TRAIN_SIZE, MATH_VALIDATION_SIZE, STUDENT_PROMPT_SUFFIX
+from .constants import (
+    MATH_TRAIN_SIZE,
+    MATH_VALIDATION_SIZE,
+    STUDENT_PROMPT_SUFFIX,
+    TRAIN_MAX_PROMPT_TOKENS,
+)
 from .data import canonicalize_math_problem
 from .prepare import verify_materialized_data
 from .records import student_generation_payload
@@ -83,8 +88,9 @@ def run_preflight(
     parquet_reader: Optional[ParquetReader] = None,
     tokenizer_loader: Optional[TokenizerLoader] = None,
     enforce_pinned_contract: bool = True,
+    max_prompt_length: int = TRAIN_MAX_PROMPT_TOKENS,
 ) -> Dict[str, Any]:
-    """Authenticate assets and inspect every materialized training prompt."""
+    """Authenticate assets and inspect every train/validation prompt."""
 
     data_root = Path(data_dir).expanduser().resolve()
     model_root = Path(model_dir).expanduser().resolve()
@@ -131,23 +137,28 @@ def run_preflight(
 
     tokenizer = load_tokenizer(model_root)
     tokenizer_result = _validate_tokenizer(tokenizer)
+    if isinstance(max_prompt_length, bool) or not isinstance(max_prompt_length, int):
+        raise TypeError("max_prompt_length must be an integer")
+    if max_prompt_length <= 0:
+        raise ValueError("max_prompt_length must be positive")
     maximum_tokens = -1
     maximum_id = None
-    for row in train_rows:
-        prompt = row["prompt"]
-        token_ids = tokenizer.apply_chat_template(
-            prompt,
-            add_generation_prompt=True,
-            tokenize=True,
-        )
-        length = len(token_ids)
-        if length > maximum_tokens:
-            maximum_tokens = length
-            maximum_id = row["extra_info"]["example_id"]
-    if maximum_tokens > 1_024:
+    for rows in (train_rows, validation_rows):
+        for row in rows:
+            prompt = row["prompt"]
+            token_ids = tokenizer.apply_chat_template(
+                prompt,
+                add_generation_prompt=True,
+                tokenize=True,
+            )
+            length = len(token_ids)
+            if length > maximum_tokens:
+                maximum_tokens = length
+                maximum_id = row["extra_info"]["example_id"]
+    if maximum_tokens > max_prompt_length:
         raise ValueError(
-            "rendered train prompt exceeds 1024 tokens: %s has %d"
-            % (maximum_id, maximum_tokens)
+            "rendered train/validation prompt exceeds %d tokens: %s has %d"
+            % (max_prompt_length, maximum_id, maximum_tokens)
         )
 
     return {
@@ -163,8 +174,9 @@ def run_preflight(
         },
         "student_payloads_checked": len(train_rows) + len(validation_rows),
         "math_train_math500_overlap": 0,
-        "max_rendered_train_prompt_tokens": maximum_tokens,
-        "max_rendered_train_prompt_example_id": maximum_id,
+        "max_prompt_length": max_prompt_length,
+        "max_rendered_train_validation_prompt_tokens": maximum_tokens,
+        "max_rendered_train_validation_prompt_example_id": maximum_id,
         "tokenizer": tokenizer_result,
     }
 
@@ -173,12 +185,24 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--max-prompt-length", type=int, default=TRAIN_MAX_PROMPT_TOKENS
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
-    print(json.dumps(run_preflight(args.data_dir, args.model_dir), sort_keys=True))
+    print(
+        json.dumps(
+            run_preflight(
+                args.data_dir,
+                args.model_dir,
+                max_prompt_length=args.max_prompt_length,
+            ),
+            sort_keys=True,
+        )
+    )
     return 0
 
 

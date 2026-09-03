@@ -8,7 +8,12 @@ from typing import Any, Dict, Mapping
 
 import yaml
 
-from opd_tools.constants import MATH_TRAIN_SIZE, STUDENT_PROMPT_SUFFIX
+from opd_tools.constants import (
+    MATH_TRAIN_SIZE,
+    STUDENT_PROMPT_SUFFIX,
+    TRAIN_MAX_PROMPT_TOKENS,
+    TRAIN_MAX_RESPONSE_TOKENS,
+)
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -87,6 +92,7 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
         deliberate = {
             "data.train_files",
             "data.val_files",
+            "data.max_prompt_length",
             "actor_rollout_ref.model.path",
             "trainer.logger",
             "trainer.project_name",
@@ -154,6 +160,7 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
         expected = {
             "data.train_files": "${DATA_ROOT}/math_lighteval_train.parquet",
             "data.val_files": "${DATA_ROOT}/math_lighteval_validation.parquet",
+            "data.max_prompt_length": TRAIN_MAX_PROMPT_TOKENS,
             "data.seed": 11,
             "actor_rollout_ref.model.path": "${MODEL_ROOT}",
             "actor_rollout_ref.rollout.deterministic_sampling": True,
@@ -205,6 +212,17 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
         optimizer_steps = rollout_iterations * (prompt_batch // mini_batch)
         self.assertEqual(rollout_iterations, 327)
         self.assertEqual(optimizer_steps, 654)
+        self.assertEqual(
+            self.study_overrides["data.max_prompt_length"], TRAIN_MAX_PROMPT_TOKENS
+        )
+        self.assertEqual(
+            self.study_overrides["data.max_response_length"],
+            TRAIN_MAX_RESPONSE_TOKENS,
+        )
+        self.assertLessEqual(
+            TRAIN_MAX_PROMPT_TOKENS + TRAIN_MAX_RESPONSE_TOKENS,
+            self.study_overrides["actor_rollout_ref.rollout.max_model_len"],
+        )
         self.assertEqual(
             STUDENT_PROMPT_SUFFIX,
             " Let's think step by step and output the final answer within \\boxed{}.",
