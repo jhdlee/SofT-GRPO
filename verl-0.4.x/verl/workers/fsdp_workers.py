@@ -36,6 +36,13 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
+from verl.opd import (
+    OPDConfig,
+    TeacherType,
+    freeze_teacher_,
+    parameter_squared_distance_sum_and_count,
+    validate_resource_limits,
+)
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
@@ -175,6 +182,7 @@ class ActorRolloutRefWorker(Worker):
         use_liger=False,
         role="actor",
         enable_activation_offload=False,
+        cpu_offload_params=None,
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
@@ -294,7 +302,9 @@ class ActorRolloutRefWorker(Worker):
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        if cpu_offload_params is None:
+            cpu_offload_params = role == "ref"
+        cpu_offload = CPUOffload(offload_params=True) if cpu_offload_params else None
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
@@ -479,6 +489,14 @@ class ActorRolloutRefWorker(Worker):
 
         from omegaconf import OmegaConf
 
+        opd_mapping = OmegaConf.to_container(
+            self.config.get("opd", OmegaConf.create({"enabled": False})),
+            resolve=True,
+        )
+        self.opd_config = OPDConfig.from_mapping(opd_mapping)
+        self.opd_teacher_module_fsdp = None
+        self.opd_checkpoint_manager = None
+
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
         use_remove_padding = self.config.model.get("use_remove_padding", False)
@@ -518,6 +536,37 @@ class ActorRolloutRefWorker(Worker):
             if fsdp_version(self.actor_module_fsdp) == 1:
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
+            if (
+                self._is_actor
+                and self.opd_config.active
+                and self.opd_config.teacher.type is not TeacherType.CURRENT_ACTOR
+            ):
+                self.opd_teacher_module_fsdp = self._build_model_optimizer(
+                    model_path=local_path,
+                    fsdp_config=fsdp_config,
+                    optim_config=None,
+                    override_model_config=override_model_config,
+                    use_remove_padding=use_remove_padding,
+                    use_fused_kernels=False,
+                    enable_gradient_checkpointing=False,
+                    trust_remote_code=self.config.model.get("trust_remote_code", False),
+                    use_liger=False,
+                    role="ref",
+                    enable_activation_offload=False,
+                    cpu_offload_params=False,
+                )[0]
+                freeze_teacher_(self.opd_teacher_module_fsdp)
+                squared_distance, parameter_count = parameter_squared_distance_sum_and_count(
+                    self.opd_teacher_module_fsdp,
+                    self.actor_module_fsdp,
+                )
+                dist.all_reduce(squared_distance)
+                dist.all_reduce(parameter_count)
+                if float(squared_distance.item()) != 0.0:
+                    raise RuntimeError(
+                        "privileged OPD teacher did not initialize identically to the actor"
+                    )
+
             if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
@@ -531,7 +580,14 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
-            self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
+            self.actor = DataParallelPPOActor(
+                config=self.config.actor,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                opd_config=opd_mapping,
+                opd_teacher_module=self.opd_teacher_module_fsdp,
+                tokenizer=self.tokenizer,
+            )
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -564,6 +620,17 @@ class ActorRolloutRefWorker(Worker):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
+            if (
+                self.opd_teacher_module_fsdp is not None
+                and self.opd_config.teacher.type is TeacherType.EMA
+            ):
+                self.opd_checkpoint_manager = FSDPCheckpointManager(
+                    model=self.opd_teacher_module_fsdp,
+                    optimizer=None,
+                    lr_scheduler=None,
+                    processing_class=self.processor if self.processor is not None else self.tokenizer,
+                    checkpoint_contents=["model", "optimizer", "extra"],
+                )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -588,6 +655,18 @@ class ActorRolloutRefWorker(Worker):
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            metrics["perf/host_memory_percent"] = psutil.virtual_memory().percent
+            metrics["perf/cpu_utilization_percent"] = psutil.cpu_percent(interval=None)
+
+            integrity = self.config.get("rollout_integrity", {})
+            if bool(integrity.get("enabled", False)):
+                # Enforce the ceilings on every rank and every iteration.  The
+                # CUDA value is a process-lifetime high-water mark, so a later
+                # longer trajectory cannot silently exceed the canary result.
+                validate_resource_limits(
+                    hbm_peak_gib=metrics["perf/max_memory_allocated_gb"],
+                    host_ram_percent=metrics["perf/host_memory_percent"],
+                )
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
@@ -727,6 +806,24 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
+        if self.opd_checkpoint_manager is not None:
+            teacher_path = os.path.join(local_path, "opd_teacher")
+            self.opd_checkpoint_manager.save_checkpoint(
+                local_path=teacher_path,
+                hdfs_path=None,
+                global_step=global_step,
+                max_ckpt_to_keep=max_ckpt_to_keep,
+            )
+            state_path = os.path.join(
+                teacher_path,
+                f"ema_state_world_size_{self.world_size}_rank_{self.rank}.json",
+            )
+            temporary_state_path = f"{state_path}.tmp"
+            with open(temporary_state_path, "w", encoding="utf-8") as handle:
+                json.dump(self.actor.ema_state.state_dict(), handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_state_path, state_path)
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
@@ -764,6 +861,21 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        if self.opd_checkpoint_manager is not None:
+            teacher_path = os.path.join(local_path, "opd_teacher")
+            state_path = os.path.join(
+                teacher_path,
+                f"ema_state_world_size_{self.world_size}_rank_{self.rank}.json",
+            )
+            if not os.path.isdir(teacher_path) or not os.path.isfile(state_path):
+                raise RuntimeError(f"EMA checkpoint is incomplete under {teacher_path}")
+            self.opd_checkpoint_manager.load_checkpoint(
+                local_path=teacher_path,
+                hdfs_path=None,
+                del_local_after_load=del_local_after_load,
+            )
+            with open(state_path, encoding="utf-8") as handle:
+                self.actor.ema_state.load_state_dict(json.load(handle))
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

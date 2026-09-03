@@ -30,6 +30,7 @@ else:
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.stateless_random import expand_parallel_sampling_params
 
 
 @dataclass
@@ -296,12 +297,12 @@ class GenerateReqInput:
 
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""
-        if self.sampling_params is None:
-            self.sampling_params = [{}] * num
-        elif isinstance(self.sampling_params, dict):
-            self.sampling_params = [self.sampling_params] * num
-        else:  # Already a list
-            self.sampling_params = self.sampling_params * self.parallel_sample_num
+        self.sampling_params = expand_parallel_sampling_params(
+            self.sampling_params,
+            batch_size=self.batch_size,
+            parallel_sample_num=self.parallel_sample_num,
+        )
+        assert len(self.sampling_params) == num
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""

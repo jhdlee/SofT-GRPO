@@ -27,7 +27,8 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import PreTrainedTokenizer
-from verl.utils.device import get_torch_device, get_device_name
+
+from verl.utils.device import get_device_name, get_torch_device
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -160,7 +161,10 @@ def logprobs_from_logits_topk_gumbel(logits, rollout_topk_ids, rollout_topk_gumb
         # print(f"output_gumbel_and_answer {output.max().item()} {output.min().item()}")
         output = output.view(*batch_dim)
     else:
-        output = logprobs_from_logits_v2(logits, labels)
+        raise RuntimeError(
+            "continuous top-k Gumbel replay requires FlashAttention cross entropy; "
+            "categorical fallback is forbidden"
+        )
     return output
 
 

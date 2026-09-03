@@ -15,6 +15,8 @@
 import torch
 from typing import Any, Dict, List, Optional, Union
 
+from sglang.srt.sampling.stateless_random import MAX_SEED
+
 _SAMPLING_EPS = 1e-6
 
 
@@ -70,6 +72,7 @@ class SamplingParams:
         noise_gumbel: bool = True,
         noise_on_logits: bool = True,
         noise_on_inputs: bool = False,
+        seed: Optional[int] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -89,6 +92,10 @@ class SamplingParams:
         self.noise_gumbel = noise_gumbel
         self.noise_on_logits = noise_on_logits
         self.noise_on_inputs = noise_on_inputs
+        # ``seed`` is request-local.  Unlike the process-wide server seed, it
+        # drives a counter-based stream and therefore survives exact resume
+        # without restoring SGLang's global CUDA RNG state.
+        self.seed = None if seed is None else int(seed)
         self.after_thinking_temperature = after_thinking_temperature
         self.after_thinking_top_p = after_thinking_top_p
         self.after_thinking_top_k = after_thinking_top_k
@@ -133,6 +140,10 @@ class SamplingParams:
             self.after_thinking_top_k = 1 << 30  # whole vocabulary
 
     def verify(self):
+        if self.seed is not None and not 0 <= self.seed <= MAX_SEED:
+            raise ValueError(
+                f"seed must be in [0, {MAX_SEED}], got {self.seed}."
+            )
         if self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be non-negative, got {self.temperature}."

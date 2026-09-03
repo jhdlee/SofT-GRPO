@@ -102,6 +102,7 @@ from sglang.srt.managers.multimodal_processor import (
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.stateless_random import derive_parallel_seed
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
@@ -702,9 +703,18 @@ class TokenizerManager:
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.sampling_params = copy.copy(
+                        tokenized_obj.sampling_params
+                    )
+                    if tokenized_obj.sampling_params.seed is not None:
+                        tokenized_obj.sampling_params.seed = derive_parallel_seed(
+                            tokenized_obj.sampling_params.seed,
+                            sample_index,
+                        )
+                    tmp_obj.sampling_params = tokenized_obj.sampling_params
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))

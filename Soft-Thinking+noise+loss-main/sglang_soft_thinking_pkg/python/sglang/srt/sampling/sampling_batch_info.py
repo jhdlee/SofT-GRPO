@@ -31,6 +31,13 @@ class SamplingBatchInfo:
     # begin of soft thinking
     # ==========
     is_all_no_noise: bool
+
+    # Request-local deterministic random state.  The counter is the number of
+    # already emitted response tokens, so reconstructing a retracted request
+    # resumes the exact stream without process-global RNG state.
+    random_seeds: torch.Tensor
+    random_counters: torch.Tensor
+    deterministic_random_mask: torch.Tensor
     # ==========
     # end of soft thinking
     # ==========
@@ -114,6 +121,16 @@ class SamplingBatchInfo:
         ).to(device, non_blocking=True)
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        random_seeds = torch.tensor(
+            [r.sampling_params.seed if r.sampling_params.seed is not None else 0 for r in reqs],
+            dtype=torch.int64,
+        ).to(device, non_blocking=True)
+        random_counters = torch.tensor(
+            [len(r.output_ids) for r in reqs], dtype=torch.int64
+        ).to(device, non_blocking=True)
+        deterministic_random_mask = torch.tensor(
+            [r.sampling_params.seed is not None for r in reqs], dtype=torch.bool
         ).to(device, non_blocking=True)
 
         # ==========
@@ -237,6 +254,9 @@ class SamplingBatchInfo:
             early_stopping_length_threshold=early_stopping_length_threshold,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             is_all_no_noise=False,
+            random_seeds=random_seeds,
+            random_counters=random_counters,
+            deterministic_random_mask=deterministic_random_mask,
             need_after_thinking_min_p_sampling=any(r.sampling_params.after_thinking_min_p > 0 for r in reqs),
             enable_soft_thinking=batch.enable_soft_thinking,
             noise_factor=noise_factor,
@@ -327,6 +347,9 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "random_seeds",
+            "random_counters",
+            "deterministic_random_mask",
         ]
         # ==========
         # begin of soft thinking
@@ -440,6 +463,9 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "random_seeds",
+            "random_counters",
+            "deterministic_random_mask",
         ]
         # ==========
         # begin of soft thinking
@@ -467,4 +493,3 @@ class SamplingBatchInfo:
         self.is_all_no_noise |= other.is_all_no_noise
         self.need_min_p_sampling |= other.need_min_p_sampling
         self.need_after_thinking_min_p_sampling |= other.need_after_thinking_min_p_sampling
-

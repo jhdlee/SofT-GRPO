@@ -13,6 +13,8 @@ data:
   return_raw_chat: False
   return_full_prompt: False
   shuffle: True
+  # Shared by the dataloader and request-local rollout streams.
+  seed: 1
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
   filter_overlong_prompts_workers: 1
   truncation: error
@@ -116,6 +118,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 2
     max_num_batched_tokens: 8192
     max_model_len: null
+    deterministic_sampling: false
     max_num_seqs: 1024
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
@@ -254,6 +257,21 @@ algorithm:
   pf_ppo:
     reweight_method: pow  # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
+  # Auxiliary on-policy distillation. This remains public under
+  # ``algorithm.opd``; main_ppo copies the resolved mapping into the colocated
+  # actor/rollout worker config before worker construction.
+  opd:
+    enabled: true
+    beta_base: 0.001
+    schedule: warmup_constant  # [warmup_constant, warmup_decay]
+    warmup_fraction: 0.10
+    teacher:
+      type: ema  # [ema, current_actor, frozen_initial]
+      ema_decay: 0.99
+    kl_direction: teacher_to_student  # [teacher_to_student, student_to_teacher]
+    trajectory_gate: all  # [all, positive_advantage]
+    prompt_template: sdft  # [sdft, sdpg]
+    temperature: 1.0
 
 trainer:
   balance_batch: True
@@ -277,11 +295,38 @@ trainer:
   default_hdfs_dir: null
   del_local_ckpt_after_load: False
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  # Atomic driver-level retention. BEST is preserved in addition to these two.
+  checkpoint_keep_latest: 2
+  # Kept as accepted upstream compatibility fields. Atomic PPO checkpoints
+  # deliberately pass ``None`` to worker-level rotation and use the driver
+  # setting above, because worker managers see only temporary directory names.
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
+  checkpoint_best_metric: val/math_verify/mean_at_1
+  checkpoint_best_mode: max
+  checkpoint_max_seconds: 720
+  # Optional file touched by a Slurm signal handler. It is polled only after a
+  # complete rollout iteration, then forces a committed checkpoint and a clean
+  # driver return so the shell can requeue the job.
+  requeue_signal_file: null
+  # Smoke/resume hook: stop after this many complete rollout iterations in one
+  # process without changing trainer.total_training_steps (the schedule horizon).
+  max_rollout_iterations_per_invocation: null
   # The timeout for ray worker group to wait for the register center to be ready
   ray_wait_register_center_timeout: 300
   device: cuda
+  # Fail-closed checks used by the two-GPU smoke and each production job's
+  # first rollout. Kept disabled in the upstream-compatible default config and
+  # enabled explicitly by the seed-11 launchers.
+  rollout_integrity:
+    enabled: false
+    gate_first_n_iterations: 0
+    max_cap_rate: 0.05
+    max_all_soft_rate: 0.05
+    min_close_tag_rate: 0.95
+    min_soft_to_hard_rate: 0.95
+    min_categorical_boxed_answer_rate: 0.95
+    max_replay_ratio_abs_error: 1.0e-4
 
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.

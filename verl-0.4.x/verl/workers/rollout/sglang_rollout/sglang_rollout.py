@@ -77,6 +77,10 @@ from verl.workers.rollout.schemas import (
     FinishReasonTypeEnum,
     Message,
 )
+from verl.workers.rollout.sglang_rollout.deterministic_sampling import (
+    build_request_sampling_params,
+    expand_parallel_seeds,
+)
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
 try:
@@ -684,12 +688,43 @@ class SGLangRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            request_sampling_params = self.sampling_params
+            expanded_sampling_seeds = None
+            if bool(self.config.get("deterministic_sampling", False)) and do_sample:
+                if "rollout_iteration" not in prompts.meta_info:
+                    raise RuntimeError(
+                        "deterministic_sampling requires prompts.meta_info['rollout_iteration']"
+                    )
+                if "rollout_seed" not in prompts.meta_info:
+                    raise RuntimeError(
+                        "deterministic_sampling requires prompts.meta_info['rollout_seed']"
+                    )
+
+                example_identities = non_tensor_batch.get(
+                    "index", np.arange(batch_size, dtype=np.int64)
+                )
+                external_sample_indices = non_tensor_batch.get(
+                    "rollout_sample_index", np.zeros(batch_size, dtype=np.int64)
+                )
+                request_sampling_params, base_sampling_seeds = build_request_sampling_params(
+                    self.sampling_params,
+                    root_seed=int(prompts.meta_info["rollout_seed"]),
+                    rollout_iteration=int(prompts.meta_info["rollout_iteration"]),
+                    example_identities=example_identities,
+                    prompt_token_ids=idx_list,
+                    external_sample_indices=external_sample_indices,
+                )
+                expanded_sampling_seeds = expand_parallel_seeds(
+                    base_sampling_seeds,
+                    int(self.sampling_params.get("n", 1)),
+                )
+
             if self._tp_rank == 0:  # go in
                 loop = asyncio.get_event_loop()
                 output = loop.run_until_complete(
                     self._engine.async_generate(
                         prompt=None,  # because we have already convert it to prompt token id
-                        sampling_params=self.sampling_params,
+                        sampling_params=request_sampling_params,
                         return_logprob=True,
                         input_ids=idx_list,
                         image_data=image_list,
@@ -743,6 +778,20 @@ class SGLangRollout(BaseRollout):
                     _non_tensor_batch[key] = np.repeat(val, self.sampling_params["n"], axis=0)
             else:
                 _non_tensor_batch = non_tensor_batch
+
+            if expanded_sampling_seeds is None:
+                rollout_sampling_seed = torch.full(
+                    (batch_size,), -1, dtype=torch.int64, device=idx.device
+                )
+            else:
+                if len(expanded_sampling_seeds) != batch_size:
+                    raise RuntimeError(
+                        "expanded deterministic seed count does not match rollout batch "
+                        f"({len(expanded_sampling_seeds)} != {batch_size})"
+                    )
+                rollout_sampling_seed = torch.tensor(
+                    expanded_sampling_seeds, dtype=torch.int64, device=idx.device
+                )
             seq = torch.cat([idx, response], dim=-1)
             rollout_topk_ids = torch.cat([idx_topk, rollout_topk_ids], dim=1)
             rollout_topk_gumbels = torch.cat(
@@ -779,6 +828,7 @@ class SGLangRollout(BaseRollout):
                     dtype=rollout_topk_gumbels.dtype,
                     device=rollout_topk_gumbels.device
                 ),
+                "rollout_sampling_seed": rollout_sampling_seed,
             },
             batch_size=batch_size,
         )

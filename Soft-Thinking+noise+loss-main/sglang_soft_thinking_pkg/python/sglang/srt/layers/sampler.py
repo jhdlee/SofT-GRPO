@@ -10,8 +10,11 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.stateless_random import (
+    stateless_categorical,
+    stateless_gumbel,
+)
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
-import torch.nn.functional as F
 
 if is_cuda():
     from sgl_kernel import (
@@ -24,6 +27,53 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+
+
+def _request_local_gumbel(
+    reference: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+) -> torch.Tensor:
+    """Draw Gumbels while leaving seeded rows independent of global RNG."""
+
+    deterministic = sampling_info.deterministic_random_mask
+    if not torch.any(deterministic):
+        return -torch.empty_like(reference).exponential_().log()
+
+    result = torch.empty_like(reference)
+    unseeded = ~deterministic
+    if torch.any(unseeded):
+        result[unseeded] = -torch.empty_like(reference[unseeded]).exponential_().log()
+    result[deterministic] = stateless_gumbel(
+        sampling_info.random_seeds[deterministic],
+        sampling_info.random_counters[deterministic],
+        width=reference.shape[-1],
+        stream=0,
+        dtype=reference.dtype,
+    )
+    return result
+
+
+def _request_local_categorical(
+    probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+) -> torch.Tensor:
+    """Draw categorical IDs from independent per-request streams."""
+
+    deterministic = sampling_info.deterministic_random_mask
+    if not torch.any(deterministic):
+        return torch.multinomial(probs, num_samples=1)
+
+    result = torch.empty((probs.shape[0], 1), dtype=torch.int64, device=probs.device)
+    unseeded = ~deterministic
+    if torch.any(unseeded):
+        result[unseeded] = torch.multinomial(probs[unseeded], num_samples=1)
+    result[deterministic] = stateless_categorical(
+        probs[deterministic],
+        sampling_info.random_seeds[deterministic],
+        sampling_info.random_counters[deterministic],
+        stream=1,
+    )
+    return result
 
 
 class Sampler(nn.Module):
@@ -68,7 +118,6 @@ class Sampler(nn.Module):
         # ==========
         # begin of soft thinking
         # ==========
-        probs_clone = None
         # ==========
         # end of soft thinking
         # ==========
@@ -143,8 +192,6 @@ class Sampler(nn.Module):
                     top_ps = torch.where(soft_mask, sampling_info.top_ps, sampling_info.after_thinking_top_ps)
                     top_ks = torch.where(soft_mask, sampling_info.top_ks, sampling_info.after_thinking_top_ks)
                     min_ps = torch.where(soft_mask, sampling_info.min_ps, sampling_info.after_thinking_min_ps)
-                    dirichlet_alphas = sampling_info.dirichlet_alphas
-
                     # top k top p renorm
                     probs = top_k_renorm_prob(probs, top_ks)
                     probs = top_p_renorm_prob(probs, top_ps)
@@ -163,6 +210,11 @@ class Sampler(nn.Module):
 
                     # dirichlet noise (not used in paper)
                     if add_noise_dirichlet:  # slow
+                        if torch.any(sampling_info.deterministic_random_mask):
+                            raise RuntimeError(
+                                "request-local deterministic sampling supports the released "
+                                "Gumbel path, not Dirichlet noise"
+                            )
                         conc = topk_probs.clone() * 1.0
                         gamma_dist = torch.distributions.Gamma(conc, torch.ones_like(conc))
                         gamma_samples = gamma_dist.rsample()
@@ -182,10 +234,8 @@ class Sampler(nn.Module):
                     # gumbel softmax noise (not used in paper)
                     elif add_noise_gumbel_softmax:  # slow
                         topk_logits = torch.log(topk_probs + 1e-6)
-                        gumbels = (
-                            -torch.empty_like(topk_logits)
-                            .exponential_()
-                            .log()
+                        gumbels = _request_local_gumbel(
+                            topk_logits, sampling_info
                         ).clamp(-1.5, 3)  # ~Gumbel(0,1)
                         # TODO: Add noise on logits
                         # if sampling_info.noise_factor.sum() != 0:
@@ -204,6 +254,11 @@ class Sampler(nn.Module):
                         logits_output.topk_gumbels = topk_gumbels
 
                     else:  # gaussian noise
+                        if torch.any(sampling_info.deterministic_random_mask):
+                            raise RuntimeError(
+                                "request-local deterministic sampling supports the released "
+                                "Gumbel path, not Gaussian noise"
+                            )
                         mu = topk_probs
                         normal_dist = torch.distributions.Normal(mu, torch.ones_like(mu) * 0.05)
                         normal_samples = normal_dist.rsample()
@@ -223,7 +278,9 @@ class Sampler(nn.Module):
                     # after thinking sampling
                     non_soft_mask = ~soft_mask
                     if any(non_soft_mask):
-                        sampled_token_ids = torch.multinomial(probs, num_samples=1)
+                        sampled_token_ids = _request_local_categorical(
+                            probs, sampling_info
+                        )
 
                         # For rows where soft_thinking_modes is False
                         topk_probs[non_soft_mask] = 0.0
@@ -241,7 +298,18 @@ class Sampler(nn.Module):
                 # end of soft thinking
                 # ==========
                 else:
-                    if sampling_info.need_min_p_sampling:
+                    if torch.any(sampling_info.deterministic_random_mask):
+                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                        if sampling_info.need_min_p_sampling:
+                            max_prob = probs.max(dim=-1, keepdim=True).values
+                            thresholds = max_prob * sampling_info.min_ps.view(-1, 1)
+                            probs.masked_fill_(probs < thresholds, 0.0)
+                            probs.div_(probs.sum(dim=-1, keepdim=True))
+                        batch_next_token_ids = _request_local_categorical(
+                            probs, sampling_info
+                        ).view(-1)
+                    elif sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                         batch_next_token_ids = min_p_sampling_from_probs(
@@ -279,6 +347,10 @@ class Sampler(nn.Module):
                 raise ValueError(
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
                 )
+
+            sampling_info.random_counters.add_(
+                sampling_info.deterministic_random_mask.to(torch.int64)
+            )
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
