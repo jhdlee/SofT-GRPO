@@ -458,6 +458,11 @@ def _write_checkpoint_manifest(
     if not actor_state_entries:
         raise RuntimeError("checkpoint payload has no actor model/optimizer shards")
     checkpoint_provenance = validate_checkpoint_provenance(dict(provenance))
+    opd_teacher_entries = [
+        entry
+        for entry in inventory
+        if str(entry["path"]).startswith("actor/opd_teacher/")
+    ]
     manifest: dict[str, object] = {
         "schema_version": _CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_name": checkpoint_name,
@@ -486,6 +491,13 @@ def _write_checkpoint_manifest(
         "actor_model_optimizer_tree_sha256": _inventory_digest(actor_state_entries),
         "files": inventory,
     }
+    if opd_teacher_entries:
+        # Includes every teacher model shard and the per-rank EMA counter.
+        # This permits an exact direct-vs-resumed OPD comparison without
+        # conflating it with invocation-only driver state.
+        manifest["opd_teacher_tree_sha256"] = _inventory_digest(
+            opd_teacher_entries
+        )
     manifest_path = os.path.join(checkpoint_dir, _CHECKPOINT_MANIFEST)
     temporary_path = f"{manifest_path}.{uuid.uuid4().hex}.tmp"
     try:
@@ -610,6 +622,17 @@ def _verify_checkpoint(
         raise RuntimeError("checkpoint manifest has no actor model/optimizer shards")
     if manifest.get("actor_model_optimizer_tree_sha256") != _inventory_digest(actor_state_entries):
         raise RuntimeError("checkpoint actor model/optimizer digest is inconsistent")
+    opd_teacher_entries = [
+        entry
+        for path, entry in expected.items()
+        if path.startswith("actor/opd_teacher/")
+    ]
+    teacher_digest = manifest.get("opd_teacher_tree_sha256")
+    if opd_teacher_entries:
+        if teacher_digest != _inventory_digest(opd_teacher_entries):
+            raise RuntimeError("checkpoint OPD teacher digest is inconsistent")
+    elif teacher_digest is not None:
+        raise RuntimeError("checkpoint has an OPD teacher digest without teacher state")
     return manifest
 
 

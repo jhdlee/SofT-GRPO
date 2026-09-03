@@ -181,11 +181,21 @@ def _stage_checkpoint(
     step: int,
     metric: float | None = None,
     provenance=None,
+    with_opd_teacher: bool = False,
 ) -> Path:
     temporary = root / f".global_step_{step}.incomplete.test"
     (temporary / "actor").mkdir(parents=True)
     (temporary / "actor" / "model_world_size_2_rank_0.pt").write_bytes(f"model-{step}".encode())
     (temporary / "actor" / "optim_world_size_2_rank_0.pt").write_bytes(f"optim-{step}".encode())
+    if with_opd_teacher:
+        teacher = temporary / "actor" / "opd_teacher"
+        teacher.mkdir()
+        (teacher / "model_world_size_2_rank_0.pt").write_bytes(
+            f"teacher-{step}".encode()
+        )
+        (teacher / "ema_state_world_size_2_rank_0.json").write_text(
+            json.dumps({"update_count": step, "last_rollout_iteration": step - 1})
+        )
     (temporary / "data.pt").write_bytes(f"data-{step}".encode())
     (temporary / "driver_state.pt").write_bytes(f"driver-{step}".encode())
     rollout_record = helpers["_build_rollout_integrity_record"](
@@ -253,6 +263,27 @@ def test_atomic_manifest_commit_and_stale_tracker_recovery(tmp_path, checkpoint_
     assert helpers["_verified_rollout_trajectory_digest"](str(second)) == json.loads(
         (second / "rollout_metadata.json").read_text()
     )["trajectory_sha256"]
+
+
+def test_manifest_authenticates_opd_teacher_and_ema_counter(
+    tmp_path, checkpoint_helpers
+):
+    checkpoint = _stage_checkpoint(
+        checkpoint_helpers, tmp_path, 1, with_opd_teacher=True
+    )
+    manifest = checkpoint_helpers["_verify_checkpoint"](str(checkpoint))
+    assert re.fullmatch(r"[0-9a-f]{64}", manifest["opd_teacher_tree_sha256"])
+    state_path = (
+        checkpoint
+        / "actor"
+        / "opd_teacher"
+        / "ema_state_world_size_2_rank_0.json"
+    )
+    state_path.write_text(
+        json.dumps({"update_count": 999, "last_rollout_iteration": 998})
+    )
+    with pytest.raises(RuntimeError, match="(?:size|hash) mismatch"):
+        checkpoint_helpers["_verify_checkpoint"](str(checkpoint))
 
 
 def test_hash_verification_fails_before_deserialization(tmp_path, checkpoint_helpers):

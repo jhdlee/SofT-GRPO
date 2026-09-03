@@ -31,6 +31,18 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _inventory_digest(entries: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for entry in sorted(entries, key=lambda item: str(item["path"])):
+        digest.update(str(entry["path"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(entry["size"]).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(entry["sha256"]).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def verified_manifest(run_root: Path, step: int) -> dict[str, Any]:
     checkpoint = run_root / f"global_step_{step}"
     manifest_path = checkpoint / "checkpoint_manifest.json"
@@ -56,6 +68,21 @@ def verified_manifest(run_root: Path, step: int) -> dict[str, Any]:
             raise RuntimeError(f"checkpoint payload size mismatch: {payload}")
         if _sha256(payload) != entry.get("sha256"):
             raise RuntimeError(f"checkpoint payload hash mismatch: {payload}")
+    teacher_entries = [
+        entry
+        for entry in files
+        if str(entry["path"]).startswith("actor/opd_teacher/")
+    ]
+    teacher_digest = manifest.get("opd_teacher_tree_sha256")
+    if teacher_entries:
+        if teacher_digest != _inventory_digest(teacher_entries):
+            raise RuntimeError(
+                f"checkpoint OPD teacher digest mismatch: {manifest_path}"
+            )
+    elif teacher_digest is not None:
+        raise RuntimeError(
+            f"checkpoint has an OPD teacher digest without teacher state: {manifest_path}"
+        )
     for field in (
         "actor_model_optimizer_tree_sha256",
         "rollout_trajectory_sha256",
@@ -118,6 +145,12 @@ def main() -> None:
         "rollout_trajectory_sha256",
         "actor_model_optimizer_tree_sha256",
     )
+    left_teacher = left.get("opd_teacher_tree_sha256")
+    right_teacher = right.get("opd_teacher_tree_sha256")
+    if (left_teacher is None) != (right_teacher is None):
+        raise SystemExit(f"{args.label} failed: only one checkpoint has OPD teacher state")
+    if left_teacher is not None:
+        fields += ("opd_teacher_tree_sha256",)
     for field in fields:
         if left[field] != right[field]:
             raise SystemExit(
@@ -127,6 +160,7 @@ def main() -> None:
     print(
         f"{args.label} passed at global_step_{args.step}: "
         f"trajectory={left[fields[0]]} actor={left[fields[1]]}"
+        + (f" teacher={left[fields[2]]}" if len(fields) == 3 else "")
     )
 
 
