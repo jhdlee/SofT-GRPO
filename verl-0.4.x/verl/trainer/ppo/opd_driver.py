@@ -17,8 +17,10 @@ import torch
 from verl.opd import (
     ITERATION_METRICS,
     VALIDATION_METRICS,
+    LossSupport,
     ObjectiveMode,
     OPDConfig,
+    opd_loss_support_mask,
     opd_schedule_metrics,
     required_iteration_metrics,
     validate_metric_payload,
@@ -376,6 +378,46 @@ def replay_ratio_abs_error_max(
     log_ratio = actor_log_probs[valid].float() - rollout_log_probs[valid].float()
     errors = (log_ratio.exp() - 1.0).abs()
     return errors.max().item()
+
+
+def replay_integrity_mask(
+    *,
+    response_mask: torch.Tensor,
+    continuous_replay: bool,
+    rollout_topk_ids: torch.Tensor | None = None,
+    responses: torch.Tensor | None = None,
+    close_tag_token_id: int | None = None,
+) -> torch.Tensor:
+    """Select positions with comparable rollout and actor-replay densities.
+
+    Released SofT-GRPO samples the first ``</think>`` action while the request
+    is still in soft-thinking mode. After observing that token, SGLang rewrites
+    both its stored support and reported density to categorical metadata.
+    That metadata no longer represents the Gumbel action that was actually
+    selected. Comparing the rewritten boundary to actor replay therefore does
+    not validate the original action and can create a false integrity failure.
+
+    Native-soft replay therefore compares continuous actions before the
+    boundary and categorical actions strictly after it. Capped trajectories
+    contribute all valid continuous actions. Ordinary categorical rollouts
+    retain their full response mask.
+    """
+
+    if type(continuous_replay) is not bool:
+        raise TypeError("continuous_replay must be bool")
+    if not continuous_replay:
+        return response_mask.to(dtype=torch.bool)
+    if rollout_topk_ids is None or responses is None or close_tag_token_id is None:
+        raise ValueError(
+            "native-soft replay integrity requires supports, responses, and close tag"
+        )
+    return opd_loss_support_mask(
+        response_mask,
+        rollout_topk_ids,
+        loss_support=LossSupport.ALL_RESPONSE,
+        responses=responses,
+        close_tag_token_id=close_tag_token_id,
+    )
 
 
 def reward_and_group_metrics(

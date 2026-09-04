@@ -18,6 +18,7 @@ from verl.trainer.ppo.opd_driver import (
     add_canonical_metric_aliases,
     compute_rollout_diagnostics,
     mask_invalid_native_boundary_scores,
+    replay_integrity_mask,
     replay_ratio_abs_error_max,
     reward_and_group_metrics,
     schedule_meta_info,
@@ -325,6 +326,41 @@ def test_full_dose_gradient_gate_config_rejects_invalid_thresholds(overrides):
 def test_replay_ratio_metric_equals_zero_for_identical_log_densities():
     logp = torch.tensor([[-2.0, -0.5]])
     assert replay_ratio_abs_error_max(logp, logp.clone(), torch.ones_like(logp)) == 0.0
+
+
+def test_native_soft_replay_integrity_excludes_rewritten_close_transition():
+    responses = torch.tensor([[4, 99, 7, 8]])
+    response_mask = torch.ones_like(responses)
+    supports = torch.tensor(
+        [[[4, 5, 6], [99, 0, 0], [7, 0, 0], [8, 0, 0]]]
+    )
+
+    comparable = replay_integrity_mask(
+        response_mask=response_mask,
+        continuous_replay=True,
+        rollout_topk_ids=supports,
+        responses=responses,
+        close_tag_token_id=99,
+    )
+
+    assert comparable.tolist() == [[True, False, True, True]]
+    # SGLang rewrites the close action's support and density as categorical
+    # metadata after selecting it as a Gumbel action. Its exclusion must
+    # prevent that non-replayable boundary from causing a false failure.
+    rollout_logp = torch.tensor([[-2.0, -0.1, -0.5, -0.25]])
+    actor_logp = torch.tensor([[-2.0, -9.0, -0.5, -0.25]])
+    assert replay_ratio_abs_error_max(
+        rollout_logp, actor_logp, comparable
+    ) == 0.0
+
+
+def test_categorical_replay_integrity_keeps_every_valid_action():
+    response_mask = torch.tensor([[1, 1, 0]])
+    comparable = replay_integrity_mask(
+        response_mask=response_mask,
+        continuous_replay=False,
+    )
+    assert comparable.tolist() == [[True, True, False]]
 
 
 def test_reward_metrics_count_informative_groups_not_trajectories():

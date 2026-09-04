@@ -69,6 +69,7 @@ from verl.trainer.ppo.opd_driver import (
     compute_categorical_rollout_diagnostics,
     compute_rollout_diagnostics,
     mask_invalid_native_boundary_scores,
+    replay_integrity_mask,
     replay_ratio_abs_error_max,
     reward_and_group_metrics,
     reward_only_metrics,
@@ -2442,13 +2443,27 @@ class RayPPOTrainer:
                             responses = batch.batch["responses"]
                             response_length = responses.size(1)
                             response_mask = attention_mask[:, -response_length:]
+                            response_support = (
+                                batch.batch["rollout_topk_ids"][:, -response_length:]
+                                if self.continuous_replay
+                                else None
+                            )
+                            density_comparison_mask = replay_integrity_mask(
+                                response_mask=response_mask,
+                                continuous_replay=self.continuous_replay,
+                                rollout_topk_ids=response_support,
+                                responses=responses,
+                                close_tag_token_id=self.close_tag_token_id,
+                            )
 
                             rollout_probs = torch.exp(rollout_old_log_probs)
                             actor_probs = torch.exp(actor_old_log_probs)
                             # print(f"rollout_probs {rollout_probs}, {rollout_probs.grad_fn}")
                             # print(f"actor_probs {actor_probs, {actor_probs.grad_fn}")
                             rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                            rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+                            rollout_probs_diff = torch.masked_select(
+                                rollout_probs_diff, density_comparison_mask
+                            )
                             rollout_probs_diff_max = torch.max(rollout_probs_diff)
                             rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
                             rollout_probs_diff_std = torch.std(rollout_probs_diff)
@@ -2463,7 +2478,7 @@ class RayPPOTrainer:
                             replay_error = replay_ratio_abs_error_max(
                                 rollout_log_probs=rollout_old_log_probs,
                                 actor_log_probs=actor_old_log_probs,
-                                response_mask=response_mask,
+                                response_mask=density_comparison_mask,
                             )
                             metrics["replay/ratio_abs_error_max"] = replay_error
 
