@@ -178,7 +178,12 @@ class PrivilegedReplay:
                 use_cache=False,
                 logits_to_keep=query_indices,
             )
-            logits = output.logits.squeeze(0)
+            raw_logits = output.logits
+            if raw_logits.requires_grad or raw_logits.grad_fn is not None:
+                raise RuntimeError(
+                    "privileged teacher logits retained an autograd graph"
+                )
+            logits = raw_logits.squeeze(0)
             if logits.ndim == 1:
                 logits = logits.unsqueeze(0)
             if logits.shape[0] != active.numel():
@@ -258,6 +263,12 @@ class PrivilegedReplay:
             raise ValueError("every OPD objective slot must be classified as latent or answer")
 
         selected_student = student_logits.index_select(0, student_query_indices)
+        if not selected_student.requires_grad or selected_student.grad_fn is None:
+            raise RuntimeError(
+                "OPD student logits are disconnected from the actor autograd graph"
+            )
+        if teacher_logits.requires_grad or teacher_logits.grad_fn is not None:
+            raise RuntimeError("OPD teacher logits must be fully detached")
         if selected_student.shape != teacher_logits.shape:
             raise RuntimeError(
                 "student/teacher latent-query alignment differs: "
@@ -270,6 +281,8 @@ class PrivilegedReplay:
             temperature=self.config.temperature,
             vocab_chunk_size=vocab_chunk_size,
         )
+        if not token_kl.requires_grad or token_kl.grad_fn is None:
+            raise RuntimeError("OPD KL is disconnected from the student logits")
         flat_latent = latent_mask[replay_mask]
         flat_answer = answer_mask[replay_mask]
         if latent_support_ids.ndim != 2 or latent_support_ids.shape[0] != int(flat_latent.sum().item()):

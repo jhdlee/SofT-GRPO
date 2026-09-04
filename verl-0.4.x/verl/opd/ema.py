@@ -59,6 +59,26 @@ def freeze_teacher_(teacher: nn.Module) -> nn.Module:
     return teacher
 
 
+def teacher_gradient_isolation_violations(teacher: nn.Module) -> tuple[int, int]:
+    """Count frozen-state and accumulated-gradient violations cheaply.
+
+    This inspects parameter metadata only; it does not read parameter values or
+    summon full FSDP parameters.  Callers can all-reduce the two counts so a
+    violation on any shard makes every rank fail together.
+    """
+
+    requires_grad = 0
+    accumulated_grad = 0
+    parameter_count = 0
+    for parameter in teacher.parameters():
+        parameter_count += 1
+        requires_grad += int(parameter.requires_grad)
+        accumulated_grad += int(parameter.grad is not None)
+    if parameter_count == 0:
+        raise ValueError("cannot validate gradient isolation for a parameterless teacher")
+    return requires_grad, accumulated_grad
+
+
 def _validate_matching_tensors(
     kind: str,
     teacher_tensors: dict[str, torch.Tensor],

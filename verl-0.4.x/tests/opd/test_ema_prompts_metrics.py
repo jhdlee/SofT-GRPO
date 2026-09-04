@@ -17,6 +17,7 @@ from verl.opd import (
     render_sdft_prompt,
     required_iteration_metrics,
     rms_from_squared_sum_and_count,
+    teacher_gradient_isolation_violations,
     update_ema_once_,
     validate_metric_payload,
     validation_pass_at_1_aliases,
@@ -80,6 +81,21 @@ def test_parameter_distance_exposes_distributed_sum_and_count():
     assert squared_sum.item() == 9.0
     assert count.item() == 1
     assert rms_from_squared_sum_and_count(squared_sum, count).item() == 3.0
+
+
+def test_teacher_gradient_isolation_detects_frozen_state_and_stale_gradients():
+    teacher = freeze_teacher_(TinyModel(1.0, 0.0, 0))
+    assert teacher_gradient_isolation_violations(teacher) == (0, 0)
+
+    teacher.weight.grad = torch.ones_like(teacher.weight)
+    assert teacher_gradient_isolation_violations(teacher) == (0, 1)
+
+    teacher.weight.grad = None
+    teacher.weight.requires_grad_(True)
+    assert teacher_gradient_isolation_violations(teacher) == (1, 0)
+
+    with pytest.raises(ValueError, match="parameterless teacher"):
+        teacher_gradient_isolation_violations(nn.Identity())
 
 
 def test_sdft_prompt_is_exact_and_does_not_duplicate_answer():

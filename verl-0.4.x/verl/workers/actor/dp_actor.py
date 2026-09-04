@@ -40,6 +40,7 @@ from verl.opd import (
     opd_loss_support_mask,
     parameter_squared_distance_sum_and_count,
     rms_from_squared_sum_and_count,
+    teacher_gradient_isolation_violations,
     update_ema_once_,
 )
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
@@ -1029,6 +1030,24 @@ class DataParallelPPOActor(BasePPOActor):
 
         teacher_student_rms = 0.0
         if opd_active and self.opd_config.teacher.type is not TeacherType.CURRENT_ACTOR:
+            isolation_counts = torch.tensor(
+                teacher_gradient_isolation_violations(self.opd_teacher_module),
+                dtype=torch.int64,
+                device=get_torch_device().current_device(),
+            )
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    isolation_counts, op=torch.distributed.ReduceOp.MAX
+                )
+            if bool((isolation_counts != 0).any().item()):
+                requires_grad_count, accumulated_grad_count = (
+                    int(value) for value in isolation_counts.tolist()
+                )
+                raise RuntimeError(
+                    "privileged OPD teacher received gradients during the student "
+                    f"update: requires_grad_parameters={requires_grad_count}, "
+                    f"accumulated_gradients={accumulated_grad_count}"
+                )
             squared_sum, parameter_count = parameter_squared_distance_sum_and_count(
                 self.opd_teacher_module, self.actor_module
             )

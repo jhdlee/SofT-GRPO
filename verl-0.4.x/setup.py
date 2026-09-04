@@ -35,7 +35,10 @@ install_requires = [
     "pyarrow>=19.0.0",
     "pybind11",
     "pylatexenc",
-    "ray[default]>=2.41.0",
+    # Only Ray Core is used by this training path.  The ``default`` extra pulls
+    # OpenTelemetry >=1.30, which is incompatible with vLLM 0.8.5's required
+    # OpenTelemetry 1.26 runtime.
+    "ray>=2.43.0,!=2.44.*,<2.50.0",
     "torchdata",
     "tensordict<=0.6.2",
     "transformers",

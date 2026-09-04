@@ -22,6 +22,7 @@ from .ema import (
     freeze_teacher_,
     parameter_squared_distance_sum_and_count,
     rms_from_squared_sum_and_count,
+    teacher_gradient_isolation_violations,
     update_ema_module_,
     update_ema_once_,
 )
@@ -94,6 +95,7 @@ __all__ = [
     "safe_mean_from_sum",
     "schedule_multiplier",
     "trajectory_gate_mask",
+    "teacher_gradient_isolation_violations",
     "update_ema_module_",
     "update_ema_once_",
     "validate_metric_payload",

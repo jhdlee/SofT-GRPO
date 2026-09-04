@@ -139,6 +139,28 @@ def test_teacher_replay_uses_causal_query_positions_and_detaches_prefix():
     torch.testing.assert_close(logits, expected)
 
 
+def test_teacher_replay_fails_if_teacher_forward_reenables_autograd():
+    class _LeakingTeacher(_RecordingCausalModel):
+        def forward(self, **kwargs):
+            with torch.enable_grad():
+                return super().forward(**kwargs)
+
+    replay = PrivilegedReplay(_LeakingTeacher(), _Tokenizer(), OPDConfig())
+    with pytest.raises(RuntimeError, match="teacher logits retained an autograd graph"):
+        replay.teacher_logits(
+            response_embeddings=torch.randn(1, 2, 5),
+            response_mask=torch.tensor([[True, True]]),
+            latent_mask=torch.tensor([[True, False]]),
+            extra_infos=[
+                {
+                    "opd_original_user_content": "Question",
+                    "opd_gold_cot": "Reasoning",
+                    "opd_gold_answer": "4",
+                }
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     ("gate", "expected_selected"),
     [("all", 4), ("positive_advantage", 2)],
@@ -150,7 +172,7 @@ def test_replay_loss_supports_tokenwise_verl_advantages_and_detaches_teacher(
     replay = _replay(gate=gate)
     torch.manual_seed(19)
     student_logits = torch.randn(4, 11, requires_grad=True)
-    teacher_logits = torch.randn(4, 11, requires_grad=True)
+    teacher_logits = torch.randn(4, 11)
     latent_mask = torch.tensor(
         [[True, True, False], [True, False, True]],
     )
@@ -183,7 +205,6 @@ def test_replay_loss_supports_tokenwise_verl_advantages_and_detaches_teacher(
     result.kl_sum.backward()
     assert student_logits.grad is not None
     assert torch.isfinite(student_logits.grad).all()
-    assert teacher_logits.grad is None
     if gate == "positive_advantage":
         assert torch.count_nonzero(student_logits.grad[:2]).item() > 0
         assert torch.count_nonzero(student_logits.grad[2:]).item() == 0
@@ -194,7 +215,7 @@ def test_positive_advantage_gate_rejects_misaligned_advantages():
     replay = _replay(gate="positive_advantage")
     with pytest.raises(ValueError, match="advantages must have shape"):
         replay.loss_from_teacher_logits(
-            student_logits=torch.randn(2, 7),
+            student_logits=torch.randn(2, 7, requires_grad=True),
             student_query_indices=torch.arange(2),
             teacher_logits=torch.randn(2, 7),
             teacher_seconds=0.0,
@@ -215,7 +236,7 @@ def test_all_response_replay_splits_latent_and_answer_kl_with_one_denominator(
     replay = _replay(gate=gate, loss_support="all_response")
     torch.manual_seed(23)
     student_logits = torch.randn(5, 11, requires_grad=True)
-    teacher_logits = torch.randn(5, 11, requires_grad=True)
+    teacher_logits = torch.randn(5, 11)
     latent_mask = torch.tensor([[True, True, False], [True, False, False]])
     answer_mask = torch.tensor([[False, False, True], [False, True, False]])
     objective_mask = latent_mask | answer_mask
@@ -255,4 +276,26 @@ def test_all_response_replay_splits_latent_and_answer_kl_with_one_denominator(
     assert result.selected_slots == expected_selected
     assert result.opd_support_gradient.shape == (3, 3)
     assert result.student_support_logits.shape == (3, 3)
-    assert teacher_logits.grad is None
+
+
+def test_replay_loss_rejects_attached_teacher_and_disconnected_student_logits():
+    replay = _replay()
+    common = {
+        "student_query_indices": torch.arange(2),
+        "teacher_seconds": 0.0,
+        "latent_mask": torch.tensor([[True, True]]),
+        "advantages": torch.ones(1, 2),
+        "latent_support_ids": torch.tensor([[0, 1], [1, 2]]),
+    }
+    with pytest.raises(RuntimeError, match="teacher logits must be fully detached"):
+        replay.loss_from_teacher_logits(
+            student_logits=torch.randn(2, 7, requires_grad=True),
+            teacher_logits=torch.randn(2, 7, requires_grad=True),
+            **common,
+        )
+    with pytest.raises(RuntimeError, match="student logits are disconnected"):
+        replay.loss_from_teacher_logits(
+            student_logits=torch.randn(2, 7),
+            teacher_logits=torch.randn(2, 7),
+            **common,
+        )
