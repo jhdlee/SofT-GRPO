@@ -26,6 +26,10 @@ class OPDReplayResult:
     teacher_seconds: float
     opd_support_gradient: torch.Tensor
     student_support_logits: torch.Tensor
+    latent_kl_sum: torch.Tensor | None = None
+    answer_kl_sum: torch.Tensor | None = None
+    latent_slots: int = 0
+    answer_slots: int = 0
 
 
 def validate_reasoning_tokenizer(tokenizer: Any) -> tuple[int, int]:
@@ -193,6 +197,8 @@ class PrivilegedReplay:
         response_embeddings: torch.Tensor,
         response_mask: torch.Tensor,
         latent_mask: torch.Tensor,
+        objective_mask: torch.Tensor | None = None,
+        answer_mask: torch.Tensor | None = None,
         extra_infos: Sequence[Mapping[str, Any]],
         advantages: torch.Tensor,
         latent_support_ids: torch.Tensor,
@@ -200,10 +206,11 @@ class PrivilegedReplay:
     ) -> OPDReplayResult:
         """Compute the local KL numerator with a global-denominator contract."""
 
+        replay_mask = latent_mask if objective_mask is None else objective_mask
         teacher_logits, teacher_seconds = self.teacher_logits(
             response_embeddings=response_embeddings,
             response_mask=response_mask,
-            latent_mask=latent_mask,
+            latent_mask=replay_mask,
             extra_infos=extra_infos,
         )
         return self.loss_from_teacher_logits(
@@ -212,6 +219,8 @@ class PrivilegedReplay:
             teacher_logits=teacher_logits,
             teacher_seconds=teacher_seconds,
             latent_mask=latent_mask,
+            objective_mask=replay_mask,
+            answer_mask=answer_mask,
             advantages=advantages,
             latent_support_ids=latent_support_ids,
             vocab_chunk_size=vocab_chunk_size,
@@ -225,11 +234,28 @@ class PrivilegedReplay:
         teacher_logits: torch.Tensor,
         teacher_seconds: float,
         latent_mask: torch.Tensor,
+        objective_mask: torch.Tensor | None = None,
+        answer_mask: torch.Tensor | None = None,
         advantages: torch.Tensor,
         latent_support_ids: torch.Tensor,
         vocab_chunk_size: int | None = 8192,
     ) -> OPDReplayResult:
         """Finish KL scoring after a teacher forward performed before the actor."""
+
+        replay_mask = latent_mask if objective_mask is None else objective_mask
+        if replay_mask.shape != latent_mask.shape:
+            raise ValueError("objective_mask and latent_mask must have identical shapes")
+        if answer_mask is None:
+            answer_mask = torch.zeros_like(replay_mask, dtype=torch.bool)
+        elif answer_mask.shape != replay_mask.shape:
+            raise ValueError("answer_mask and objective_mask must have identical shapes")
+        replay_mask = replay_mask.bool()
+        latent_mask = latent_mask.bool() & replay_mask
+        answer_mask = answer_mask.bool() & replay_mask
+        if bool((latent_mask & answer_mask).any().item()):
+            raise ValueError("latent and categorical-answer OPD supports must be disjoint")
+        if bool((replay_mask & ~(latent_mask | answer_mask)).any().item()):
+            raise ValueError("every OPD objective slot must be classified as latent or answer")
 
         selected_student = student_logits.index_select(0, student_query_indices)
         if selected_student.shape != teacher_logits.shape:
@@ -244,16 +270,21 @@ class PrivilegedReplay:
             temperature=self.config.temperature,
             vocab_chunk_size=vocab_chunk_size,
         )
-        if latent_support_ids.ndim != 2 or latent_support_ids.shape[0] != token_kl.numel():
+        flat_latent = latent_mask[replay_mask]
+        flat_answer = answer_mask[replay_mask]
+        if latent_support_ids.ndim != 2 or latent_support_ids.shape[0] != int(flat_latent.sum().item()):
             raise ValueError("latent_support_ids must provide one support row per latent query")
         if latent_support_ids.device != selected_student.device:
             latent_support_ids = latent_support_ids.to(selected_student.device)
+        latent_student = selected_student[flat_latent]
+        latent_teacher = teacher_logits[flat_latent]
+        latent_token_kl = token_kl[flat_latent]
         student_logp = torch.log_softmax(
-            selected_student.float() / self.config.temperature,
+            latent_student.float() / self.config.temperature,
             dim=-1,
         )
         teacher_logp = torch.log_softmax(
-            teacher_logits.float() / self.config.temperature,
+            latent_teacher.float() / self.config.temperature,
             dim=-1,
         )
         support_student_logp = student_logp.gather(-1, latent_support_ids)
@@ -264,7 +295,7 @@ class PrivilegedReplay:
             ) / self.config.temperature
         else:
             opd_support_gradient = support_student_logp.exp() * (
-                support_student_logp - support_teacher_logp - token_kl.unsqueeze(-1)
+                support_student_logp - support_teacher_logp - latent_token_kl.unsqueeze(-1)
             ) / self.config.temperature
         flat_gate = torch.ones_like(token_kl, dtype=torch.bool)
         if self.config.trajectory_gate.value == "positive_advantage":
@@ -275,13 +306,13 @@ class PrivilegedReplay:
                         "trajectory advantages must have one value per replay row"
                     )
                 row_advantages = detached_advantages
-            elif detached_advantages.shape == latent_mask.shape:
+            elif detached_advantages.shape == replay_mask.shape:
                 # VERL carries GRPO's sequence-level advantage at every valid
                 # response position.  Reduce over the latent positions rather
                 # than calling ``.item()`` on a response-length vector.  The
                 # mean is also robust to future estimators whose token values
                 # are not bit-identical within a trajectory.
-                latent_float = latent_mask.to(
+                latent_float = replay_mask.to(
                     device=detached_advantages.device,
                     dtype=detached_advantages.dtype,
                 )
@@ -296,7 +327,7 @@ class PrivilegedReplay:
             if not torch.isfinite(row_advantages).all():
                 raise FloatingPointError("trajectory advantages must be finite")
             row_gate = (row_advantages > 0).to(device=token_kl.device)
-            latent_counts = latent_mask.sum(dim=-1).to(
+            latent_counts = replay_mask.sum(dim=-1).to(
                 device=token_kl.device,
                 dtype=torch.long,
             )
@@ -305,12 +336,18 @@ class PrivilegedReplay:
                 raise RuntimeError("trajectory gate did not align with latent queries")
         teacher_logp = torch.log_softmax(teacher_logits.float() / self.config.temperature, dim=-1)
         entropy = -(teacher_logp.exp() * teacher_logp).sum(dim=-1)
+        selected_kl = token_kl.masked_fill(~flat_gate, 0.0)
+        latent_gate = flat_gate[flat_latent]
         return OPDReplayResult(
-            kl_sum=token_kl.masked_fill(~flat_gate, 0.0).sum(),
-            denominator_slots=int(latent_mask.sum().item()),
+            kl_sum=selected_kl.sum(),
+            denominator_slots=int(replay_mask.sum().item()),
             selected_slots=int(flat_gate.sum().item()),
             teacher_entropy_sum=float(entropy.masked_fill(~flat_gate, 0.0).sum().item()),
             teacher_seconds=teacher_seconds,
-            opd_support_gradient=opd_support_gradient.masked_fill(~flat_gate.unsqueeze(-1), 0.0).detach(),
-            student_support_logits=selected_student.gather(-1, latent_support_ids).detach(),
+            opd_support_gradient=opd_support_gradient.masked_fill(~latent_gate.unsqueeze(-1), 0.0).detach(),
+            student_support_logits=latent_student.gather(-1, latent_support_ids).detach(),
+            latent_kl_sum=selected_kl[flat_latent].sum(),
+            answer_kl_sum=selected_kl[flat_answer].sum(),
+            latent_slots=int(latent_mask.sum().item()),
+            answer_slots=int(answer_mask.sum().item()),
         )

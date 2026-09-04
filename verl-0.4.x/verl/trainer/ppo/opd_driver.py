@@ -17,10 +17,51 @@ import torch
 from verl.opd import (
     ITERATION_METRICS,
     VALIDATION_METRICS,
+    ObjectiveMode,
     OPDConfig,
     opd_schedule_metrics,
+    required_iteration_metrics,
     validate_metric_payload,
+    validation_pass_at_1_aliases,
 )
+
+
+def _nonnegative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
+def training_rollout_iteration(global_step: int) -> int:
+    """Map VERL's one-based training step to the study's zero-based axis."""
+
+    step = _nonnegative_int(global_step, "global_step")
+    if step == 0:
+        raise ValueError("a training event requires global_step >= 1")
+    return step - 1
+
+
+def validation_rollout_iteration(completed_rollouts: int) -> int:
+    """Label validation by completed rollouts: 0, 25, ..., 109."""
+
+    return _nonnegative_int(completed_rollouts, "completed_rollouts")
+
+
+def training_wandb_step(global_step: int) -> int:
+    """Reserve an ordered W&B event step for one training row."""
+
+    step = _nonnegative_int(global_step, "global_step")
+    if step == 0:
+        raise ValueError("a training event requires global_step >= 1")
+    return 2 * step
+
+
+def validation_wandb_step(completed_rollouts: int) -> int:
+    """Place validation after the corresponding training event in W&B."""
+
+    return 2 * _nonnegative_int(completed_rollouts, "completed_rollouts") + 1
 
 
 @dataclass(frozen=True)
@@ -35,6 +76,10 @@ class RolloutIntegrityConfig:
     min_soft_to_hard_rate: float = 0.95
     min_categorical_boxed_answer_rate: float = 0.95
     max_replay_ratio_abs_error: float = 1e-4
+    full_dose_gradient_gate_enabled: bool = False
+    min_opd_grpo_support_gradient_ratio: float = 0.1
+    max_opd_grpo_support_gradient_ratio: float = 10.0
+    max_full_dose_gradient_clip_fraction: float = 0.5
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> RolloutIntegrityConfig:
@@ -44,6 +89,8 @@ class RolloutIntegrityConfig:
         result = cls(**dict(values))
         if type(result.enabled) is not bool:
             raise TypeError("rollout_integrity.enabled must be bool")
+        if type(result.full_dose_gradient_gate_enabled) is not bool:
+            raise TypeError("full_dose_gradient_gate_enabled must be bool")
         if isinstance(result.gate_first_n_iterations, bool) or not isinstance(result.gate_first_n_iterations, int):
             raise TypeError("gate_first_n_iterations must be an integer")
         if result.gate_first_n_iterations < 0:
@@ -60,6 +107,21 @@ class RolloutIntegrityConfig:
                 raise ValueError(f"{name} must be in [0, 1]")
         if not np.isfinite(result.max_replay_ratio_abs_error) or result.max_replay_ratio_abs_error < 0:
             raise ValueError("max_replay_ratio_abs_error must be finite and nonnegative")
+        minimum_ratio = float(result.min_opd_grpo_support_gradient_ratio)
+        maximum_ratio = float(result.max_opd_grpo_support_gradient_ratio)
+        if not np.isfinite(minimum_ratio) or minimum_ratio <= 0.0:
+            raise ValueError(
+                "min_opd_grpo_support_gradient_ratio must be finite and positive"
+            )
+        if not np.isfinite(maximum_ratio) or maximum_ratio < minimum_ratio:
+            raise ValueError(
+                "max_opd_grpo_support_gradient_ratio must be finite and at least the minimum"
+            )
+        maximum_clip_fraction = float(result.max_full_dose_gradient_clip_fraction)
+        if not np.isfinite(maximum_clip_fraction) or not 0.0 <= maximum_clip_fraction <= 1.0:
+            raise ValueError(
+                "max_full_dose_gradient_clip_fraction must be in [0, 1]"
+            )
         return result
 
 
@@ -70,6 +132,7 @@ class RolloutDiagnostics:
     metrics: Mapping[str, float]
     all_soft_rate: float
     categorical_boxed_answer_rate: float
+    boundary_valid_mask: tuple[bool, ...]
 
 
 def _mean(values: torch.Tensor) -> float:
@@ -170,6 +233,19 @@ def compute_rollout_diagnostics(
             hard_text = decode(row_ids[row_hard].tolist())
             boxed_flags.append(r"\boxed{" in hard_text)
     boxed_rate = float(np.mean(boxed_flags)) if boxed_flags else 0.0
+    categorical_boxed = torch.tensor(
+        boxed_flags,
+        dtype=torch.bool,
+        device=responses.device,
+    ) if boxed_flags else torch.zeros(responses.shape[0], dtype=torch.bool, device=responses.device)
+    boundary_valid = (
+        has_close
+        & transitioned
+        & latent_lengths.gt(0)
+        & hard_lengths.gt(1)
+        & categorical_boxed
+        & ~replay_fallback.any(dim=-1)
+    )
 
     metrics = {
         "latent/length_mean": _mean(latent_lengths),
@@ -188,7 +264,101 @@ def compute_rollout_diagnostics(
         metrics=metrics,
         all_soft_rate=_mean(all_soft),
         categorical_boxed_answer_rate=boxed_rate,
+        boundary_valid_mask=tuple(bool(value) for value in boundary_valid.detach().cpu().tolist()),
     )
+
+
+def compute_categorical_rollout_diagnostics(
+    *,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+    close_tag_token_id: int,
+    decode: Optional[Callable[[Sequence[int]], str]] = None,
+) -> RolloutDiagnostics:
+    """Return the common rollout fields for a genuinely categorical arm."""
+
+    if responses.ndim != 2 or response_mask.shape != responses.shape:
+        raise ValueError("responses and response_mask must be matching rank-2 tensors")
+    valid = response_mask.bool()
+    close = valid & responses.eq(int(close_tag_token_id))
+    seen_close = close.to(torch.int64).cumsum(dim=-1) > 0
+    after_close = torch.zeros_like(seen_close)
+    if after_close.shape[-1] > 1:
+        after_close[:, 1:] = seen_close[:, :-1]
+    answer_lengths = (valid & after_close).sum(dim=-1)
+    boxed_flags = []
+    if decode is not None:
+        for row_ids, row_answer in zip(responses.detach().cpu(), (valid & after_close).detach().cpu()):
+            boxed_flags.append(r"\boxed{" in decode(row_ids[row_answer].tolist()))
+    metrics = {
+        "latent/length_mean": 0.0,
+        "latent/length_p95": 0.0,
+        "latent/hard_answer_length_mean": _mean(answer_lengths),
+        "latent/close_tag_rate": _mean(close.any(dim=-1)),
+        "latent/soft_to_hard_rate": 0.0,
+        "latent/cap_rate": _mean(valid.all(dim=-1)),
+        "latent/mixture_entropy_mean": 0.0,
+        "latent/top1_weight_mean": 0.0,
+        "latent/soft_hard_agreement": 0.0,
+        "integrity/continuous_replay_active": 0.0,
+        "replay/fallback_count": 0.0,
+    }
+    return RolloutDiagnostics(
+        metrics=metrics,
+        all_soft_rate=0.0,
+        categorical_boxed_answer_rate=(
+            float(np.mean(boxed_flags)) if boxed_flags else 0.0
+        ),
+        # Boundary gating applies only to native-soft trajectories.  A genuine
+        # categorical arm is graded from its response text directly.
+        boundary_valid_mask=tuple(True for _ in range(responses.shape[0])),
+    )
+
+
+_BOUNDARY_GRADED_EXTRA_INFO_KEYS = frozenset(
+    {"score", "released_reward", "math_verify"}
+)
+
+
+def mask_invalid_native_boundary_scores(
+    *,
+    reward_tensor: torch.Tensor,
+    reward_extra_info: Mapping[str, Sequence[Any]],
+    boundary_valid_mask: Sequence[bool],
+) -> tuple[torch.Tensor, dict[str, list[Any]]]:
+    """Force invalid native-soft boundaries to receive zero validation credit.
+
+    A decoded hard shadow is not an admissible native-soft completion unless
+    the stored action metadata demonstrates a continuous prefix followed by a
+    categorical ``</think>``/boxed-answer suffix.  Mask both the scalar reward
+    tensor and the correctness fields used to select BEST checkpoints.  Other
+    auxiliary metadata is copied unchanged.
+    """
+
+    if reward_tensor.ndim != 2:
+        raise ValueError("reward_tensor must have shape [batch, response]")
+    mask = torch.as_tensor(
+        tuple(boundary_valid_mask),
+        dtype=torch.bool,
+        device=reward_tensor.device,
+    )
+    if mask.ndim != 1 or mask.shape[0] != reward_tensor.shape[0]:
+        raise ValueError("boundary_valid_mask must contain one value per response")
+
+    masked_reward = reward_tensor.clone()
+    masked_reward[~mask] = 0.0
+    mask_cpu = mask.detach().cpu().tolist()
+    masked_extra: dict[str, list[Any]] = {}
+    for key, raw_values in reward_extra_info.items():
+        values = list(raw_values)
+        if len(values) != reward_tensor.shape[0]:
+            raise ValueError(
+                f"reward_extra_info[{key!r}] must contain one value per response"
+            )
+        if key in _BOUNDARY_GRADED_EXTRA_INFO_KEYS:
+            values = [value if valid else 0.0 for value, valid in zip(values, mask_cpu)]
+        masked_extra[str(key)] = values
+    return masked_reward, masked_extra
 
 
 def replay_ratio_abs_error_max(
@@ -232,6 +402,21 @@ def reward_and_group_metrics(
     }
 
 
+def reward_only_metrics(sequence_scores: torch.Tensor) -> Mapping[str, float]:
+    """Reward monitoring for standalone OPD without inventing GRPO fields."""
+
+    if sequence_scores.ndim != 1 or sequence_scores.numel() == 0:
+        raise ValueError("standalone reward scores must be a nonempty vector")
+    scores = sequence_scores.float()
+    if not torch.isfinite(scores).all():
+        raise FloatingPointError("standalone reward scores must be finite")
+    return {
+        "train/reward_mean": scores.mean().item(),
+        "train/reward_std": scores.std(unbiased=False).item(),
+        "train/correct_fraction": (scores > 0.5).float().mean().item(),
+    }
+
+
 def schedule_meta_info(opd_config: OPDConfig, rollout_iteration: int, total_iterations: int) -> Mapping[str, Any]:
     """Worker metadata for one rollout iteration, without ambiguous aliases."""
 
@@ -240,6 +425,8 @@ def schedule_meta_info(opd_config: OPDConfig, rollout_iteration: int, total_iter
         "opd_config": {
             "enabled": opd_config.enabled,
             "beta_base": opd_config.beta_base,
+            "mode": str(opd_config.mode),
+            "loss_support": str(opd_config.loss_support),
             "schedule": str(opd_config.schedule),
             "warmup_fraction": opd_config.warmup_fraction,
             "teacher": {
@@ -261,7 +448,7 @@ def schedule_meta_info(opd_config: OPDConfig, rollout_iteration: int, total_iter
 
 def validate_rollout_integrity(
     diagnostics: RolloutDiagnostics,
-    replay_error: float,
+    replay_error: float | None,
     config: RolloutIntegrityConfig,
     rollout_iteration: int,
 ) -> None:
@@ -282,7 +469,10 @@ def validate_rollout_integrity(
         raise RuntimeError("continuous SofT-GRPO replay is not active")
     if values["replay/fallback_count"] != 0.0:
         raise RuntimeError("categorical replay fallback was detected")
-    if not np.isfinite(replay_error) or replay_error > config.max_replay_ratio_abs_error:
+    if replay_error is not None and (
+        not np.isfinite(replay_error)
+        or replay_error > config.max_replay_ratio_abs_error
+    ):
         raise RuntimeError(
             f"rollout/replay ratio error {replay_error:.6g} exceeds "
             f"{config.max_replay_ratio_abs_error:.6g}"
@@ -311,6 +501,105 @@ def validate_rollout_integrity(
         raise RuntimeError("rollout integrity gate failed: " + "; ".join(failures))
 
 
+def validate_categorical_rollout_integrity(
+    replay_error: float,
+    config: RolloutIntegrityConfig,
+) -> None:
+    """Fail closed on categorical actor/rollout drift without soft metadata."""
+
+    if not config.enabled:
+        return
+    if not np.isfinite(replay_error) or replay_error > config.max_replay_ratio_abs_error:
+        raise RuntimeError(
+            f"categorical rollout/replay ratio error {replay_error:.6g} exceeds "
+            f"{config.max_replay_ratio_abs_error:.6g}"
+        )
+
+
+def validate_full_dose_gradient_integrity(
+    metrics: Mapping[str, Any],
+    config: RolloutIntegrityConfig,
+    *,
+    schedule_multiplier: float,
+) -> None:
+    """Fail closed on pathological hybrid gradients at a full OPD dose.
+
+    The fixed-support component gradients are available only after the actor
+    update, so this gate deliberately runs after both optimizer steps have
+    completed.  Warm-up iterations are not interpreted as failures: the gate
+    becomes active only at the exact full-dose multiplier of one.
+    """
+
+    if not config.enabled or not config.full_dose_gradient_gate_enabled:
+        return
+    multiplier = float(schedule_multiplier)
+    if not np.isfinite(multiplier) or not 0.0 <= multiplier <= 1.0:
+        raise RuntimeError(
+            "full-dose gradient gate received an invalid OPD schedule multiplier: "
+            f"{multiplier!r}"
+        )
+    if multiplier < 1.0:
+        return
+
+    required = (
+        "grad/grpo_norm",
+        "grad/opd_norm",
+        "actor/gradient_clipfrac",
+    )
+    missing = [name for name in required if name not in metrics]
+    if missing:
+        raise RuntimeError(
+            "full-dose gradient gate is missing actor diagnostics: "
+            f"{missing}"
+        )
+    grpo_norm = float(metrics["grad/grpo_norm"])
+    opd_norm = float(metrics["grad/opd_norm"])
+    clip_fraction = float(metrics["actor/gradient_clipfrac"])
+    diagnostic_values = {
+        "GRPO support-gradient norm": grpo_norm,
+        "OPD support-gradient norm": opd_norm,
+        "gradient clip fraction": clip_fraction,
+    }
+    nonfinite = sorted(
+        name for name, value in diagnostic_values.items() if not np.isfinite(value)
+    )
+    if nonfinite:
+        raise RuntimeError(
+            "full-dose gradient diagnostics are non-finite: " f"{nonfinite}"
+        )
+    if grpo_norm <= 0.0:
+        raise RuntimeError(
+            "full-dose gradient gate requires a positive GRPO support-gradient norm"
+        )
+    if opd_norm < 0.0:
+        raise RuntimeError(
+            "full-dose gradient gate requires a nonnegative OPD support-gradient norm"
+        )
+
+    ratio = opd_norm / grpo_norm
+    failures = []
+    if not (
+        config.min_opd_grpo_support_gradient_ratio
+        <= ratio
+        <= config.max_opd_grpo_support_gradient_ratio
+    ):
+        failures.append(
+            "OPD/GRPO support-gradient ratio="
+            f"{ratio:.6g} (required "
+            f"[{config.min_opd_grpo_support_gradient_ratio:.6g}, "
+            f"{config.max_opd_grpo_support_gradient_ratio:.6g}])"
+        )
+    if not 0.0 <= clip_fraction <= config.max_full_dose_gradient_clip_fraction:
+        failures.append(
+            f"gradient clip fraction={clip_fraction:.6g} (required "
+            f"[0, {config.max_full_dose_gradient_clip_fraction:.6g}])"
+        )
+    if failures:
+        raise RuntimeError(
+            "full-dose gradient integrity gate failed: " + "; ".join(failures)
+        )
+
+
 def add_canonical_metric_aliases(
     metrics: Mapping[str, Any],
     *,
@@ -333,12 +622,18 @@ def add_canonical_metric_aliases(
     # Component-gradient geometry is measured exactly at the policy's stored
     # fixed-top-five action logits.  The separately logged total norm is the
     # optimizer-facing parameter-gradient norm.
-    result["grad/diagnostic_space"] = "fixed_top5_action_logits"
+    result["grad/diagnostic_space"] = (
+        "fixed_top5_action_logits"
+        if float(result.get("integrity/continuous_replay_active", 0.0)) == 1.0
+        else "not_applicable_categorical"
+    )
 
     aliases = {
         "loss/grpo": "actor/pg_loss",
         "loss/native_ref_kl": "actor/kl_loss",
         "loss/opd_kl_unweighted": "actor/opd_kl_unweighted",
+        "loss/opd_kl_latent": "actor/opd_kl_latent",
+        "loss/opd_kl_answer": "actor/opd_kl_answer",
         "loss/opd_weighted": "actor/opd_weighted",
         "loss/total": "actor/total_loss",
         "opd/teacher_student_param_rms": "actor/opd_teacher_student_param_rms",
@@ -370,18 +665,23 @@ def add_canonical_metric_aliases(
             raise ValueError(
                 "actor/gradient_clipfrac must be a finite fraction in [0, 1]"
             )
-        result["grad/clipped"] = float(gradient_clip_fraction > 0.0)
+        result["grad/clipped"] = gradient_clip_fraction
 
     # Inactive OPD is a strict no-op.  Explicit zero values make baseline W&B
     # runs directly comparable without pretending that a teacher was evaluated.
     if not opd_config.active:
         result.setdefault("loss/opd_kl_unweighted", 0.0)
+        result.setdefault("loss/opd_kl_latent", 0.0)
+        result.setdefault("loss/opd_kl_answer", 0.0)
         result.setdefault("loss/opd_weighted", 0.0)
         result.setdefault("opd/teacher_student_param_rms", 0.0)
         result.setdefault("opd/ema_update_count", 0.0)
         result.setdefault("grad/opd_norm", 0.0)
         result.setdefault("grad/grpo_opd_cosine", 0.0)
         result.setdefault("perf/teacher_seconds", 0.0)
+        result.setdefault("opd/latent_slot_count", 0.0)
+        result.setdefault("opd/answer_slot_count", 0.0)
+        result.setdefault("opd/selected_slot_fraction", 0.0)
 
     if "loss/total" not in result and "loss/grpo" in result:
         total = float(result["loss/grpo"])
@@ -403,7 +703,17 @@ def validate_iteration_metric_contract(metrics: Mapping[str, Any]) -> None:
     is enabled by the seed-11 launchers.
     """
 
-    validate_metric_payload(metrics, required=ITERATION_METRICS)
+    mode = metrics.get("algorithm/objective_mode", ObjectiveMode.AUXILIARY.value)
+    required = required_iteration_metrics(mode)
+    validate_metric_payload(metrics, required=required)
+    if ObjectiveMode(mode) is ObjectiveMode.STANDALONE:
+        forbidden = set(ITERATION_METRICS) - set(required)
+        present = sorted(forbidden & set(metrics))
+        if present:
+            raise ValueError(
+                "standalone OPD must omit inapplicable PPO/GRPO metrics: "
+                f"{present}"
+            )
 
 
 def validate_validation_metric_contract(metrics: Mapping[str, Any]) -> None:
@@ -429,4 +739,5 @@ def validation_metric_aliases(metrics: Mapping[str, Any]) -> Mapping[str, float]
         aliases["val/released_reward/mean_at_1"] = float(np.mean(released))
     if math_verify:
         aliases["val/math_verify/mean_at_1"] = float(np.mean(math_verify))
+    aliases.update(validation_pass_at_1_aliases({**metrics, **aliases}))
     return aliases

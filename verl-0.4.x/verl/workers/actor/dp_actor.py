@@ -30,11 +30,14 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.opd import (
     EMAUpdateState,
+    ObjectiveMode,
     OPDConfig,
     PrivilegedReplay,
     TeacherType,
+    categorical_suffix_mask,
     ddp_scaled_local_loss,
     latent_mask_from_topk_support,
+    opd_loss_support_mask,
     parameter_squared_distance_sum_and_count,
     rms_from_squared_sum_and_count,
     update_ema_once_,
@@ -43,7 +46,6 @@ from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalt
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits, logprobs_from_logits_topk_dirichlet, logprobs_from_logits_topk_gumbel, logprobs_from_logits_topk_normal
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs, ulysses_pad_and_slice_inputs_3d
@@ -180,7 +182,7 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, add_noise_dirichlet=False,
                              add_noise_gumbel_softmax=True, compute_opd=False,
-                             collect_gradient_info=False):
+                             collect_gradient_info=False, continuous_replay=True):
         def safe_lookup_embeddings(fsdp_wrapped_module, input_ids, target_device=None, target_dtype=None):
             """FSDP兼容安全查表：无FSDP时等价于普通调用。"""
             embed = fsdp_wrapped_module.get_input_embeddings()
@@ -212,7 +214,9 @@ class DataParallelPPOActor(BasePPOActor):
         """
         if compute_opd and self.opd_replay is None:
             raise RuntimeError("OPD replay requested while the objective is inactive")
-        if (compute_opd or collect_gradient_info) and not self.use_remove_padding:
+        if compute_opd and not continuous_replay:
+            raise RuntimeError("OPD cannot run on categorical hard-token replay")
+        if continuous_replay and not self.use_remove_padding:
             raise RuntimeError("continuous replay diagnostics require remove-padding replay")
         if compute_opd and self.use_ulysses_sp:
             raise RuntimeError("OPD currently requires Ulysses sequence parallel size 1")
@@ -231,12 +235,16 @@ class DataParallelPPOActor(BasePPOActor):
         # print(f'type gumbels{micro_batch["rollout_topk_gumbels"].dtype}')
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
-            rollout_topk_ids = micro_batch["rollout_topk_ids"]
-            rollout_topk_gumbels = micro_batch["rollout_topk_gumbels"]
+            rollout_topk_ids = micro_batch.get("rollout_topk_ids") if continuous_replay else None
+            rollout_topk_gumbels = micro_batch.get("rollout_topk_gumbels") if continuous_replay else None
+            if continuous_replay and (rollout_topk_ids is None or rollout_topk_gumbels is None):
+                raise RuntimeError("continuous replay requires stored top-k IDs and perturbations")
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
-            gumbel_temperature = micro_batch["gumbel_temperature"][0].item()
+            gumbel_temperature = (
+                micro_batch["gumbel_temperature"][0].item() if continuous_replay else None
+            )
             entropy = None
             opd_result = None
             gradient_info = None
@@ -252,10 +260,11 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-                topk_ids_rmpad, _, *_ = unpad_input(rollout_topk_ids,
-                                                    attention_mask)  # input_ids_rmpad (total_nnz, ...)
-                topk_gumbels_rmpad, _, *_ = unpad_input(rollout_topk_gumbels,
+                if continuous_replay:
+                    topk_ids_rmpad, _, *_ = unpad_input(rollout_topk_ids,
                                                         attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                    topk_gumbels_rmpad, _, *_ = unpad_input(rollout_topk_gumbels,
+                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
 
                 # print(input_ids_rmpad.size(), topk_ids_rmpad.size(), topk_gumbels_rmpad.size())
                 # unpad the position_ids to align the rotary
@@ -269,23 +278,24 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # for compute the log_prob
 
-                topk_embs = safe_lookup_embeddings(
-                    self.actor_module,
-                    topk_ids_rmpad,
-                    target_device=topk_gumbels_rmpad.device,
-                    target_dtype=topk_gumbels_rmpad.dtype
-                )
+                if continuous_replay:
+                    topk_embs = safe_lookup_embeddings(
+                        self.actor_module,
+                        topk_ids_rmpad,
+                        target_device=topk_gumbels_rmpad.device,
+                        target_dtype=topk_gumbels_rmpad.dtype
+                    )
                 # print(f"topk_gumbels_rmpad{topk_gumbels_rmpad.tolist()}")
                 # print(f"topk_ids_rmpad{topk_ids_rmpad.tolist()}")
                 # print(f"position_ids_rmpad{position_ids_rmpad.tolist()}")
 
-                mask = (topk_ids_rmpad[:, 1:] == 0).all(dim=-1, keepdim=True)  # bool [B,1]
-                masked = topk_gumbels_rmpad.clone()
-                masked[:, 1:] = masked[:, 1:].masked_fill(mask, -torch.inf)
-                gumbel_y = torch.softmax(masked / gumbel_temperature, dim=-1).to(topk_gumbels_rmpad.dtype)
-                # print(gumbel_y)
-                topk_embs = torch.sum(gumbel_y.unsqueeze(-1) * topk_embs, dim=1, dtype=torch.bfloat16)
-                if compute_opd or collect_gradient_info:
+                    mask = (topk_ids_rmpad[:, 1:] == 0).all(dim=-1, keepdim=True)  # bool [B,1]
+                    masked = topk_gumbels_rmpad.clone()
+                    masked[:, 1:] = masked[:, 1:].masked_fill(mask, -torch.inf)
+                    gumbel_y = torch.softmax(masked / gumbel_temperature, dim=-1).to(topk_gumbels_rmpad.dtype)
+                    # print(gumbel_y)
+                    topk_embs = torch.sum(gumbel_y.unsqueeze(-1) * topk_embs, dim=1, dtype=torch.bfloat16)
+                if continuous_replay and (compute_opd or collect_gradient_info):
                     response_mask = attention_mask[:, -response_length:].bool()
                     response_support = rollout_topk_ids[:, -response_length:]
                     latent_mask = latent_mask_from_topk_support(response_mask, response_support)
@@ -293,12 +303,33 @@ class DataParallelPPOActor(BasePPOActor):
                         raise RuntimeError(
                             "continuous replay fallback detected: every response must contain latent actions"
                         )
+                    objective_mask = (
+                        opd_loss_support_mask(
+                            response_mask,
+                            response_support,
+                            loss_support=self.opd_config.loss_support,
+                            responses=micro_batch["responses"],
+                            close_tag_token_id=self.opd_replay.think_end_id,
+                        )
+                        if compute_opd
+                        else latent_mask
+                    )
+                    answer_mask = (
+                        categorical_suffix_mask(
+                            response_mask,
+                            response_support,
+                            micro_batch["responses"],
+                            self.opd_replay.think_end_id,
+                        )
+                        if compute_opd
+                        else torch.zeros_like(latent_mask)
+                    )
                     query_indices = []
                     flat_offset = 0
                     prompt_width = seqlen - response_length
                     for row in range(batch_size):
                         valid_prompt = int(attention_mask[row, :prompt_width].sum().item())
-                        active = torch.nonzero(latent_mask[row], as_tuple=False).flatten()
+                        active = torch.nonzero(objective_mask[row], as_tuple=False).flatten()
                         query_indices.extend((flat_offset + valid_prompt + active - 1).tolist())
                         flat_offset += int(attention_mask[row].sum().item())
                     student_query_indices = torch.tensor(
@@ -322,13 +353,14 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_logits, teacher_seconds = self.opd_replay.teacher_logits(
                         response_embeddings=replay_dense[:, -response_length:].detach(),
                         response_mask=response_mask,
-                        latent_mask=latent_mask,
+                        latent_mask=objective_mask,
                         extra_infos=micro_batch["extra_info"],
                     )
                 # topk_embs = torch.bmm(gumbel_y.unsqueeze(1), topk_embs).squeeze(1)
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                topk_gumbels_rmpad_rolled = torch.roll(topk_gumbels_rmpad, shifts=-1, dims=0)  # (total_nnz, k)
-                topk_ids_rmpad_rolled = torch.roll(topk_ids_rmpad, shifts=-1, dims=0)  # (total_nnz, k)
+                if continuous_replay:
+                    topk_gumbels_rmpad_rolled = torch.roll(topk_gumbels_rmpad, shifts=-1, dims=0)  # (total_nnz, k)
+                    topk_ids_rmpad_rolled = torch.roll(topk_ids_rmpad, shifts=-1, dims=0)  # (total_nnz, k)
                 # print(topk_gumbels_rmpad_rolled.tolist())
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
@@ -346,16 +378,17 @@ class DataParallelPPOActor(BasePPOActor):
                             position_ids_rmpad=position_ids_rmpad,
                             sp_size=self.ulysses_sequence_parallel_size,
                         )
-                    topk_ids_rmpad, _, _ = ulysses_pad_and_slice_inputs_3d(
-                        rollout_topk_ids,
-                        position_ids_rmpad=None,
-                        sp_size=self.ulysses_sequence_parallel_size,
-                    )
-                    topk_gumbels_rmpad, _, _ = ulysses_pad_and_slice_inputs_3d(
-                        rollout_topk_gumbels,
-                        position_ids_rmpad=None,
-                        sp_size=self.ulysses_sequence_parallel_size,
-                    )
+                    if continuous_replay:
+                        topk_ids_rmpad, _, _ = ulysses_pad_and_slice_inputs_3d(
+                            rollout_topk_ids,
+                            position_ids_rmpad=None,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                        topk_gumbels_rmpad, _, _ = ulysses_pad_and_slice_inputs_3d(
+                            rollout_topk_gumbels,
+                            position_ids_rmpad=None,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
                     input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
                         input_ids_rmpad_rolled,
                         position_ids_rmpad=None,
@@ -369,9 +402,13 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                 # print(input_ids_rmpad.size(), topk_embeds_rmpad.size(), topk_gumbels_rmpad_rolled.size())
+                actor_inputs = (
+                    {"inputs_embeds": topk_embs.unsqueeze(0).detach()}
+                    if continuous_replay
+                    else {"input_ids": input_ids_rmpad}
+                )
                 output = self.actor_module(
-                    # input_ids=input_ids_rmpad,
-                    inputs_embeds=topk_embs.unsqueeze(0).detach(),
+                    **actor_inputs,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
@@ -393,12 +430,25 @@ class DataParallelPPOActor(BasePPOActor):
                             teacher_logits=teacher_logits,
                             teacher_seconds=teacher_seconds,
                             latent_mask=latent_mask,
-                            advantages=micro_batch["advantages"],
+                            objective_mask=objective_mask,
+                            answer_mask=answer_mask,
+                            advantages=micro_batch.get("advantages"),
                             latent_support_ids=response_support[latent_mask],
                             vocab_chunk_size=int(self.config.get("opd_vocab_chunk_size", 8192)),
                         )
-                    if collect_gradient_info:
-                        selected_logits = logits_rmpad.index_select(0, student_query_indices)
+                    if collect_gradient_info and continuous_replay:
+                        latent_query_indices = []
+                        flat_offset = 0
+                        prompt_width = seqlen - response_length
+                        for row in range(batch_size):
+                            valid_prompt = int(attention_mask[row, :prompt_width].sum().item())
+                            active = torch.nonzero(latent_mask[row], as_tuple=False).flatten()
+                            latent_query_indices.extend((flat_offset + valid_prompt + active - 1).tolist())
+                            flat_offset += int(attention_mask[row].sum().item())
+                        latent_query_indices = torch.tensor(
+                            latent_query_indices, dtype=torch.long, device=logits_rmpad.device
+                        )
+                        selected_logits = logits_rmpad.index_select(0, latent_query_indices)
                         latent_support_ids = response_support[latent_mask]
                         gradient_info = {
                             "latent_mask": latent_mask,
@@ -414,7 +464,13 @@ class DataParallelPPOActor(BasePPOActor):
                     #     labels=input_ids_rmpad_rolled,
                     #     inplace_backward=inplace_backward,
                     # )
-                    if add_noise_gumbel_softmax:
+                    if not continuous_replay:
+                        log_probs = logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            inplace_backward=inplace_backward,
+                        )
+                    elif add_noise_gumbel_softmax:
                         log_probs = logprobs_from_logits_topk_gumbel(
                             logits=logits_rmpad,
                             rollout_topk_ids=topk_ids_rmpad_rolled,
@@ -556,9 +612,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         add_noise_dirichlet = data.meta_info['add_noise_dirichlet']
         add_noise_gumbel_softmax = data.meta_info['add_noise_gumbel_softmax']
+        continuous_replay = bool(data.meta_info.get("continuous_replay", True))
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "rollout_topk_ids",
-                       "rollout_topk_gumbels", "gumbel_temperature"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if continuous_replay:
+            select_keys.extend(
+                ["rollout_topk_ids", "rollout_topk_gumbels", "gumbel_temperature"]
+            )
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -582,7 +642,8 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy, log_probs, _, _ = self._forward_micro_batch(micro_batch, temperature=temperature,
                                                                calculate_entropy=calculate_entropy,
                                                                add_noise_dirichlet=add_noise_dirichlet,
-                                                               add_noise_gumbel_softmax=add_noise_gumbel_softmax)
+                                                               add_noise_gumbel_softmax=add_noise_gumbel_softmax,
+                                                               continuous_replay=continuous_replay)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -601,18 +662,20 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
-        # make sure we are in training mode
         self.actor_module.train()
 
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        temperature = data.meta_info["temperature"]
         multi_turn = data.meta_info.get("multi_turn", False)
-
-        add_noise_dirichlet = data.meta_info['add_noise_dirichlet']
-        add_noise_gumbel_softmax = data.meta_info['add_noise_gumbel_softmax']
+        add_noise_dirichlet = data.meta_info["add_noise_dirichlet"]
+        add_noise_gumbel_softmax = data.meta_info["add_noise_gumbel_softmax"]
+        continuous_replay = bool(data.meta_info.get("continuous_replay", True))
         opd_active = self.opd_config.active
+        standalone = opd_active and self.opd_config.mode is ObjectiveMode.STANDALONE
         opd_beta = float(data.meta_info.get("opd_beta_effective", 0.0))
         rollout_iteration = int(data.meta_info.get("opd_rollout_iteration", -1))
         if opd_active:
+            if not continuous_replay:
+                raise RuntimeError("active OPD requires native continuous replay")
             if rollout_iteration < 0:
                 raise RuntimeError("active OPD update is missing its zero-based rollout iteration")
             if not math.isfinite(opd_beta) or opd_beta < 0.0:
@@ -621,18 +684,23 @@ class DataParallelPPOActor(BasePPOActor):
                 raise RuntimeError("OPD production study requires exactly one PPO epoch")
             if self.config.use_dynamic_bsz:
                 raise RuntimeError("OPD requires fixed microbatches for global slot weighting")
+        if standalone and (opd_beta <= 0.0 or self.config.use_kl_loss):
+            raise RuntimeError("standalone OPD requires a positive dose and forbids native reference KL")
         compute_opd = opd_active and opd_beta > 0.0
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages",
-                       "rollout_topk_ids", "rollout_topk_gumbels", "gumbel_temperature"]
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if not standalone:
+            select_keys.extend(["old_log_probs", "advantages"])
+        if continuous_replay:
+            select_keys.extend(
+                ["rollout_topk_ids", "rollout_topk_gumbels", "gumbel_temperature"]
+            )
         if multi_turn:
             select_keys.append("loss_mask")
-        if self.config.use_kl_loss:
+        if self.config.use_kl_loss and not standalone:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch
         if compute_opd and has_multi_modal_inputs:
             raise RuntimeError("OPD MATH production study does not support multimodal replay")
         if compute_opd:
@@ -642,248 +710,327 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = data.select(select_keys, ["extra_info"]).chunk(num_mini_batches)
         elif has_multi_modal_inputs:
             num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
-            non_tensor_select_keys = ["multi_modal_inputs"]
-            dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+            dataloader = data.select(select_keys, ["multi_modal_inputs"]).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
         optimizer_steps = 0
+        local_pg_sum = 0.0
+        local_native_kl_sum = 0.0
+        local_base_total_sum = 0.0
+        local_policy_tokens = 0
         local_opd_kl_sum = 0.0
+        local_opd_latent_kl_sum = 0.0
+        local_opd_answer_kl_sum = 0.0
         local_opd_denominator = 0
+        local_opd_latent_slots = 0
+        local_opd_answer_slots = 0
         local_opd_selected = 0
         local_teacher_entropy_sum = 0.0
         teacher_seconds = 0.0
-        local_pg_loss_sum = 0.0
-        local_native_kl_sum = 0.0
-        local_total_loss_sum = 0.0
-        local_loss_observations = 0
         support_grpo_grad_sq = None
         support_opd_grad_sq = None
         support_grad_dot = None
         ratio_observations = []
         negative_log_ratio_observations = []
         clip_observations = []
-        for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
-                # split batch into micro_batches
-                mini_batch = data
+        grad_norm_sum = 0.0
+        grad_clip_count = 0.0
+
+        for _epoch in range(self.config.ppo_epochs):
+            for mini_batch in dataloader:
                 if compute_opd:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size
+                        // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    num_micro_batches = (
+                        mini_batch.batch.batch_size[0]
+                        // self.config.ppo_micro_batch_size_per_gpu
+                    )
                     micro_batches = mini_batch.chunk(num_micro_batches)
                 elif has_multi_modal_inputs:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size
+                        // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    num_micro_batches = (
+                        mini_batch.batch.batch_size[0]
+                        // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    max_token_len = (
+                        self.config.ppo_max_token_len_per_gpu
+                        * self.ulysses_sequence_parallel_size
+                    )
+                    micro_batches, _ = rearrange_micro_batches(
+                        batch=mini_batch, max_token_len=max_token_len
+                    )
                 else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    # split batch into micro_batches
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size
+                        // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.split(
+                        self.config.ppo_micro_batch_size_per_gpu
+                    )
 
                 self.actor_optimizer.zero_grad()
-
                 global_opd_denominator = None
                 if compute_opd:
                     mini_tensors = mini_batch.batch
                     mini_response_length = mini_tensors["responses"].size(-1)
-                    mini_response_mask = mini_tensors["attention_mask"][:, -mini_response_length:].bool()
-                    mini_support = mini_tensors["rollout_topk_ids"][:, -mini_response_length:]
-                    local_slots = latent_mask_from_topk_support(mini_response_mask, mini_support).sum()
+                    mini_response_mask = mini_tensors["attention_mask"][
+                        :, -mini_response_length:
+                    ].bool()
+                    mini_support = mini_tensors["rollout_topk_ids"][
+                        :, -mini_response_length:
+                    ]
+                    local_slots = opd_loss_support_mask(
+                        mini_response_mask,
+                        mini_support,
+                        loss_support=self.opd_config.loss_support,
+                        responses=mini_tensors["responses"],
+                        close_tag_token_id=self.opd_replay.think_end_id,
+                    ).sum()
                     global_opd_denominator = local_slots.to(dtype=torch.int64)
                     if torch.distributed.is_initialized():
                         torch.distributed.all_reduce(global_opd_denominator)
                     if int(global_opd_denominator.item()) <= 0:
-                        raise RuntimeError("distributed OPD optimizer batch has no latent slots")
+                        raise RuntimeError("distributed OPD optimizer batch has no selected support slots")
 
-                for data in micro_batches:
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
+                for micro_batch in micro_batches:
+                    if isinstance(micro_batch, DataProto):
+                        micro_data = {
+                            **micro_batch.batch.to(get_torch_device().current_device()),
+                            **micro_batch.non_tensor_batch,
+                        }
                     else:
-                        data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
-                    responses = data["responses"]
+                        micro_data = micro_batch.to(get_torch_device().current_device())
+                    responses = micro_data["responses"]
                     response_length = responses.size(1)
-                    attention_mask = data["attention_mask"]
-                    if multi_turn:
-                        response_mask = data["loss_mask"][:, -response_length:]
-                    else:
-                        response_mask = attention_mask[:, -response_length:]
-
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
-
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
+                    attention_mask = micro_data["attention_mask"]
+                    response_mask = (
+                        micro_data["loss_mask"][:, -response_length:]
+                        if multi_turn
+                        else attention_mask[:, -response_length:]
+                    )
+                    response_mask = response_mask.bool()
+                    entropy_coeff = float(self.config.entropy_coeff)
                     loss_agg_mode = self.config.loss_agg_mode
+                    collect_gradient_info = continuous_replay and (
+                        compute_opd or not standalone
+                    )
+                    entropy, log_prob, opd_result, gradient_info = self._forward_micro_batch(
+                        micro_batch=micro_data,
+                        temperature=temperature,
+                        calculate_entropy=(not standalone and entropy_coeff != 0.0),
+                        add_noise_dirichlet=add_noise_dirichlet,
+                        add_noise_gumbel_softmax=add_noise_gumbel_softmax,
+                        compute_opd=compute_opd,
+                        collect_gradient_info=collect_gradient_info,
+                        continuous_replay=continuous_replay,
+                    )
 
-                    # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    entropy, log_prob, opd_result, gradient_info = self._forward_micro_batch(micro_batch=data, temperature=temperature,
-                                                                  calculate_entropy=calculate_entropy,
-                                                                  add_noise_dirichlet=add_noise_dirichlet,
-                                                                  add_noise_gumbel_softmax=add_noise_gumbel_softmax,
-                                                                  compute_opd=compute_opd,
-                                                                  collect_gradient_info=True)
-                    # print(
-                    #     f"old_log_prob {(old_log_prob * response_mask).max().item()} {(old_log_prob * response_mask).min().item()}")
-                    # print(
-                    #     f"log_prob {(log_prob * response_mask).max().item()} {(log_prob * response_mask).min().item()}")
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
-                    active_ratio = torch.exp(log_prob - old_log_prob)[response_mask.bool()]
-                    if active_ratio.numel() == 0 or not torch.isfinite(active_ratio).all():
-                        raise FloatingPointError("PPO replay produced an empty or non-finite density ratio")
-                    active_advantages = advantages[response_mask.bool()]
-                    active_unclipped = -active_advantages * active_ratio
-                    active_clipped = -active_advantages * torch.clamp(
-                        active_ratio,
-                        1 - clip_ratio_low,
-                        1 + clip_ratio_high,
-                    )
-                    ratio_observations.append(active_ratio.detach().float())
-                    negative_log_ratio_observations.append(
-                        (old_log_prob - log_prob)[response_mask.bool()].detach().float()
-                    )
-                    clip_observations.append(
-                        active_clipped.gt(active_unclipped).detach().float()
-                    )
-                    if gradient_info is None:
-                        raise RuntimeError("continuous support gradient inventory was not returned")
-                    policy_sensitivity = torch.autograd.grad(
-                        pg_loss,
-                        log_prob,
-                        retain_graph=True,
-                        create_graph=False,
-                    )[0].detach()
-                    latent_policy_sensitivity = policy_sensitivity[gradient_info["latent_mask"]]
-                    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-                    opd_gradient = opd_result.opd_support_gradient if opd_result is not None else None
-                    opd_gradient_scale = 0.0
-                    if compute_opd:
-                        opd_gradient_scale = (
-                            opd_beta * world_size / float(global_opd_denominator.item())
+                    loss = None
+                    pg_loss = None
+                    if not standalone:
+                        old_log_prob = micro_data["old_log_probs"]
+                        advantages = micro_data["advantages"]
+                        clip_ratio = self.config.clip_ratio
+                        clip_ratio_low = (
+                            self.config.clip_ratio_low
+                            if self.config.clip_ratio_low is not None
+                            else clip_ratio
                         )
-                    micro_grpo_sq, micro_opd_sq, micro_dot = _continuous_support_gradient_geometry(
-                        support_logits=gradient_info["support_logits"],
-                        stored_perturbed_logits=gradient_info["support_gumbels"],
-                        policy_log_density_sensitivity=latent_policy_sensitivity,
-                        opd_support_gradient=opd_gradient,
-                        gumbel_temperature=float(data["gumbel_temperature"][0].item()),
-                        policy_scale=1.0 / self.gradient_accumulation,
-                        opd_scale=opd_gradient_scale,
-                    )
-                    if support_grpo_grad_sq is None:
-                        support_grpo_grad_sq = micro_grpo_sq
-                        support_opd_grad_sq = micro_opd_sq
-                        support_grad_dot = micro_dot
-                    else:
-                        support_grpo_grad_sq = support_grpo_grad_sq + micro_grpo_sq
-                        support_opd_grad_sq = support_opd_grad_sq + micro_opd_sq
-                        support_grad_dot = support_grad_dot + micro_dot
+                        clip_ratio_high = (
+                            self.config.clip_ratio_high
+                            if self.config.clip_ratio_high is not None
+                            else clip_ratio
+                        )
+                        clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+                        pg_loss, _pg_clipfrac, _ppo_kl, _pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        active_ratio = torch.exp(log_prob - old_log_prob)[response_mask]
+                        if active_ratio.numel() == 0 or not torch.isfinite(active_ratio).all():
+                            raise FloatingPointError(
+                                "PPO replay produced an empty or non-finite density ratio"
+                            )
+                        active_advantages = advantages[response_mask]
+                        active_unclipped = -active_advantages * active_ratio
+                        active_clipped = -active_advantages * torch.clamp(
+                            active_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high
+                        )
+                        active_dual = torch.minimum(
+                            -active_advantages * clip_ratio_c,
+                            torch.maximum(active_unclipped, active_clipped),
+                        )
+                        active_pg = torch.where(
+                            active_advantages < 0,
+                            active_dual,
+                            torch.maximum(active_unclipped, active_clipped),
+                        )
+                        local_pg_sum += float(active_pg.detach().sum().item())
+                        local_policy_tokens += int(active_pg.numel())
+                        local_base_total_sum += float(active_pg.detach().sum().item())
+                        ratio_observations.append(active_ratio.detach().float())
+                        negative_log_ratio_observations.append(
+                            (old_log_prob - log_prob)[response_mask].detach().float()
+                        )
+                        clip_observations.append(
+                            active_clipped.gt(active_unclipped).detach().float()
+                        )
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
                         policy_loss = pg_loss
+                        if entropy_coeff != 0.0:
+                            entropy_loss = agg_loss(
+                                loss_mat=entropy,
+                                loss_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            policy_loss = policy_loss - entropy_loss * entropy_coeff
+                            local_base_total_sum -= float(
+                                entropy[response_mask].detach().sum().item()
+                            ) * entropy_coeff
+                        if self.config.use_kl_loss:
+                            kld = kl_penalty(
+                                logprob=log_prob,
+                                ref_logprob=micro_data["ref_log_prob"],
+                                kl_penalty=self.config.kl_loss_type,
+                            )
+                            kl_loss = agg_loss(
+                                loss_mat=kld,
+                                loss_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            local_native_kl_sum += float(kld[response_mask].detach().sum().item())
+                            local_base_total_sum += float(
+                                kld[response_mask].detach().sum().item()
+                            ) * float(self.config.kl_loss_coef)
+                            metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        if self.config.use_dynamic_bsz:
+                            loss = policy_loss * (
+                                len(micro_data) / self.config.ppo_mini_batch_size
+                            )
+                        else:
+                            loss = policy_loss / self.gradient_accumulation
 
-                    kl_loss = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
-                    if self.config.use_kl_loss:
-                        ref_log_prob = data["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob,
-                                         kl_penalty=self.config.kl_loss_type)
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
-
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    else:
-                        loss = policy_loss / self.gradient_accumulation
                     if compute_opd:
                         if opd_result is None:
-                            raise RuntimeError("active nonzero OPD update did not return a KL result")
-                        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-                        opd_loss = ddp_scaled_local_loss(
-                            opd_result.kl_sum,
-                            global_opd_denominator,
-                            world_size,
+                            raise RuntimeError("active nonzero OPD update returned no KL result")
+                        world_size = (
+                            torch.distributed.get_world_size()
+                            if torch.distributed.is_initialized()
+                            else 1
                         )
-                        loss = loss + opd_beta * opd_loss
+                        opd_loss = ddp_scaled_local_loss(
+                            opd_result.kl_sum, global_opd_denominator, world_size
+                        )
+                        weighted_local_opd = opd_beta * opd_loss
+                        loss = weighted_local_opd if loss is None else loss + weighted_local_opd
                         local_opd_kl_sum += float(opd_result.kl_sum.detach().item())
+                        local_opd_latent_kl_sum += float(
+                            opd_result.latent_kl_sum.detach().item()
+                        )
+                        local_opd_answer_kl_sum += float(
+                            opd_result.answer_kl_sum.detach().item()
+                        )
                         local_opd_denominator += int(opd_result.denominator_slots)
+                        local_opd_latent_slots += int(opd_result.latent_slots)
+                        local_opd_answer_slots += int(opd_result.answer_slots)
                         local_opd_selected += int(opd_result.selected_slots)
                         local_teacher_entropy_sum += opd_result.teacher_entropy_sum
                         teacher_seconds += opd_result.teacher_seconds
+                    if loss is None:
+                        raise RuntimeError("actor update constructed no optimization objective")
+
+                    if collect_gradient_info:
+                        if gradient_info is None:
+                            raise RuntimeError(
+                                "continuous support gradient inventory was not returned"
+                            )
+                        if standalone:
+                            latent_policy_sensitivity = torch.zeros(
+                                gradient_info["latent_mask"].sum(),
+                                device=log_prob.device,
+                                dtype=log_prob.dtype,
+                            )
+                        else:
+                            policy_sensitivity = torch.autograd.grad(
+                                pg_loss,
+                                log_prob,
+                                retain_graph=True,
+                                create_graph=False,
+                            )[0].detach()
+                            latent_policy_sensitivity = policy_sensitivity[
+                                gradient_info["latent_mask"]
+                            ]
+                        world_size = (
+                            torch.distributed.get_world_size()
+                            if torch.distributed.is_initialized()
+                            else 1
+                        )
+                        opd_gradient = (
+                            opd_result.opd_support_gradient
+                            if opd_result is not None
+                            else None
+                        )
+                        opd_gradient_scale = (
+                            opd_beta * world_size / float(global_opd_denominator.item())
+                            if compute_opd
+                            else 0.0
+                        )
+                        micro_grpo_sq, micro_opd_sq, micro_dot = (
+                            _continuous_support_gradient_geometry(
+                                support_logits=gradient_info["support_logits"],
+                                stored_perturbed_logits=gradient_info["support_gumbels"],
+                                policy_log_density_sensitivity=latent_policy_sensitivity,
+                                opd_support_gradient=opd_gradient,
+                                gumbel_temperature=float(
+                                    micro_data["gumbel_temperature"][0].item()
+                                ),
+                                policy_scale=(
+                                    0.0 if standalone else 1.0 / self.gradient_accumulation
+                                ),
+                                opd_scale=opd_gradient_scale,
+                            )
+                        )
+                        if support_grpo_grad_sq is None:
+                            support_grpo_grad_sq = micro_grpo_sq
+                            support_opd_grad_sq = micro_opd_sq
+                            support_grad_dot = micro_dot
+                        else:
+                            support_grpo_grad_sq += micro_grpo_sq
+                            support_opd_grad_sq += micro_opd_sq
+                            support_grad_dot += micro_dot
+
                     loss.backward()
-
-                    local_pg_loss_sum += float(pg_loss.detach().item())
-                    local_native_kl_sum += float(kl_loss.detach().item())
-                    local_total_loss_sum += float(policy_loss.detach().item())
-                    local_loss_observations += 1
-
-                    data = {
-                        "actor/pg_loss": pg_loss.detach().item(),
-                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                        "actor/ppo_kl": ppo_kl.detach().item(),
-                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        "actor/ratio_mean": active_ratio.mean().detach().item(),
-                        "actor/ratio_p95": torch.quantile(active_ratio.float(), 0.95).detach().item(),
-                    }
-                    append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
                 optimizer_steps += 1
                 grad_norm_value = float(grad_norm.detach().item())
-                data = {
-                    "actor/grad_norm": grad_norm_value,
-                    "actor/gradient_clipfrac": float(grad_norm_value > float(self.config.grad_clip)),
-                }
-                append_to_dict(metrics, data)
+                grad_norm_sum += grad_norm_value
+                grad_clip_count += float(grad_norm_value > float(self.config.grad_clip))
 
         if optimizer_steps <= 0:
             raise RuntimeError("actor update completed without an optimizer step")
-        global_ratios = _all_gather_variable_1d(torch.cat(ratio_observations))
-        global_negative_log_ratios = _all_gather_variable_1d(
-            torch.cat(negative_log_ratio_observations)
-        )
-        global_clip_indicators = _all_gather_variable_1d(torch.cat(clip_observations))
-        if global_ratios.numel() == 0:
-            raise RuntimeError("PPO update produced no ratio observations")
-        exact_ratio_mean = float(global_ratios.mean().item())
-        exact_ratio_p95 = float(torch.quantile(global_ratios, 0.95).item())
-        exact_approx_kl = float(global_negative_log_ratios.mean().item())
-        exact_clip_fraction = float(global_clip_indicators.mean().item())
 
         teacher_student_rms = 0.0
         if opd_active and self.opd_config.teacher.type is not TeacherType.CURRENT_ACTOR:
             squared_sum, parameter_count = parameter_squared_distance_sum_and_count(
-                self.opd_teacher_module,
-                self.actor_module,
+                self.opd_teacher_module, self.actor_module
             )
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(squared_sum)
@@ -892,6 +1039,8 @@ class DataParallelPPOActor(BasePPOActor):
                 rms_from_squared_sum_and_count(squared_sum, parameter_count).item()
             )
 
+        # The EMA snapshot is fixed for both optimizer steps and advances only
+        # after every step in the outer rollout iteration has succeeded.
         ema_updates_this_iteration = 0
         if opd_active and self.opd_config.teacher.type is TeacherType.EMA:
             update_ema_once_(
@@ -903,63 +1052,69 @@ class DataParallelPPOActor(BasePPOActor):
             )
             ema_updates_this_iteration = 1
 
-        global_opd_kl_sum = torch.tensor(
-            local_opd_kl_sum,
+        device = get_torch_device().current_device()
+        global_values = torch.tensor(
+            [
+                local_pg_sum,
+                local_native_kl_sum,
+                local_base_total_sum,
+                float(local_policy_tokens),
+                local_opd_kl_sum,
+                local_opd_latent_kl_sum,
+                local_opd_answer_kl_sum,
+                float(local_opd_denominator),
+                float(local_opd_latent_slots),
+                float(local_opd_answer_slots),
+                float(local_opd_selected),
+                local_teacher_entropy_sum,
+                grad_norm_sum,
+                grad_clip_count,
+                float(optimizer_steps),
+            ],
             dtype=torch.float64,
-            device=get_torch_device().current_device(),
-        )
-        global_opd_slots = torch.tensor(
-            local_opd_denominator,
-            dtype=torch.int64,
-            device=global_opd_kl_sum.device,
-        )
-        global_selected_slots = torch.tensor(
-            local_opd_selected,
-            dtype=torch.int64,
-            device=global_opd_kl_sum.device,
-        )
-        global_entropy_sum = torch.tensor(
-            local_teacher_entropy_sum,
-            dtype=torch.float64,
-            device=global_opd_kl_sum.device,
+            device=device,
         )
         if torch.distributed.is_initialized():
-            for value in (global_opd_kl_sum, global_opd_slots, global_selected_slots, global_entropy_sum):
-                torch.distributed.all_reduce(value)
-        opd_kl_mean = (
-            float((global_opd_kl_sum / global_opd_slots).item())
-            if int(global_opd_slots.item()) > 0
-            else 0.0
+            torch.distributed.all_reduce(global_values)
+        (
+            global_pg_sum,
+            global_native_kl_sum,
+            global_base_total_sum,
+            global_policy_tokens,
+            global_opd_kl_sum,
+            global_opd_latent_kl_sum,
+            global_opd_answer_kl_sum,
+            global_opd_slots,
+            global_latent_slots,
+            global_answer_slots,
+            global_selected_slots,
+            global_entropy_sum,
+            global_grad_norm_sum,
+            global_grad_clip_count,
+            global_optimizer_step_observations,
+        ) = global_values
+        opd_kl_mean = float(
+            (global_opd_kl_sum / global_opd_slots.clamp_min(1.0)).item()
         )
-        teacher_entropy_mean = (
-            float((global_entropy_sum / global_selected_slots).item())
-            if int(global_selected_slots.item()) > 0
-            else 0.0
+        opd_latent_mean = float(
+            (global_opd_latent_kl_sum / global_latent_slots.clamp_min(1.0)).item()
         )
-        if support_grpo_grad_sq is None:
-            raise RuntimeError("continuous support gradient diagnostics were not accumulated")
-        for value in (support_grpo_grad_sq, support_opd_grad_sq, support_grad_dot):
-            if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(value)
-        gradient_world_size = (
-            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        opd_answer_mean = float(
+            (global_opd_answer_kl_sum / global_answer_slots.clamp_min(1.0)).item()
         )
-        grpo_support_norm = math.sqrt(max(float(support_grpo_grad_sq.item()), 0.0)) / gradient_world_size
-        opd_support_norm = math.sqrt(max(float(support_opd_grad_sq.item()), 0.0)) / gradient_world_size
-        if grpo_support_norm > 0.0 and opd_support_norm > 0.0:
-            grpo_opd_cosine = float(support_grad_dot.item()) / (
-                math.sqrt(float(support_grpo_grad_sq.item()))
-                * math.sqrt(float(support_opd_grad_sq.item()))
-            )
-            grpo_opd_cosine = max(-1.0, min(1.0, grpo_opd_cosine))
-        else:
-            grpo_opd_cosine = 0.0
-        base_loss_mean = local_total_loss_sum / max(local_loss_observations, 1)
+        teacher_entropy_mean = float(
+            (global_entropy_sum / global_selected_slots.clamp_min(1.0)).item()
+        )
         weighted_opd = opd_beta * opd_kl_mean
+        base_loss_mean = (
+            0.0
+            if standalone
+            else float((global_base_total_sum / global_policy_tokens.clamp_min(1.0)).item())
+        )
         metrics.update(
             {
-                "loss/grpo": local_pg_loss_sum / max(local_loss_observations, 1),
-                "loss/native_ref_kl": local_native_kl_sum / max(local_loss_observations, 1),
+                "loss/opd_kl_latent": opd_latent_mean,
+                "loss/opd_kl_answer": opd_answer_mean,
                 "loss/opd_kl_unweighted": opd_kl_mean,
                 "loss/opd_weighted": weighted_opd,
                 "loss/total": base_loss_mean + weighted_opd,
@@ -968,31 +1123,103 @@ class DataParallelPPOActor(BasePPOActor):
                 "opd/ema_updates_this_iteration": float(ema_updates_this_iteration),
                 "opd/active_slots": float(global_opd_slots.item()),
                 "opd/selected_slots": float(global_selected_slots.item()),
+                "opd/latent_slot_count": float(global_latent_slots.item()),
+                "opd/answer_slot_count": float(global_answer_slots.item()),
+                "opd/selected_slot_fraction": float(
+                    (global_selected_slots / global_opd_slots.clamp_min(1.0)).item()
+                ),
                 "opd/teacher_entropy": teacher_entropy_mean,
                 "perf/teacher_seconds": teacher_seconds,
                 "trainer/optimizer_steps_this_iteration": float(optimizer_steps),
-                # Worker-prefixed aliases are consumed by the driver-side
-                # stable W&B contract without disturbing upstream metrics.
+                "actor/opd_kl_latent": opd_latent_mean,
+                "actor/opd_kl_answer": opd_answer_mean,
                 "actor/opd_kl_unweighted": opd_kl_mean,
                 "actor/opd_weighted": weighted_opd,
                 "actor/total_loss": base_loss_mean + weighted_opd,
                 "actor/opd_teacher_student_param_rms": teacher_student_rms,
                 "actor/opd_ema_update_count": float(self.ema_state.update_count),
                 "actor/opd_teacher_seconds": teacher_seconds,
-                "actor/ratio_mean": exact_ratio_mean,
-                "actor/ratio_p95": exact_ratio_p95,
-                "actor/pg_clipfrac": exact_clip_fraction,
-                "actor/ppo_kl": exact_approx_kl,
-                "actor/grpo_grad_norm": grpo_support_norm,
-                "actor/opd_grad_norm": opd_support_norm,
-                "actor/grpo_opd_grad_cosine": grpo_opd_cosine,
-                "grad/grpo_norm": grpo_support_norm,
-                "grad/opd_norm": opd_support_norm,
-                "grad/grpo_opd_cosine": grpo_opd_cosine,
-                "grad/fixed_support_grpo_norm": grpo_support_norm,
-                "grad/fixed_support_opd_norm": opd_support_norm,
-                "grad/fixed_support_grpo_opd_cosine": grpo_opd_cosine,
+                "actor/grad_norm": float(
+                    (global_grad_norm_sum / global_optimizer_step_observations).item()
+                ),
+                "actor/gradient_clipfrac": float(
+                    (global_grad_clip_count / global_optimizer_step_observations).item()
+                ),
             }
         )
+
+        grpo_support_norm = 0.0
+        opd_support_norm = 0.0
+        grpo_opd_cosine = 0.0
+        if continuous_replay:
+            if support_grpo_grad_sq is None:
+                raise RuntimeError("continuous support gradient diagnostics were not accumulated")
+            for value in (support_grpo_grad_sq, support_opd_grad_sq, support_grad_dot):
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(value)
+            gradient_world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            )
+            grpo_support_norm = (
+                math.sqrt(max(float(support_grpo_grad_sq.item()), 0.0))
+                / gradient_world_size
+            )
+            opd_support_norm = (
+                math.sqrt(max(float(support_opd_grad_sq.item()), 0.0))
+                / gradient_world_size
+            )
+            if grpo_support_norm > 0.0 and opd_support_norm > 0.0:
+                grpo_opd_cosine = float(support_grad_dot.item()) / (
+                    math.sqrt(float(support_grpo_grad_sq.item()))
+                    * math.sqrt(float(support_opd_grad_sq.item()))
+                )
+                grpo_opd_cosine = max(-1.0, min(1.0, grpo_opd_cosine))
+        metrics.update(
+            {
+                "actor/opd_grad_norm": opd_support_norm,
+                "grad/opd_norm": opd_support_norm,
+                "grad/fixed_support_opd_norm": opd_support_norm,
+            }
+        )
+
+        if not standalone:
+            global_ratios = _all_gather_variable_1d(torch.cat(ratio_observations))
+            global_negative_log_ratios = _all_gather_variable_1d(
+                torch.cat(negative_log_ratio_observations)
+            )
+            global_clip_indicators = _all_gather_variable_1d(
+                torch.cat(clip_observations)
+            )
+            exact_ratio_mean = float(global_ratios.mean().item())
+            exact_ratio_p95 = float(torch.quantile(global_ratios, 0.95).item())
+            exact_approx_kl = float(global_negative_log_ratios.mean().item())
+            exact_clip_fraction = float(global_clip_indicators.mean().item())
+            exact_pg_mean = float(
+                (global_pg_sum / global_policy_tokens.clamp_min(1.0)).item()
+            )
+            exact_native_kl_mean = float(
+                (global_native_kl_sum / global_policy_tokens.clamp_min(1.0)).item()
+            )
+            metrics.update(
+                {
+                    "actor/pg_loss": exact_pg_mean,
+                    "actor/kl_loss": exact_native_kl_mean,
+                    "actor/ratio_mean": exact_ratio_mean,
+                    "actor/ratio_p95": exact_ratio_p95,
+                    "actor/pg_clipfrac": exact_clip_fraction,
+                    "actor/ppo_kl": exact_approx_kl,
+                    "actor/grpo_grad_norm": grpo_support_norm,
+                    "actor/grpo_opd_grad_cosine": grpo_opd_cosine,
+                    "loss/grpo": exact_pg_mean,
+                    "loss/native_ref_kl": exact_native_kl_mean,
+                    "grad/grpo_norm": grpo_support_norm,
+                    "grad/grpo_opd_cosine": grpo_opd_cosine,
+                    "grad/fixed_support_grpo_norm": grpo_support_norm,
+                    "grad/fixed_support_grpo_opd_cosine": grpo_opd_cosine,
+                }
+            )
+
         self.actor_optimizer.zero_grad()
         return metrics

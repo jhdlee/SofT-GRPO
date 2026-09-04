@@ -57,6 +57,9 @@ def schedule_multiplier(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"unknown OPD schedule: {schedule!r}") from exc
 
+    if schedule_type is ScheduleType.CONSTANT:
+        return 1.0
+
     warmup = warmup_iterations(total_iterations, warmup_fraction)
     if rollout_iteration <= warmup:
         return min(1.0, rollout_iteration / warmup)

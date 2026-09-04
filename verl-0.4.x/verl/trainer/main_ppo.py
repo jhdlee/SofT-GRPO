@@ -96,30 +96,50 @@ class TaskRunner:
                     raise RuntimeError(f"rollout integrity requires atomic {tag!r}; got token IDs {tag_ids}")
             rollout = config.actor_rollout_ref.rollout
             incompatible = []
-            if rollout.name != "sglang":
-                incompatible.append("rollout.name must be sglang")
             if not bool(rollout.get("deterministic_sampling", False)):
                 incompatible.append(
                     "deterministic_sampling must be true for exact request-local replay"
                 )
-            if not rollout.enable_soft_thinking:
-                incompatible.append("enable_soft_thinking must be true")
-            if not rollout.add_noise_gumbel_softmax:
-                incompatible.append("add_noise_gumbel_softmax must be true")
-            if not rollout.noise_gumbel or not rollout.noise_on_logits:
-                incompatible.append("shifted-Gumbel logit noise must be active")
-            if rollout.add_noise_dirichlet or rollout.noise_gaussian or rollout.noise_on_inputs:
-                incompatible.append("alternative continuous-noise paths must be disabled")
-            if rollout.top_k != 5 or rollout.after_thinking_top_k != 5:
-                incompatible.append("thinking and answer top_k must both be 5")
-            if float(rollout.temperature) != 1.0 or float(rollout.after_thinking_temperature) != 1.0:
-                incompatible.append("thinking and answer LM temperatures must both be 1.0")
-            if float(rollout.gumbel_softmax_temperature) != 0.1:
-                incompatible.append("gumbel_softmax_temperature must be 0.1")
-            if not config.actor_rollout_ref.model.use_remove_padding:
-                incompatible.append("model.use_remove_padding must be true (the padded actor branch is categorical)")
+            if bool(rollout.get("enable_soft_thinking", True)):
+                if rollout.name != "sglang":
+                    incompatible.append("native-soft rollout.name must be sglang")
+                if not rollout.add_noise_gumbel_softmax:
+                    incompatible.append("add_noise_gumbel_softmax must be true")
+                if not rollout.noise_gumbel or not rollout.noise_on_logits:
+                    incompatible.append("shifted-Gumbel logit noise must be active")
+                if rollout.add_noise_dirichlet or rollout.noise_gaussian or rollout.noise_on_inputs:
+                    incompatible.append("alternative continuous-noise paths must be disabled")
+                if rollout.top_k != 5 or rollout.after_thinking_top_k != 5:
+                    incompatible.append("thinking and answer top_k must both be 5")
+                if float(rollout.temperature) != 1.0 or float(rollout.after_thinking_temperature) != 1.0:
+                    incompatible.append("thinking and answer LM temperatures must both be 1.0")
+                if float(rollout.gumbel_softmax_temperature) != 0.1:
+                    incompatible.append("gumbel_softmax_temperature must be 0.1")
+                if not config.actor_rollout_ref.model.use_remove_padding:
+                    incompatible.append("native-soft replay requires model.use_remove_padding=true")
+            else:
+                if rollout.name != "vllm":
+                    incompatible.append("categorical hard rollout.name must be vllm")
+                if float(rollout.temperature) != 1.0:
+                    incompatible.append("categorical hard temperature must be 1.0")
+                if float(rollout.top_p) != 1.0:
+                    incompatible.append("categorical hard top_p must be 1.0")
+                if int(rollout.top_k) != -1:
+                    incompatible.append("categorical hard top_k must be unrestricted (-1)")
+                if any(
+                    bool(rollout.get(name, False))
+                    for name in (
+                        "add_noise_gumbel_softmax",
+                        "add_noise_dirichlet",
+                        "noise_gumbel",
+                        "noise_gaussian",
+                        "noise_on_inputs",
+                        "noise_on_logits",
+                    )
+                ):
+                    incompatible.append("categorical hard rollout must disable continuous-noise paths")
             if incompatible:
-                raise RuntimeError("continuous SofT-GRPO integrity configuration failed: " + "; ".join(incompatible))
+                raise RuntimeError("rollout integrity configuration failed: " + "; ".join(incompatible))
 
         # vllm early verify
         if config.actor_rollout_ref.rollout.name in ["vllm"]:

@@ -5,6 +5,8 @@ from torch import nn
 from verl.opd import (
     FORBIDDEN_METRICS,
     ITERATION_METRICS,
+    STANDALONE_INAPPLICABLE_METRICS,
+    STANDALONE_ITERATION_METRICS,
     VALIDATION_METRICS,
     EMAUpdateState,
     OPDConfig,
@@ -13,9 +15,11 @@ from verl.opd import (
     parameter_squared_distance_sum_and_count,
     render_privileged_prompt,
     render_sdft_prompt,
+    required_iteration_metrics,
     rms_from_squared_sum_and_count,
     update_ema_once_,
     validate_metric_payload,
+    validation_pass_at_1_aliases,
 )
 
 
@@ -114,13 +118,75 @@ def test_metric_contract_contains_required_names_and_separates_weight_terms():
     assert "opd/kl_weight" in FORBIDDEN_METRICS
     assert "opd/schedule_multiplier" in ITERATION_METRICS
     assert "opd/beta_effective" in ITERATION_METRICS
+    assert "algorithm/objective_mode" in ITERATION_METRICS
+    assert "opd/loss_support" in ITERATION_METRICS
+    assert "loss/opd_kl_latent" in ITERATION_METRICS
+    assert "loss/opd_kl_answer" in ITERATION_METRICS
+    assert "opd/latent_slot_count" in ITERATION_METRICS
+    assert "opd/answer_slot_count" in ITERATION_METRICS
+    assert "opd/selected_slot_fraction" in ITERATION_METRICS
     assert "val/math_verify/mean_at_1" in VALIDATION_METRICS
+    assert "val/math_verify/pass_at_1" in VALIDATION_METRICS
+    assert "val/released_reward/pass_at_1" in VALIDATION_METRICS
 
     metrics = opd_schedule_metrics(OPDConfig(), rollout_iteration=11, total_iterations=109)
     assert metrics["opd/warmup_iterations"] == 11
     assert metrics["opd/schedule_multiplier"] == 1.0
     assert metrics["opd/beta_effective"] == 0.001
+    assert metrics["algorithm/objective_mode"] == "auxiliary"
+    assert metrics["opd/loss_support"] == "latent_only"
     validate_metric_payload(metrics, required=metrics.keys())
+
+
+def test_constant_schedule_metrics_report_no_warmup():
+    metrics = opd_schedule_metrics(
+        OPDConfig(
+            mode="standalone",
+            loss_support="all_response",
+            beta_base=1.0,
+            schedule="constant",
+        ),
+        rollout_iteration=0,
+        total_iterations=109,
+    )
+    assert metrics["algorithm/objective_mode"] == "standalone"
+    assert metrics["opd/loss_support"] == "all_response"
+    assert metrics["opd/warmup_iterations"] == 0
+    assert metrics["opd/schedule_multiplier"] == 1.0
+    assert metrics["opd/beta_effective"] == 1.0
+
+
+def test_standalone_metric_contract_omits_inapplicable_grpo_and_ppo_fields():
+    assert required_iteration_metrics("auxiliary") is ITERATION_METRICS
+    assert required_iteration_metrics("standalone") is STANDALONE_ITERATION_METRICS
+    assert STANDALONE_INAPPLICABLE_METRICS.isdisjoint(STANDALONE_ITERATION_METRICS)
+    assert "loss/grpo" in STANDALONE_INAPPLICABLE_METRICS
+    assert "loss/native_ref_kl" in STANDALONE_INAPPLICABLE_METRICS
+    assert "ppo/ratio_mean" in STANDALONE_INAPPLICABLE_METRICS
+    assert "grad/grpo_norm" in STANDALONE_INAPPLICABLE_METRICS
+    assert "train/reward_mean" in STANDALONE_ITERATION_METRICS
+    assert "loss/opd_kl_unweighted" in STANDALONE_ITERATION_METRICS
+
+
+def test_validation_pass_at_1_is_an_exact_mean_at_1_alias():
+    aliases = validation_pass_at_1_aliases(
+        {
+            "val/math_verify/mean_at_1": 0.625,
+            "val/released_reward/mean_at_1": 0.5,
+        }
+    )
+    assert aliases == {
+        "val/math_verify/pass_at_1": 0.625,
+        "val/released_reward/pass_at_1": 0.5,
+    }
+
+    with pytest.raises(ValueError, match="disagrees"):
+        validation_pass_at_1_aliases(
+            {
+                "val/math_verify/mean_at_1": 0.625,
+                "val/math_verify/pass_at_1": 0.5,
+            }
+        )
 
 
 def test_zero_beta_schedule_metrics_are_zero_without_hiding_base_config():

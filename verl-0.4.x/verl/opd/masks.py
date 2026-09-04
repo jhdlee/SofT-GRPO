@@ -6,7 +6,7 @@ from typing import Optional, Union
 
 import torch
 
-from .config import TrajectoryGate
+from .config import LossSupport, TrajectoryGate
 
 
 def latent_mask_from_topk_support(response_mask: torch.Tensor, rollout_topk_ids: torch.Tensor) -> torch.Tensor:
@@ -27,6 +27,100 @@ def latent_mask_from_topk_support(response_mask: torch.Tensor, rollout_topk_ids:
     valid_response = response_mask.to(dtype=torch.bool)
     categorical_sentinel = (rollout_topk_ids[..., 1:] == 0).all(dim=-1)
     return valid_response & ~categorical_sentinel
+
+
+def _validate_boundary_inputs(
+    response_mask: torch.Tensor,
+    rollout_topk_ids: torch.Tensor,
+    responses: torch.Tensor,
+) -> None:
+    if responses.shape != response_mask.shape:
+        raise ValueError("responses and response_mask must have identical shapes")
+    # Reuse the released-support validation, including the support-width check.
+    latent_mask_from_topk_support(response_mask, rollout_topk_ids)
+
+
+def categorical_suffix_mask(
+    response_mask: torch.Tensor,
+    rollout_topk_ids: torch.Tensor,
+    responses: torch.Tensor,
+    close_tag_token_id: int,
+) -> torch.Tensor:
+    """Return sampled categorical actions strictly after the first close tag.
+
+    Masks in this module are response-*action* aligned: position ``t`` selects
+    the causal logits that predict response action ``t``.  Consequently the
+    categorical ``</think>`` transition action itself is excluded, while EOS
+    and other valid sampled suffix actions after it remain eligible.
+
+    Released SofT-GRPO encodes categorical actions with support
+    ``[token_id, 0, 0, ...]``.  A malformed continuous action after the close
+    tag is deliberately excluded rather than being relabeled categorical.
+    """
+
+    _validate_boundary_inputs(response_mask, rollout_topk_ids, responses)
+    if isinstance(close_tag_token_id, bool) or not isinstance(close_tag_token_id, int):
+        raise TypeError("close_tag_token_id must be an integer")
+
+    valid = response_mask.to(dtype=torch.bool)
+    close = valid & responses.eq(close_tag_token_id)
+    # Shift the inclusive prefix state right by one so the close action is not
+    # part of the answer suffix.  Multiple close tokens remain suffix actions
+    # once the first transition has occurred.
+    seen_close_inclusive = close.to(dtype=torch.int64).cumsum(dim=-1) > 0
+    seen_close_before = torch.zeros_like(seen_close_inclusive)
+    if seen_close_before.shape[-1] > 1:
+        seen_close_before[..., 1:] = seen_close_inclusive[..., :-1]
+
+    categorical = (rollout_topk_ids[..., 1:] == 0).all(dim=-1)
+    return valid & categorical & seen_close_before
+
+
+def opd_loss_support_mask(
+    response_mask: torch.Tensor,
+    rollout_topk_ids: torch.Tensor,
+    *,
+    loss_support: Union[LossSupport, str] = LossSupport.LATENT_ONLY,
+    responses: Optional[torch.Tensor] = None,
+    close_tag_token_id: Optional[int] = None,
+) -> torch.Tensor:
+    """Build the response-action mask for the configured OPD objective.
+
+    ``latent_only`` intentionally delegates to the original released-support
+    detector and therefore preserves historical behavior exactly.
+
+    ``all_response`` includes valid continuous positions strictly before the
+    first atomic ``</think>`` and valid categorical positions strictly after
+    it.  It excludes the close transition itself, padding, and malformed mode
+    positions.  If a capped trajectory never closes, all of its valid
+    continuous positions remain selected and it contributes no answer slots.
+    """
+
+    try:
+        support_type = LossSupport(loss_support)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unknown OPD loss support: {loss_support!r}") from exc
+
+    latent = latent_mask_from_topk_support(response_mask, rollout_topk_ids)
+    if support_type is LossSupport.LATENT_ONLY:
+        return latent
+    if responses is None or close_tag_token_id is None:
+        raise ValueError(
+            "responses and close_tag_token_id are required for all_response support"
+        )
+
+    _validate_boundary_inputs(response_mask, rollout_topk_ids, responses)
+    valid = response_mask.to(dtype=torch.bool)
+    close = valid & responses.eq(close_tag_token_id)
+    seen_close_inclusive = close.to(dtype=torch.int64).cumsum(dim=-1) > 0
+    pre_close_latent = latent & ~seen_close_inclusive
+    answer = categorical_suffix_mask(
+        response_mask,
+        rollout_topk_ids,
+        responses,
+        close_tag_token_id,
+    )
+    return pre_close_latent | answer
 
 
 def trajectory_gate_mask(

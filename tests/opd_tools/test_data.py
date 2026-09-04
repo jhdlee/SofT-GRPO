@@ -5,14 +5,23 @@ import unittest
 
 from opd_tools.constants import (
     GSM8K_DATASET_REVISION,
+    MATH_DUPLICATE_DROP_INDICES,
+    MATH_DUPLICATE_KEEP_BY_DROP,
+    MATH_EMPTY_ANSWER_INDICES,
+    MATH_SPLIT_SEED,
+    MATH_TRAIN_SIZE,
+    MATH_VALIDATION_IDS_SHA256,
+    MATH_VALIDATION_SIZE,
     MATH500_DATASET_REVISION,
     MATH_DATASET_REVISION,
     MODEL_REVISION,
 )
 from opd_tools.data import (
+    _validation_allocations,
     build_gsm8k_evaluation_records,
     build_math500_evaluation_records,
     clean_math_lighteval,
+    ordered_example_ids_sha256,
     stratified_math_split,
 )
 from opd_tools.records import (
@@ -80,17 +89,64 @@ class MathDataTest(unittest.TestCase):
 
         self.assertEqual(report.source_count, 7_500)
         self.assertEqual(report.clean_count, 7_497)
+        self.assertEqual(
+            report.empty_answer_source_indices,
+            MATH_EMPTY_ANSWER_INDICES,
+        )
+        self.assertEqual(
+            report.duplicate_drop_source_indices,
+            MATH_DUPLICATE_DROP_INDICES,
+        )
+        self.assertEqual(
+            report.duplicate_keep_by_drop,
+            tuple(sorted(MATH_DUPLICATE_KEEP_BY_DROP.items())),
+        )
         self.assertEqual(report.released_extractor_disagreement_source_indices, (252,))
         self.assertEqual(
             report.released_extractor_disagreements,
             ((252, "17", "{17}."),),
         )
-        self.assertEqual(len(splits["train"]), 6_985)
-        self.assertEqual(len(splits["validation"]), 512)
+        self.assertEqual(len(splits["train"]), MATH_TRAIN_SIZE)
+        self.assertEqual(len(splits["validation"]), MATH_VALIDATION_SIZE)
         train_ids = {example.example_id for example in splits["train"]}
         validation_ids = {example.example_id for example in splits["validation"]}
         self.assertFalse(train_ids & validation_ids)
-        self.assertNotIn("math-train-000959", train_ids | validation_ids)
+        retained_ids = train_ids | validation_ids
+        for source_index in (*MATH_EMPTY_ANSWER_INDICES, *MATH_DUPLICATE_DROP_INDICES):
+            self.assertNotIn("math-train-%06d" % source_index, retained_ids)
+        self.assertIn("math-train-000925", retained_ids)
+        self.assertEqual(
+            {example.source_index: example.example_id for example in cleaned}[7_499],
+            "math-train-007499",
+        )
+
+    def test_largest_remainder_allocation_leaves_one_train_per_stratum(self):
+        rows = []
+        source_index = 0
+        for subject, count in (("A", 5), ("B", 3), ("C", 2), ("D", 1)):
+            for _ in range(count):
+                rows.append(math_row(source_index, subject=subject, level="Level 1"))
+                source_index += 1
+        cleaned, _ = clean_math_lighteval(rows, enforce_pinned_contract=False)
+        strata = {}
+        for subject in ("A", "B", "C", "D"):
+            strata[(subject, "Level 1")] = [
+                example for example in cleaned if example.subject == subject
+            ]
+
+        allocation = _validation_allocations(strata, validation_size=4)
+
+        self.assertEqual(
+            allocation,
+            {
+                ("A", "Level 1"): 2,
+                ("B", "Level 1"): 1,
+                ("C", "Level 1"): 1,
+                ("D", "Level 1"): 0,
+            },
+        )
+        for stratum, count in allocation.items():
+            self.assertLess(count, len(strata[stratum]))
 
     def test_split_is_deterministic_and_stratified(self):
         rows = [
@@ -108,9 +164,32 @@ class MathDataTest(unittest.TestCase):
             [item.example_id for item in first["validation"]],
             [item.example_id for item in second["validation"]],
         )
+        validation_ids = [item.example_id for item in first["validation"]]
+        self.assertEqual(
+            validation_ids,
+            [
+                "math-train-000000",
+                "math-train-000011",
+                "math-train-000014",
+                "math-train-000017",
+                "math-train-000024",
+                "math-train-000027",
+            ],
+        )
+        self.assertEqual(
+            ordered_example_ids_sha256(validation_ids),
+            "18dd32122b1e2b609637937ac7d640fe199822748f0523e211a1b373989ccf1f",
+        )
         self.assertEqual(
             {(item.subject, item.level) for item in first["validation"]},
             {(item.subject, item.level) for item in cleaned},
+        )
+
+    def test_pinned_split_seed_and_validation_hash_are_sealed(self):
+        self.assertEqual(MATH_SPLIT_SEED, 42)
+        self.assertEqual(
+            MATH_VALIDATION_IDS_SHA256,
+            "126328bfe584655607174d96b16bc24f88de70399234bdff9b4428f14ee8e084",
         )
 
     def test_student_channel_contains_no_privileged_structure(self):

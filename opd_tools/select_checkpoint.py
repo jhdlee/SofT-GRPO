@@ -9,6 +9,7 @@ chosen solely by the configured validation metric.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -16,9 +17,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .checkpoint_compare import CHECKPOINT_SCHEMA_VERSION, verified_manifest
+from .assets import verify_model_snapshot
+from .manifest import file_sha256
+from verl.opd.provenance import validate_checkpoint_provenance
 
 
 BEST_TRACKER = "best_checkpointed_iteration.txt"
+INITIAL_BEST_RECORD = "initial_best_reference.json"
 DEFAULT_SELECTION_METRIC = "val/math_verify/mean_at_1"
 
 
@@ -51,15 +56,89 @@ def _read_selected_step(run_root: Path) -> int:
             "BEST validation-checkpoint tracker is missing or unsafe: %s" % tracker
         )
     value = tracker.read_text(encoding="utf-8").strip()
-    if not value.isdigit() or int(value) < 1:
+    if not value.isdigit() or int(value) < 0:
         raise RuntimeError("BEST validation-checkpoint tracker is invalid: %r" % value)
     return int(value)
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _resolve_initial_reference(
+    root: Path, initial_model_path: Path | None, expected_metric: str
+) -> SelectedCheckpoint:
+    if initial_model_path is None:
+        raise RuntimeError(
+            "BEST points to the initial policy; --initial-model-path is required"
+        )
+    record_path = root / INITIAL_BEST_RECORD
+    if not record_path.is_file() or record_path.is_symlink():
+        raise RuntimeError("initial BEST reference is missing or unsafe")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict):
+        raise RuntimeError("initial BEST reference must be an object")
+    digest = record.get("sha256")
+    payload = {key: value for key, value in record.items() if key != "sha256"}
+    if digest != _canonical_sha256(payload):
+        raise RuntimeError("initial BEST reference digest mismatch")
+    if payload.get("schema_version") != 1 or payload.get("global_step") != 0:
+        raise RuntimeError("initial BEST reference schema is invalid")
+    if payload.get("selection_metric_name") != expected_metric:
+        raise RuntimeError(
+            "initial policy was selected using %r rather than %r"
+            % (payload.get("selection_metric_name"), expected_metric)
+        )
+    metric_value = payload.get("selection_metric_value")
+    if (
+        isinstance(metric_value, bool)
+        or not isinstance(metric_value, (float, int))
+        or not math.isfinite(float(metric_value))
+    ):
+        raise RuntimeError("initial BEST reference has no finite validation metric")
+
+    model_root = Path(initial_model_path).expanduser().absolute()
+    if model_root.is_symlink():
+        raise RuntimeError("initial model path may not be a symlink")
+    model_root = model_root.resolve()
+    model_manifest = verify_model_snapshot(model_root)
+    try:
+        provenance = validate_checkpoint_provenance(payload.get("provenance"))
+    except RuntimeError as error:
+        raise RuntimeError("initial BEST reference provenance is invalid") from error
+    provenance_model = provenance["model"]
+    expected_identity = {
+        "id": model_manifest["model"]["id"],
+        "resolved_revision": model_manifest["model"]["resolved_revision"],
+        "manifest_file_sha256": file_sha256(model_root / "manifest.json"),
+        "manifest_content_sha256": model_manifest["manifest_content_sha256"],
+        "inventory_sha256": model_manifest["inventory_sha256"],
+    }
+    if provenance_model != expected_identity:
+        raise RuntimeError("initial BEST reference model identity differs")
+    return SelectedCheckpoint(
+        run_root=root,
+        step=0,
+        checkpoint=record_path,
+        model_export=model_root,
+        selection_metric_name=expected_metric,
+        selection_metric_value=float(metric_value),
+        payload_tree_sha256=model_manifest["inventory_sha256"],
+    )
 
 
 def resolve_selected_checkpoint(
     run_root: Path,
     *,
     expected_metric: str = DEFAULT_SELECTION_METRIC,
+    initial_model_path: Path | None = None,
 ) -> SelectedCheckpoint:
     """Return the authenticated HF export selected by validation only."""
 
@@ -68,6 +147,8 @@ def resolve_selected_checkpoint(
         raise RuntimeError("run root is missing or unsafe: %s" % unresolved_root)
     root = unresolved_root.resolve()
     step = _read_selected_step(root)
+    if step == 0:
+        return _resolve_initial_reference(root, initial_model_path, expected_metric)
     checkpoint = root / ("global_step_%d" % step)
     manifest = verified_manifest(root, step)
     if manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -143,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--expected-metric", default=DEFAULT_SELECTION_METRIC)
+    parser.add_argument("--initial-model-path", type=Path)
     parser.add_argument("--format", choices=("json", "path"), default="json")
     return parser
 
@@ -150,7 +232,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     selected = resolve_selected_checkpoint(
-        args.run_root, expected_metric=args.expected_metric
+        args.run_root,
+        expected_metric=args.expected_metric,
+        initial_model_path=args.initial_model_path,
     )
     if args.format == "path":
         print(selected.model_export)

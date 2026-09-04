@@ -1,23 +1,35 @@
+from pathlib import Path
+
 import pytest
 import torch
 
 from verl.opd import (
     ITERATION_METRICS,
+    STANDALONE_INAPPLICABLE_METRICS,
+    STANDALONE_ITERATION_METRICS,
     VALIDATION_METRICS,
+    ObjectiveMode,
     OPDConfig,
+    required_iteration_metrics,
     validate_resource_limits,
 )
 from verl.trainer.ppo.opd_driver import (
     RolloutIntegrityConfig,
     add_canonical_metric_aliases,
     compute_rollout_diagnostics,
+    mask_invalid_native_boundary_scores,
     replay_ratio_abs_error_max,
     reward_and_group_metrics,
     schedule_meta_info,
+    training_rollout_iteration,
+    training_wandb_step,
+    validate_full_dose_gradient_integrity,
     validate_iteration_metric_contract,
     validate_rollout_integrity,
     validate_validation_metric_contract,
     validation_metric_aliases,
+    validation_rollout_iteration,
+    validation_wandb_step,
 )
 from verl.utils.metric import reduce_metrics
 
@@ -40,6 +52,55 @@ def _valid_transition_diagnostics():
     )
 
 
+def test_training_and_validation_use_distinct_exact_rollout_axes():
+    assert [training_rollout_iteration(step) for step in range(1, 110)] == list(
+        range(109)
+    )
+    completed = [0, 25, 50, 75, 100, 109]
+    assert [validation_rollout_iteration(step) for step in completed] == completed
+
+    # W&B's internal event steps remain strictly ordered even when validation
+    # at completed count 25 is followed by training rollout index 25.
+    assert validation_wandb_step(0) < training_wandb_step(1)
+    for step in completed[1:]:
+        assert training_wandb_step(step) < validation_wandb_step(step)
+        if step < 109:
+            assert validation_wandb_step(step) < training_wandb_step(step + 1)
+
+
+def test_trainer_logs_validation_as_separate_completed_count_events():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "verl"
+        / "trainer"
+        / "ppo"
+        / "ray_trainer.py"
+    ).read_text(encoding="utf-8")
+    assert 'metric_dict["trainer/rollout_iteration"] = validation_rollout_iteration(' in source
+    assert "logger.log(data=metrics, step=training_wandb_step(self.global_steps))" in source
+    assert "step=validation_wandb_step(self.global_steps)" in source
+    assert "metrics.update(val_metrics)" not in source
+
+    scheduled_completed_counts = [
+        step for step in range(1, 110) if step % 25 == 0 or step == 109
+    ]
+    assert [0, *scheduled_completed_counts] == [0, 25, 50, 75, 100, 109]
+
+
+@pytest.mark.parametrize(
+    "function,value,error",
+    [
+        (training_rollout_iteration, 0, ValueError),
+        (training_wandb_step, 0, ValueError),
+        (validation_rollout_iteration, -1, ValueError),
+        (validation_wandb_step, True, TypeError),
+    ],
+)
+def test_rollout_axis_helpers_fail_closed(function, value, error):
+    with pytest.raises(error):
+        function(value)
+
+
 def test_rollout_diagnostics_detect_real_soft_to_hard_boundary():
     diagnostics = _valid_transition_diagnostics()
     assert diagnostics.metrics["latent/length_mean"] == 1.0
@@ -50,6 +111,46 @@ def test_rollout_diagnostics_detect_real_soft_to_hard_boundary():
     assert diagnostics.metrics["replay/fallback_count"] == 0.0
     assert diagnostics.all_soft_rate == 0.0
     assert diagnostics.categorical_boxed_answer_rate == 1.0
+    assert diagnostics.boundary_valid_mask == (True,)
+
+
+def test_validation_masks_correct_hard_shadow_when_native_boundary_is_invalid():
+    diagnostics = compute_rollout_diagnostics(
+        responses=torch.tensor([[4, 5, 0, 0], [4, 99, 7, 8]]),
+        response_mask=torch.tensor([[1, 1, 0, 0], [1, 1, 1, 1]]),
+        rollout_topk_ids=torch.tensor(
+            [
+                [[4, 6, 7], [5, 6, 7], [0, 0, 0], [0, 0, 0]],
+                [[4, 5, 6], [99, 0, 0], [7, 0, 0], [8, 0, 0]],
+            ]
+        ),
+        rollout_topk_gumbels=torch.tensor(
+            [
+                [[9.0, 1.0, 0.0], [9.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[9.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ]
+        ),
+        gumbel_temperature=0.1,
+        close_tag_token_id=99,
+        decode=lambda ids: r"\boxed{1}" if ids else "",
+    )
+    assert diagnostics.boundary_valid_mask == (False, True)
+
+    reward, extra = mask_invalid_native_boundary_scores(
+        reward_tensor=torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        reward_extra_info={
+            "score": [1.0, 1.0],
+            "released_reward": [1.0, 1.0],
+            "math_verify": [1.0, 1.0],
+            "diagnostic": [3.0, 4.0],
+        },
+        boundary_valid_mask=diagnostics.boundary_valid_mask,
+    )
+    assert reward.sum(dim=-1).tolist() == [0.0, 1.0]
+    assert extra["score"] == [0.0, 1.0]
+    assert extra["released_reward"] == [0.0, 1.0]
+    assert extra["math_verify"] == [0.0, 1.0]
+    assert extra["diagnostic"] == [3.0, 4.0]
 
 
 def test_rollout_diagnostics_counts_observed_replay_fallbacks():
@@ -125,6 +226,102 @@ def test_integrity_gate_always_enforces_exact_replay():
         )
 
 
+def _gradient_gate_config(**overrides):
+    values = {
+        "enabled": True,
+        "full_dose_gradient_gate_enabled": True,
+    }
+    values.update(overrides)
+    return RolloutIntegrityConfig.from_mapping(values)
+
+
+def test_full_dose_gradient_gate_accepts_inclusive_ratio_and_clip_boundaries():
+    config = _gradient_gate_config()
+    for ratio in (0.1, 1.0, 10.0):
+        validate_full_dose_gradient_integrity(
+            {
+                "grad/grpo_norm": 2.0,
+                "grad/opd_norm": 2.0 * ratio,
+                "actor/gradient_clipfrac": 0.5,
+            },
+            config,
+            schedule_multiplier=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("metrics", "message"),
+    [
+        (
+            {
+                "grad/grpo_norm": 1.0,
+                "grad/opd_norm": 0.099,
+                "actor/gradient_clipfrac": 0.0,
+            },
+            "support-gradient ratio",
+        ),
+        (
+            {
+                "grad/grpo_norm": 1.0,
+                "grad/opd_norm": 10.01,
+                "actor/gradient_clipfrac": 0.0,
+            },
+            "support-gradient ratio",
+        ),
+        (
+            {
+                "grad/grpo_norm": 1.0,
+                "grad/opd_norm": 1.0,
+                "actor/gradient_clipfrac": 0.5001,
+            },
+            "clip fraction",
+        ),
+    ],
+)
+def test_full_dose_gradient_gate_rejects_out_of_range_diagnostics(metrics, message):
+    with pytest.raises(RuntimeError, match=message):
+        validate_full_dose_gradient_integrity(
+            metrics,
+            _gradient_gate_config(),
+            schedule_multiplier=1.0,
+        )
+
+
+def test_full_dose_gradient_gate_skips_warmup_and_disabled_stress_arm():
+    invalid = {
+        "grad/grpo_norm": 1.0,
+        "grad/opd_norm": 100.0,
+        "actor/gradient_clipfrac": 1.0,
+    }
+    validate_full_dose_gradient_integrity(
+        invalid,
+        _gradient_gate_config(),
+        schedule_multiplier=0.999,
+    )
+    validate_full_dose_gradient_integrity(
+        invalid,
+        RolloutIntegrityConfig(enabled=True),
+        schedule_multiplier=1.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"min_opd_grpo_support_gradient_ratio": 0.0},
+        {
+            "min_opd_grpo_support_gradient_ratio": 2.0,
+            "max_opd_grpo_support_gradient_ratio": 1.0,
+        },
+        {"max_full_dose_gradient_clip_fraction": 1.01},
+        {"full_dose_gradient_gate_enabled": 1},
+    ],
+)
+def test_full_dose_gradient_gate_config_rejects_invalid_thresholds(overrides):
+    with pytest.raises((TypeError, ValueError)):
+        _gradient_gate_config(**overrides)
+
+
 def test_replay_ratio_metric_equals_zero_for_identical_log_densities():
     logp = torch.tensor([[-2.0, -0.5]])
     assert replay_ratio_abs_error_max(logp, logp.clone(), torch.ones_like(logp)) == 0.0
@@ -174,9 +371,9 @@ def test_canonical_aliases_never_emit_ambiguous_kl_weight():
 
 @pytest.mark.parametrize(
     ("clip_fraction", "expected"),
-    [(0.0, 0.0), (0.5, 1.0), (1.0, 1.0)],
+    [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)],
 )
-def test_grad_clipped_reports_any_actual_clipped_optimizer_update(
+def test_grad_clipped_reports_fraction_of_clipped_optimizer_updates(
     clip_fraction,
     expected,
 ):
@@ -291,6 +488,8 @@ def test_validation_aliases_supply_both_required_reward_interfaces():
     assert aliases == {
         "val/released_reward/mean_at_1": 0.5,
         "val/math_verify/mean_at_1": 0.75,
+        "val/released_reward/pass_at_1": 0.5,
+        "val/math_verify/pass_at_1": 0.75,
     }
 
 
@@ -335,6 +534,8 @@ def test_study_metric_contract_is_complete_and_fails_closed(required, validator)
     payload = {name: 0.0 for name in required}
     if "opd/teacher_type" in payload:
         payload["opd/teacher_type"] = "ema"
+        payload["algorithm/objective_mode"] = "auxiliary"
+        payload["opd/loss_support"] = "latent_only"
     if "grad/diagnostic_space" in payload:
         payload["grad/diagnostic_space"] = "fixed_top5_action_logits"
     validator(payload)
@@ -362,6 +563,8 @@ def test_study_metric_contract_rejects_nonfinite_or_nonnumeric_values(
     payload = {name: 0.0 for name in required}
     if "opd/teacher_type" in payload:
         payload["opd/teacher_type"] = "ema"
+        payload["algorithm/objective_mode"] = "auxiliary"
+        payload["opd/loss_support"] = "latent_only"
     if "grad/diagnostic_space" in payload:
         payload["grad/diagnostic_space"] = "fixed_top5_action_logits"
     payload[numeric_name] = bad_value
@@ -370,12 +573,83 @@ def test_study_metric_contract_rejects_nonfinite_or_nonnumeric_values(
         validator(payload)
 
 
-@pytest.mark.parametrize("name", ["opd/teacher_type", "grad/diagnostic_space"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "opd/loss_support",
+        "opd/teacher_type",
+        "grad/diagnostic_space",
+    ],
+)
 def test_study_metric_contract_requires_nonempty_string_fields(name):
     payload = {metric: 0.0 for metric in ITERATION_METRICS}
+    payload["algorithm/objective_mode"] = "auxiliary"
+    payload["opd/loss_support"] = "latent_only"
     payload["opd/teacher_type"] = "ema"
     payload["grad/diagnostic_space"] = "fixed_top5_action_logits"
     payload[name] = ""
 
     with pytest.raises(TypeError, match="nonempty string"):
+        validate_iteration_metric_contract(payload)
+
+
+def test_study_metric_contract_rejects_invalid_objective_mode():
+    payload = {metric: 0.0 for metric in ITERATION_METRICS}
+    payload["algorithm/objective_mode"] = ""
+    payload["opd/loss_support"] = "latent_only"
+    payload["opd/teacher_type"] = "ema"
+    payload["grad/diagnostic_space"] = "fixed_top5_action_logits"
+
+    with pytest.raises(ValueError, match="unknown OPD objective mode"):
+        validate_iteration_metric_contract(payload)
+
+
+def _complete_standalone_metric_payload():
+    payload = {metric: 0.0 for metric in STANDALONE_ITERATION_METRICS}
+    payload["algorithm/objective_mode"] = "standalone"
+    payload["opd/loss_support"] = "all_response"
+    payload["opd/teacher_type"] = "ema"
+    payload["grad/diagnostic_space"] = "fixed_top5_action_logits"
+    return payload
+
+
+def test_standalone_required_metrics_omit_only_inapplicable_grpo_ppo_fields():
+    assert required_iteration_metrics(ObjectiveMode.STANDALONE) is STANDALONE_ITERATION_METRICS
+    assert STANDALONE_ITERATION_METRICS == (
+        ITERATION_METRICS - STANDALONE_INAPPLICABLE_METRICS
+    )
+    assert {
+        "loss/grpo",
+        "loss/native_ref_kl",
+        "ppo/ratio_mean",
+        "ppo/ratio_p95",
+        "ppo/clip_fraction",
+        "ppo/approx_kl",
+        "grad/grpo_norm",
+        "grad/grpo_opd_cosine",
+        "train/nonzero_advantage_group_fraction",
+    } == STANDALONE_INAPPLICABLE_METRICS
+    assert "replay/ratio_abs_error_max" in STANDALONE_ITERATION_METRICS
+    assert "train/reward_mean" in STANDALONE_ITERATION_METRICS
+    assert "loss/opd_kl_unweighted" in STANDALONE_ITERATION_METRICS
+
+
+def test_standalone_metric_contract_accepts_exact_required_payload():
+    validate_iteration_metric_contract(_complete_standalone_metric_payload())
+
+
+@pytest.mark.parametrize("name", sorted(STANDALONE_INAPPLICABLE_METRICS))
+def test_standalone_metric_contract_rejects_inapplicable_grpo_ppo_fields(name):
+    payload = _complete_standalone_metric_payload()
+    payload[name] = 0.0
+
+    with pytest.raises(ValueError, match="must omit inapplicable PPO/GRPO metrics"):
+        validate_iteration_metric_contract(payload)
+
+
+def test_standalone_metric_contract_fails_closed_when_required_metric_is_missing():
+    payload = _complete_standalone_metric_payload()
+    payload.pop("replay/ratio_abs_error_max")
+
+    with pytest.raises(ValueError, match="missing required W&B metrics"):
         validate_iteration_metric_contract(payload)

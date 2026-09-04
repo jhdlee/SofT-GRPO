@@ -14,12 +14,10 @@
 
 import logging
 import os
+from importlib.metadata import PackageNotFoundError, version
 
-import pkg_resources
 from packaging.version import parse as parse_version
-from pkg_resources import DistributionNotFound
 
-from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.logging_utils import set_basic_config
 
@@ -33,6 +31,21 @@ set_basic_config(level=logging.WARNING)
 
 
 __all__ = ["DataProto", "__version__"]
+
+
+def __getattr__(name):
+    """Load the Ray-backed protocol only when runtime code asks for it.
+
+    Dependency-light utilities such as checkpoint provenance should be usable
+    from login-node and CPU tooling without importing Ray as a side effect.
+    Existing ``from verl import DataProto`` callers retain the same interface.
+    """
+
+    if name == "DataProto":
+        from .protocol import DataProto
+
+        return DataProto
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 if os.getenv("VERL_USE_MODELSCOPE", "False").lower() == "true":
     import importlib
@@ -48,12 +61,12 @@ if is_npu_available:
     package_name = 'transformers'
     required_version_spec = '4.51.0'
     try:
-        installed_version = pkg_resources.get_distribution(package_name).version
+        installed_version = version(package_name)
         installed = parse_version(installed_version)
         required = parse_version(required_version_spec)
 
         if not installed >= required:
             raise ValueError(f"{package_name} version >= {required_version_spec} is required on ASCEND NPU, current version is {installed}.")
-    except DistributionNotFound:
+    except PackageNotFoundError:
         raise ImportError(
             f"package {package_name} is not installed, please run pip install {package_name}=={required_version_spec}")

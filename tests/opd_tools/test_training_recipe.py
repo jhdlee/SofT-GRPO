@@ -15,6 +15,7 @@ from opd_tools.constants import (
     TRAIN_MAX_PROMPT_TOKENS,
     TRAIN_MAX_RESPONSE_TOKENS,
 )
+from opd_tools.study import hydra_overrides
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -78,6 +79,15 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
         cls.study_text = STUDY_RECIPE.read_text(encoding="utf-8")
         cls.upstream = _shell_overrides(UPSTREAM_RECIPE)
         cls.study_overrides = _shell_overrides(STUDY_RECIPE)
+        cls.study_overrides.update(
+            {
+                key: yaml.safe_load(value)
+                for key, value in (
+                    override.split("=", 1)
+                    for override in hydra_overrides("softgrpo_math_s11")
+                )
+            }
+        )
         defaults = yaml.safe_load(TRAINER_CONFIG.read_text(encoding="utf-8"))
         cls.study_effective = _flatten(defaults)
         cls.study_effective.update(cls.study_overrides)
@@ -187,8 +197,11 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(self.study_overrides[key], value)
 
-        # OPD is the treatment and the baseline switches only this feature off.
-        self.assertEqual(self.study_overrides["algorithm.opd.enabled"], "${OPD_ENABLED}")
+        # This comparison resolves the canonical released SofT-GRPO arm.  OPD
+        # treatment rows are audited by the central study-registry tests.
+        self.assertFalse(self.study_overrides["algorithm.opd.enabled"])
+        self.assertEqual(self.study_overrides["algorithm.opd.mode"], "auxiliary")
+        self.assertEqual(self.study_overrides["algorithm.opd.loss_support"], "latent_only")
         self.assertEqual(self.study_overrides["algorithm.opd.beta_base"], 0.001)
         self.assertEqual(self.study_overrides["algorithm.opd.warmup_fraction"], 0.10)
         self.assertEqual(self.study_overrides["algorithm.opd.teacher.type"], "ema")
@@ -202,6 +215,28 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
     def test_obsolete_worker_checkpoint_rotation_is_not_overridden(self):
         self.assertNotIn("trainer.max_actor_ckpt_to_keep", self.study_overrides)
         self.assertNotIn("trainer.max_critic_ckpt_to_keep", self.study_overrides)
+
+    def test_arm_overrides_win_over_common_defaults_and_user_smoke_overrides_win_last(self):
+        common_noise = 'actor_rollout_ref.rollout.noise_on_logits=true'
+        arm_marker = '"${ARM_OVERRIDES[@]}"'
+        internal_context_marker = '"${INTERNAL_CONTEXT_OVERRIDES[@]}"'
+        self.assertLess(self.study_text.index(common_noise), self.study_text.index(arm_marker))
+        self.assertLess(
+            self.study_text.index(arm_marker),
+            self.study_text.index(internal_context_marker),
+        )
+
+        hard_effective = dict(_shell_overrides(STUDY_RECIPE))
+        hard_effective.update(
+            {
+                key: yaml.safe_load(value)
+                for key, value in (
+                    override.split("=", 1)
+                    for override in hydra_overrides("hardgrpo_math_s11")
+                )
+            }
+        )
+        self.assertFalse(hard_effective["actor_rollout_ref.rollout.noise_on_logits"])
 
     def test_study_horizon_and_prompt_match_the_locked_contract(self):
         prompt_batch = self.study_overrides["data.train_batch_size"]

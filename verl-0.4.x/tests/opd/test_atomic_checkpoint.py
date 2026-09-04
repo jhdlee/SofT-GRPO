@@ -44,6 +44,8 @@ FUNCTIONS = {
     "_verified_actor_state_digest",
     "_verified_rollout_trajectory_digest",
     "_read_step_tracker",
+    "_verify_initial_best_reference",
+    "_write_initial_best_reference",
     "_maybe_update_best_checkpoint",
     "_prune_committed_checkpoints",
     "_requeue_requested",
@@ -59,7 +61,13 @@ def _load_checkpoint_helpers():
     for node in parsed.body:
         if isinstance(node, ast.Assign) and any(
             isinstance(target, ast.Name) and target.id.startswith("_CHECKPOINT")
-            or isinstance(target, ast.Name) and target.id in {"_BEST_CHECKPOINT_TRACKER", "_COMMITTED_CHECKPOINT_RE"}
+            or isinstance(target, ast.Name)
+            and target.id
+            in {
+                "_BEST_CHECKPOINT_TRACKER",
+                "_INITIAL_BEST_RECORD",
+                "_COMMITTED_CHECKPOINT_RE",
+            }
             for target in node.targets
         ):
             selected.append(node)
@@ -180,6 +188,7 @@ def _stage_checkpoint(
     root: Path,
     step: int,
     metric: float | None = None,
+    tiebreak_metric: float | None = None,
     provenance=None,
     with_opd_teacher: bool = False,
 ) -> Path:
@@ -204,6 +213,9 @@ def _stage_checkpoint(
             "responses": torch.tensor([[3, 4, 0], [5, 6, 0]]),
             "response_mask": torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.bool),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]),
+            "rollout_log_probs": torch.tensor(
+                [[-0.1, -0.2, 0.0], [-0.3, -0.4, 0.0]]
+            ),
             "rollout_topk_ids": torch.tensor(
                 [
                     [[1, 0], [2, 0], [3, 7], [4, 8], [0, 0]],
@@ -237,6 +249,12 @@ def _stage_checkpoint(
         provenance=provenance or _test_provenance(),
         selection_metric_name="val/math_verify/mean_at_1" if metric is not None else None,
         selection_metric_value=metric,
+        selection_tiebreak_metric_name=(
+            "val/released_reward/mean_at_1"
+            if tiebreak_metric is not None
+            else None
+        ),
+        selection_tiebreak_metric_value=tiebreak_metric,
     )
     assert manifest["dataloader_state_sha256"]
     assert manifest["actor_model_optimizer_tree_sha256"]
@@ -368,6 +386,7 @@ def test_rollout_digest_changes_for_any_continuous_action_change(checkpoint_help
         "responses": torch.tensor([[3, 4]]),
         "response_mask": torch.ones((1, 2), dtype=torch.bool),
         "attention_mask": torch.ones((1, 4), dtype=torch.bool),
+        "rollout_log_probs": torch.tensor([[-0.1, -0.2]]),
         "rollout_topk_ids": torch.tensor([[[1, 0], [2, 0], [3, 7], [4, 8]]]),
         "rollout_topk_gumbels": torch.tensor(
             [[[0.0, 0.0], [0.0, 0.0], [1.0, 0.2], [0.5, 0.1]]]
@@ -394,6 +413,37 @@ def test_rollout_digest_changes_for_any_continuous_action_change(checkpoint_help
     assert (
         first["fields"]["rollout_topk_gumbels"]["sha256"]
         != second["fields"]["rollout_topk_gumbels"]["sha256"]
+    )
+
+
+def test_categorical_rollout_digest_requires_no_continuous_support_metadata(
+    checkpoint_helpers,
+):
+    record = checkpoint_helpers["_build_rollout_integrity_record"](
+        {
+            "prompts": torch.tensor([[1, 2]]),
+            "responses": torch.tensor([[3, 4]]),
+            "response_mask": torch.ones((1, 2), dtype=torch.bool),
+            "attention_mask": torch.ones((1, 4), dtype=torch.bool),
+            "rollout_log_probs": torch.tensor([[-0.1, -0.2]]),
+            "rollout_sampling_seed": torch.tensor([101]),
+        },
+        group_ids=["rollout-00000000-prompt-000000"],
+        example_identities=[17],
+        rollout_iteration=0,
+    )
+
+    assert record["replay_mode"] == "categorical"
+    assert set(record["fields"]) == {
+        "prompts",
+        "responses",
+        "response_mask",
+        "attention_mask",
+        "rollout_log_probs",
+        "rollout_sampling_seed",
+    }
+    checkpoint_helpers["_verify_rollout_integrity_record"](
+        record, expected_rollout_iteration=0
     )
 
 
@@ -439,6 +489,118 @@ def test_retention_keeps_latest_two_and_older_best(tmp_path, checkpoint_helpers)
     assert (tmp_path / "best_checkpointed_iteration.txt").read_text().strip() == "1"
 
 
+def test_initial_validation_competes_in_best_with_secondary_tie_break(
+    tmp_path, checkpoint_helpers
+):
+    helpers = checkpoint_helpers
+    provenance = _test_provenance()
+    helpers["_write_initial_best_reference"](
+        str(tmp_path),
+        metric_name="val/math_verify/mean_at_1",
+        metric_value=0.8,
+        tiebreak_metric_name="val/released_reward/mean_at_1",
+        tiebreak_metric_value=0.5,
+        provenance=provenance,
+    )
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text().strip() == "0"
+
+    worse = _stage_checkpoint(
+        helpers,
+        tmp_path,
+        1,
+        metric=0.79,
+        tiebreak_metric=1.0,
+        provenance=provenance,
+    )
+    worse_manifest = helpers["_verify_checkpoint"](str(worse))
+    assert not helpers["_maybe_update_best_checkpoint"](
+        str(tmp_path),
+        global_step=1,
+        metric_name="val/math_verify/mean_at_1",
+        metric_value=0.79,
+        mode="max",
+        tiebreak_metric_name="val/released_reward/mean_at_1",
+        tiebreak_metric_value=1.0,
+        verified_candidate_manifest=worse_manifest,
+    )
+
+    better_tie = _stage_checkpoint(
+        helpers,
+        tmp_path,
+        2,
+        metric=0.8,
+        tiebreak_metric=0.6,
+        provenance=provenance,
+    )
+    better_tie_manifest = helpers["_verify_checkpoint"](str(better_tie))
+    assert helpers["_maybe_update_best_checkpoint"](
+        str(tmp_path),
+        global_step=2,
+        metric_name="val/math_verify/mean_at_1",
+        metric_value=0.8,
+        mode="max",
+        tiebreak_metric_name="val/released_reward/mean_at_1",
+        tiebreak_metric_value=0.6,
+        verified_candidate_manifest=better_tie_manifest,
+    )
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text().strip() == "2"
+
+    exact_tie = _stage_checkpoint(
+        helpers,
+        tmp_path,
+        3,
+        metric=0.8,
+        tiebreak_metric=0.6,
+        provenance=provenance,
+    )
+    exact_tie_manifest = helpers["_verify_checkpoint"](str(exact_tie))
+    assert not helpers["_maybe_update_best_checkpoint"](
+        str(tmp_path),
+        global_step=3,
+        metric_name="val/math_verify/mean_at_1",
+        metric_value=0.8,
+        mode="max",
+        tiebreak_metric_name="val/released_reward/mean_at_1",
+        tiebreak_metric_value=0.6,
+        verified_candidate_manifest=exact_tie_manifest,
+    )
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text().strip() == "2"
+
+
+def test_initial_best_reference_is_authenticated(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    helpers["_write_initial_best_reference"](
+        str(tmp_path),
+        metric_name="val/math_verify/mean_at_1",
+        metric_value=0.8,
+        tiebreak_metric_name="val/released_reward/mean_at_1",
+        tiebreak_metric_value=0.5,
+        provenance=_test_provenance(),
+    )
+    record_path = tmp_path / "initial_best_reference.json"
+    record = json.loads(record_path.read_text())
+    record["selection_metric_value"] = 0.9
+    record_path.write_text(json.dumps(record))
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        helpers["_prune_committed_checkpoints"](str(tmp_path), keep_latest=2)
+
+
+def test_initial_reference_cannot_replace_a_trained_best(
+    tmp_path, checkpoint_helpers
+):
+    (tmp_path / "best_checkpointed_iteration.txt").write_text("25\n")
+    with pytest.raises(RuntimeError, match="existing trained BEST"):
+        checkpoint_helpers["_write_initial_best_reference"](
+            str(tmp_path),
+            metric_name="val/math_verify/mean_at_1",
+            metric_value=0.8,
+            tiebreak_metric_name="val/released_reward/mean_at_1",
+            tiebreak_metric_value=0.5,
+            provenance=_test_provenance(),
+        )
+    assert not (tmp_path / "initial_best_reference.json").exists()
+
+
 def test_requeue_request_is_consumed_only_after_explicit_ack(tmp_path, checkpoint_helpers):
     signal_file = tmp_path / "checkpoint.request"
     assert not checkpoint_helpers["_requeue_requested"](str(signal_file))
@@ -453,6 +615,9 @@ def test_config_exposes_resume_smoke_without_changing_horizon():
     assert "max_rollout_iterations_per_invocation: null" in config
     assert "requeue_signal_file: null" in config
     assert "checkpoint_keep_latest: 2" in config
+    assert "validation_seed_iteration: 0" in config
     source = SOURCE.read_text(encoding="utf-8")
     assert '"checkpoint_resume_provenance_sha256"' in source
     assert "expected_provenance=self.checkpoint_provenance" in source
+    assert 'self.config.trainer.get("validation_seed_iteration", 0)' in source
+    assert "if not self._resumed and selection_metric_name in val_metrics" in source

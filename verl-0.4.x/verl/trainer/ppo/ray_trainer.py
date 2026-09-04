@@ -45,7 +45,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.opd import OPDConfig
+from verl.opd import ObjectiveMode, OPDConfig
 from verl.opd.provenance import (
     assert_checkpoint_provenance_matches,
     build_checkpoint_provenance,
@@ -66,14 +66,23 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.opd_driver import (
     RolloutIntegrityConfig,
     add_canonical_metric_aliases,
+    compute_categorical_rollout_diagnostics,
     compute_rollout_diagnostics,
+    mask_invalid_native_boundary_scores,
     replay_ratio_abs_error_max,
     reward_and_group_metrics,
+    reward_only_metrics,
     schedule_meta_info,
+    training_rollout_iteration,
+    training_wandb_step,
+    validate_categorical_rollout_integrity,
+    validate_full_dose_gradient_integrity,
     validate_iteration_metric_contract,
     validate_rollout_integrity,
     validate_validation_metric_contract,
     validation_metric_aliases,
+    validation_rollout_iteration,
+    validation_wandb_step,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager
@@ -92,17 +101,25 @@ _CHECKPOINT_MANIFEST = "checkpoint_manifest.json"
 _CHECKPOINT_ROLLOUT_METADATA = "rollout_metadata.json"
 _CHECKPOINT_TRACKER = "latest_checkpointed_iteration.txt"
 _BEST_CHECKPOINT_TRACKER = "best_checkpointed_iteration.txt"
+_INITIAL_BEST_RECORD = "initial_best_reference.json"
 _CHECKPOINT_SCHEMA_VERSION = 2
-_CHECKPOINT_ROLLOUT_SCHEMA_VERSION = 1
-_CHECKPOINT_ROLLOUT_FIELDS = (
+_CHECKPOINT_ROLLOUT_SCHEMA_VERSION = 2
+_CHECKPOINT_COMMON_ROLLOUT_FIELDS = (
     "prompts",
     "responses",
     "response_mask",
     "attention_mask",
+    "rollout_log_probs",
+    "rollout_sampling_seed",
+)
+_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS = (
     "rollout_topk_ids",
     "rollout_topk_gumbels",
-    "rollout_sampling_seed",
     "gumbel_temperature",
+)
+_CHECKPOINT_ROLLOUT_FIELDS = (
+    *_CHECKPOINT_COMMON_ROLLOUT_FIELDS,
+    *_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS,
 )
 _COMMITTED_CHECKPOINT_RE = re.compile(r"^global_step_([0-9]+)$")
 
@@ -255,9 +272,21 @@ def _build_rollout_integrity_record(
     distinguishing every action, mask, request-local seed, and trajectory.
     """
 
-    missing = sorted(set(_CHECKPOINT_ROLLOUT_FIELDS) - set(batch_tensors))
+    missing = sorted(set(_CHECKPOINT_COMMON_ROLLOUT_FIELDS) - set(batch_tensors))
     if missing:
         raise RuntimeError(f"cannot checkpoint rollout without fields: {missing}")
+    continuous_present = set(_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS) & set(batch_tensors)
+    if continuous_present and continuous_present != set(
+        _CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS
+    ):
+        missing_continuous = sorted(
+            set(_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS) - continuous_present
+        )
+        raise RuntimeError(
+            "checkpoint has an incomplete continuous replay inventory: "
+            f"{missing_continuous}"
+        )
+    replay_mode = "continuous" if continuous_present else "categorical"
     responses = batch_tensors["responses"]
     if responses.ndim != 2 or responses.shape[0] < 1:
         raise RuntimeError("checkpoint rollout responses must be a nonempty rank-2 tensor")
@@ -280,18 +309,29 @@ def _build_rollout_integrity_record(
         "responses": responses,
         "response_mask": response_mask,
         "attention_mask": batch_tensors["attention_mask"],
-        "rollout_topk_ids": batch_tensors["rollout_topk_ids"][:, -response_length:],
-        "rollout_topk_gumbels": batch_tensors["rollout_topk_gumbels"][:, -response_length:],
+        "rollout_log_probs": batch_tensors["rollout_log_probs"],
         "rollout_sampling_seed": sampling_seeds,
-        "gumbel_temperature": batch_tensors["gumbel_temperature"],
     }
+    if replay_mode == "continuous":
+        tensor_view.update(
+            {
+                "rollout_topk_ids": batch_tensors["rollout_topk_ids"][
+                    :, -response_length:
+                ],
+                "rollout_topk_gumbels": batch_tensors["rollout_topk_gumbels"][
+                    :, -response_length:
+                ],
+                "gumbel_temperature": batch_tensors["gumbel_temperature"],
+            }
+        )
     for name, tensor in tensor_view.items():
         if tensor.shape[0] != trajectory_count:
             raise RuntimeError(f"checkpoint rollout field {name} has the wrong batch dimension")
-    if tensor_view["rollout_topk_ids"].shape != tensor_view["rollout_topk_gumbels"].shape:
-        raise RuntimeError("checkpoint top-k IDs and Gumbels have different shapes")
-    if tensor_view["rollout_topk_ids"].ndim != 3:
-        raise RuntimeError("checkpoint top-k replay fields must be rank-3")
+    if replay_mode == "continuous":
+        if tensor_view["rollout_topk_ids"].shape != tensor_view["rollout_topk_gumbels"].shape:
+            raise RuntimeError("checkpoint top-k IDs and Gumbels have different shapes")
+        if tensor_view["rollout_topk_ids"].ndim != 3:
+            raise RuntimeError("checkpoint top-k replay fields must be rank-3")
 
     identities = [
         {
@@ -313,6 +353,7 @@ def _build_rollout_integrity_record(
         "rollout_iteration": int(rollout_iteration),
         "trajectory_count": trajectory_count,
         "response_length": response_length,
+        "replay_mode": replay_mode,
         "identities": identities,
         "fields": {
             name: _tensor_integrity_descriptor(tensor)
@@ -366,7 +407,13 @@ def _verify_rollout_integrity_record(
         )
     if len(set(identity_keys)) != trajectory_count:
         raise RuntimeError("checkpoint rollout identities are not unique")
-    if not isinstance(fields, dict) or set(fields) != set(_CHECKPOINT_ROLLOUT_FIELDS):
+    replay_mode = payload.get("replay_mode")
+    if replay_mode not in {"continuous", "categorical"}:
+        raise RuntimeError("checkpoint rollout replay mode is invalid")
+    expected_fields = set(_CHECKPOINT_COMMON_ROLLOUT_FIELDS)
+    if replay_mode == "continuous":
+        expected_fields.update(_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS)
+    if not isinstance(fields, dict) or set(fields) != expected_fields:
         raise RuntimeError("checkpoint rollout tensor inventory is invalid")
     for name, descriptor in fields.items():
         if not isinstance(descriptor, dict):
@@ -394,12 +441,15 @@ def _verify_rollout_integrity_record(
         raise RuntimeError("checkpoint rollout response shape is inconsistent")
     if fields["response_mask"]["shape"] != response_shape:
         raise RuntimeError("checkpoint rollout response-mask shape is inconsistent")
-    for name in ("rollout_topk_ids", "rollout_topk_gumbels"):
-        shape = fields[name]["shape"]
-        if len(shape) != 3 or shape[:2] != response_shape:
-            raise RuntimeError(f"checkpoint rollout replay shape is inconsistent: {name}")
-    if fields["rollout_topk_ids"]["shape"] != fields["rollout_topk_gumbels"]["shape"]:
-        raise RuntimeError("checkpoint rollout replay support shapes disagree")
+    if fields["rollout_log_probs"]["shape"] != response_shape:
+        raise RuntimeError("checkpoint rollout log-probability shape is inconsistent")
+    if replay_mode == "continuous":
+        for name in ("rollout_topk_ids", "rollout_topk_gumbels"):
+            shape = fields[name]["shape"]
+            if len(shape) != 3 or shape[:2] != response_shape:
+                raise RuntimeError(f"checkpoint rollout replay shape is inconsistent: {name}")
+        if fields["rollout_topk_ids"]["shape"] != fields["rollout_topk_gumbels"]["shape"]:
+            raise RuntimeError("checkpoint rollout replay support shapes disagree")
     if fields["rollout_sampling_seed"]["shape"] != [trajectory_count]:
         raise RuntimeError("checkpoint rollout sampling-seed shape is inconsistent")
     if _canonical_json_digest(payload) != trajectory_digest:
@@ -432,9 +482,15 @@ def _write_checkpoint_manifest(
     provenance: Mapping[str, object],
     selection_metric_name: Optional[str] = None,
     selection_metric_value: Optional[float] = None,
+    selection_tiebreak_metric_name: Optional[str] = None,
+    selection_tiebreak_metric_value: Optional[float] = None,
 ) -> dict[str, object]:
     """Hash every payload file and make the manifest durable in the temp tree."""
 
+    if (selection_tiebreak_metric_name is None) != (
+        selection_tiebreak_metric_value is None
+    ):
+        raise ValueError("selection tie-break metric name and value must be paired")
     if _checkpoint_step_from_name(checkpoint_name) != global_step:
         raise RuntimeError("checkpoint name and global step disagree")
     inventory = _checkpoint_inventory(checkpoint_dir, sync_files=True)
@@ -480,6 +536,8 @@ def _write_checkpoint_manifest(
         ],
         "selection_metric_name": selection_metric_name,
         "selection_metric_value": selection_metric_value,
+        "selection_tiebreak_metric_name": selection_tiebreak_metric_name,
+        "selection_tiebreak_metric_value": selection_tiebreak_metric_value,
         "dataloader_state_sha256": inventory_by_path["data.pt"]["sha256"],
         "driver_state_sha256": inventory_by_path["driver_state.pt"]["sha256"],
         "rollout_metadata_file_sha256": inventory_by_path[_CHECKPOINT_ROLLOUT_METADATA]["sha256"],
@@ -711,6 +769,103 @@ def _read_step_tracker(path: str) -> Optional[int]:
     return int(value)
 
 
+def _verify_initial_best_reference(
+    record: object,
+    *,
+    expected_provenance: Optional[Mapping[str, object]] = None,
+) -> dict[str, object]:
+    """Authenticate the step-zero starting-policy selection record."""
+
+    if not isinstance(record, dict):
+        raise RuntimeError("initial BEST reference must be an object")
+    digest = record.get("sha256")
+    payload = {key: value for key, value in record.items() if key != "sha256"}
+    if not isinstance(digest, str) or digest != _canonical_json_digest(payload):
+        raise RuntimeError("initial BEST reference digest mismatch")
+    if payload.get("schema_version") != 1 or payload.get("global_step") != 0:
+        raise RuntimeError("initial BEST reference schema is invalid")
+    metric_name = payload.get("selection_metric_name")
+    metric_value = payload.get("selection_metric_value")
+    if not isinstance(metric_name, str) or not metric_name:
+        raise RuntimeError("initial BEST reference metric name is invalid")
+    if (
+        isinstance(metric_value, bool)
+        or not isinstance(metric_value, (int, float))
+        or not np.isfinite(metric_value)
+    ):
+        raise RuntimeError("initial BEST reference metric value is invalid")
+    tie_name = payload.get("selection_tiebreak_metric_name")
+    tie_value = payload.get("selection_tiebreak_metric_value")
+    if (tie_name is None) != (tie_value is None):
+        raise RuntimeError("initial BEST reference tie-break metric is incomplete")
+    if tie_name is not None and (
+        not isinstance(tie_name, str)
+        or not tie_name
+        or isinstance(tie_value, bool)
+        or not isinstance(tie_value, (int, float))
+        or not np.isfinite(tie_value)
+    ):
+        raise RuntimeError("initial BEST reference tie-break metric is invalid")
+    provenance = validate_checkpoint_provenance(payload.get("provenance"))
+    if expected_provenance is not None:
+        assert_checkpoint_provenance_matches(provenance, expected_provenance)
+    return record
+
+
+def _write_initial_best_reference(
+    checkpoint_root: str,
+    *,
+    metric_name: str,
+    metric_value: float,
+    tiebreak_metric_name: Optional[str],
+    tiebreak_metric_value: Optional[float],
+    provenance: Mapping[str, object],
+) -> dict[str, object]:
+    """Durably make the authenticated pinned starting policy the first BEST."""
+
+    checkpoint_root = os.path.abspath(checkpoint_root)
+    os.makedirs(checkpoint_root, exist_ok=True)
+    existing_best_step = _read_step_tracker(
+        os.path.join(checkpoint_root, _BEST_CHECKPOINT_TRACKER)
+    )
+    if existing_best_step not in (None, 0):
+        raise RuntimeError(
+            "refusing to replace an existing trained BEST checkpoint with the initial policy"
+        )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "global_step": 0,
+        "selection_metric_name": str(metric_name),
+        "selection_metric_value": float(metric_value),
+        "selection_tiebreak_metric_name": tiebreak_metric_name,
+        "selection_tiebreak_metric_value": (
+            None if tiebreak_metric_value is None else float(tiebreak_metric_value)
+        ),
+        "provenance": validate_checkpoint_provenance(dict(provenance)),
+    }
+    record = {**payload, "sha256": _canonical_json_digest(payload)}
+    _verify_initial_best_reference(record, expected_provenance=provenance)
+    record_path = os.path.join(checkpoint_root, _INITIAL_BEST_RECORD)
+    if os.path.exists(record_path):
+        if not os.path.isfile(record_path) or os.path.islink(record_path):
+            raise RuntimeError("initial BEST reference path is not a regular file")
+        with open(record_path, encoding="utf-8") as handle:
+            existing = _verify_initial_best_reference(
+                json.load(handle), expected_provenance=provenance
+            )
+        if existing != record:
+            raise RuntimeError("refusing to overwrite a different initial BEST reference")
+    else:
+        _atomic_write_text(
+            record_path,
+            json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+    _atomic_write_text(
+        os.path.join(checkpoint_root, _BEST_CHECKPOINT_TRACKER), "0\n"
+    )
+    return record
+
+
 def _maybe_update_best_checkpoint(
     checkpoint_root: str,
     *,
@@ -718,6 +873,8 @@ def _maybe_update_best_checkpoint(
     metric_name: Optional[str],
     metric_value: Optional[float],
     mode: str,
+    tiebreak_metric_name: Optional[str] = None,
+    tiebreak_metric_value: Optional[float] = None,
     verified_candidate_manifest: Optional[dict[str, object]] = None,
 ) -> bool:
     """Point BEST at a committed checkpoint when its validation metric wins."""
@@ -729,6 +886,10 @@ def _maybe_update_best_checkpoint(
         raise RuntimeError(f"best-checkpoint metric is non-finite: {metric_name}={metric_value}")
     if mode not in {"max", "min"}:
         raise ValueError("checkpoint_best_mode must be 'max' or 'min'")
+    if (tiebreak_metric_name is None) != (tiebreak_metric_value is None):
+        raise ValueError("checkpoint tie-break metric name and value must be provided together")
+    if tiebreak_metric_value is not None and not np.isfinite(float(tiebreak_metric_value)):
+        raise RuntimeError("best-checkpoint tie-break metric is non-finite")
     candidate_path = os.path.join(checkpoint_root, f"global_step_{global_step}")
     candidate_manifest = verified_candidate_manifest
     if candidate_manifest is None:
@@ -739,26 +900,59 @@ def _maybe_update_best_checkpoint(
         raise RuntimeError("candidate checkpoint does not contain the configured selection metric")
     if candidate_manifest.get("selection_metric_value") != metric_value:
         raise RuntimeError("candidate checkpoint selection metric disagrees with the caller")
+    if candidate_manifest.get("selection_tiebreak_metric_name") != tiebreak_metric_name:
+        raise RuntimeError("candidate checkpoint tie-break metric name disagrees with the caller")
+    if candidate_manifest.get("selection_tiebreak_metric_value") != tiebreak_metric_value:
+        raise RuntimeError("candidate checkpoint tie-break metric value disagrees with the caller")
 
     tracker_path = os.path.join(checkpoint_root, _BEST_CHECKPOINT_TRACKER)
     previous_step = _read_step_tracker(tracker_path)
     previous_value = None
+    previous_tiebreak_value = None
     if previous_step is not None:
-        previous_path = os.path.join(checkpoint_root, f"global_step_{previous_step}")
-        previous_manifest_path = os.path.join(previous_path, _CHECKPOINT_MANIFEST)
-        if not os.path.isfile(previous_manifest_path):
-            raise RuntimeError(f"BEST points to an uncommitted checkpoint: {previous_path}")
-        with open(previous_manifest_path, encoding="utf-8") as handle:
-            previous_manifest = json.load(handle)
+        if previous_step == 0:
+            initial_path = os.path.join(checkpoint_root, _INITIAL_BEST_RECORD)
+            if not os.path.isfile(initial_path) or os.path.islink(initial_path):
+                raise RuntimeError("BEST points to a missing initial-policy reference")
+            with open(initial_path, encoding="utf-8") as handle:
+                previous_manifest = _verify_initial_best_reference(
+                    json.load(handle),
+                    expected_provenance=candidate_manifest.get("provenance"),
+                )
+        else:
+            previous_path = os.path.join(checkpoint_root, f"global_step_{previous_step}")
+            previous_manifest = _verify_checkpoint(
+                previous_path,
+                expected_provenance=candidate_manifest.get("provenance"),
+            )
         if previous_manifest.get("selection_metric_name") != metric_name:
             raise RuntimeError("BEST checkpoint uses a different selection metric")
         previous_value = previous_manifest.get("selection_metric_value")
         if not isinstance(previous_value, (float, int)) or not np.isfinite(previous_value):
             raise RuntimeError("BEST checkpoint contains an invalid selection metric")
+        if tiebreak_metric_name is not None:
+            if previous_manifest.get("selection_tiebreak_metric_name") != tiebreak_metric_name:
+                raise RuntimeError("BEST checkpoint uses a different tie-break metric")
+            previous_tiebreak_value = previous_manifest.get(
+                "selection_tiebreak_metric_value"
+            )
+            if not isinstance(previous_tiebreak_value, (float, int)) or not np.isfinite(
+                previous_tiebreak_value
+            ):
+                raise RuntimeError("BEST checkpoint contains an invalid tie-break metric")
 
     is_better = previous_value is None
     if previous_value is not None:
         is_better = metric_value > previous_value if mode == "max" else metric_value < previous_value
+        if (
+            metric_value == previous_value
+            and tiebreak_metric_value is not None
+            and previous_tiebreak_value is not None
+        ):
+            # The study's secondary score is released-reward Mean@1, for which
+            # larger is always better. Exact ties intentionally retain the
+            # earlier checkpoint already named by BEST.
+            is_better = float(tiebreak_metric_value) > float(previous_tiebreak_value)
     if is_better:
         _atomic_write_text(tracker_path, f"{global_step}\n")
     return is_better
@@ -779,7 +973,13 @@ def _prune_committed_checkpoints(checkpoint_root: str, keep_latest: int) -> list
     candidates.sort()
     protected_steps = {step for step, _ in candidates[-keep_latest:]}
     best_step = _read_step_tracker(os.path.join(checkpoint_root, _BEST_CHECKPOINT_TRACKER))
-    if best_step is not None:
+    if best_step == 0:
+        initial_path = os.path.join(checkpoint_root, _INITIAL_BEST_RECORD)
+        if not os.path.isfile(initial_path) or os.path.islink(initial_path):
+            raise RuntimeError("BEST points to a missing initial-policy reference")
+        with open(initial_path, encoding="utf-8") as handle:
+            _verify_initial_best_reference(json.load(handle))
+    elif best_step is not None:
         best_path = os.path.join(checkpoint_root, f"global_step_{best_step}")
         if not os.path.isfile(os.path.join(best_path, _CHECKPOINT_MANIFEST)):
             raise RuntimeError(f"BEST points to an uncommitted checkpoint: {best_path}")
@@ -1124,6 +1324,13 @@ class RayPPOTrainer:
         self.opd_config = OPDConfig.from_mapping(
             OmegaConf.to_container(config.algorithm.opd, resolve=True)
         )
+        self.continuous_replay = bool(
+            config.actor_rollout_ref.rollout.get("enable_soft_thinking", True)
+        )
+        self.standalone_opd = (
+            self.opd_config.active
+            and self.opd_config.mode is ObjectiveMode.STANDALONE
+        )
         self.rollout_integrity_config = RolloutIntegrityConfig.from_mapping(
             OmegaConf.to_container(config.trainer.rollout_integrity, resolve=True)
         )
@@ -1145,7 +1352,9 @@ class RayPPOTrainer:
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
+        self.use_reference_policy = (
+            Role.RefPolicy in role_worker_mapping and not self.standalone_opd
+        )
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
@@ -1159,7 +1368,9 @@ class RayPPOTrainer:
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if self.standalone_opd:
+            self.use_critic = False
+        elif self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
@@ -1183,6 +1394,28 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        if self.opd_config.active and not self.continuous_replay:
+            raise ValueError("active OPD requires rollout.enable_soft_thinking=true")
+        if self.rollout_integrity_config.full_dose_gradient_gate_enabled:
+            if not self.rollout_integrity_config.enabled:
+                raise ValueError(
+                    "the full-dose gradient gate requires rollout_integrity.enabled=true"
+                )
+            if (
+                not self.opd_config.active
+                or self.standalone_opd
+                or not self.continuous_replay
+            ):
+                raise ValueError(
+                    "the full-dose gradient gate requires an active continuous auxiliary OPD objective"
+                )
+        if self.standalone_opd:
+            if int(config.actor_rollout_ref.rollout.n) != 1:
+                raise ValueError("standalone OPD requires rollout.n=1")
+            if config.algorithm.use_kl_in_reward:
+                raise ValueError("standalone OPD forbids reward-side reference KL")
+            if config.actor_rollout_ref.actor.use_kl_loss:
+                raise ValueError("standalone OPD forbids actor native-reference KL")
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         if config.actor_rollout_ref.actor.strategy == "megatron":
@@ -1488,8 +1721,15 @@ class RayPPOTrainer:
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
-                "rollout_seed": int(self.config.data.seed),
-                "rollout_iteration": max(int(self.global_steps) - 1, 0),
+                # Every validation event reuses the same stateless per-example
+                # RNG namespace, so initial/25/50/75/100/final differences are
+                # attributable to checkpoints rather than changed samples.
+                "rollout_seed": int(
+                    self.config.trainer.get("validation_seed", self.config.data.seed)
+                ),
+                "rollout_iteration": int(
+                    self.config.trainer.get("validation_seed_iteration", 0)
+                ),
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
@@ -1506,11 +1746,16 @@ class RayPPOTrainer:
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
 
-            if self.close_tag_token_id is not None and {
-                "rollout_topk_ids",
-                "rollout_topk_gumbels",
-                "gumbel_temperature",
-            }.issubset(test_output_gen_batch.batch.keys()):
+            val_diag = None
+            if (
+                self.continuous_replay
+                and self.close_tag_token_id is not None
+                and {
+                    "rollout_topk_ids",
+                    "rollout_topk_gumbels",
+                    "gumbel_temperature",
+                }.issubset(test_output_gen_batch.batch.keys())
+            ):
                 val_responses = test_output_gen_batch.batch["responses"]
                 val_response_mask = test_output_gen_batch.batch["attention_mask"][:, -val_responses.shape[-1]:]
                 val_topk_ids = test_output_gen_batch.batch["rollout_topk_ids"][:, -val_responses.shape[-1]:]
@@ -1524,6 +1769,20 @@ class RayPPOTrainer:
                     close_tag_token_id=self.close_tag_token_id,
                     decode=lambda ids: self.tokenizer.decode(ids, skip_special_tokens=False),
                 )
+            elif not self.continuous_replay and self.close_tag_token_id is not None:
+                val_responses = test_output_gen_batch.batch["responses"]
+                val_response_mask = test_output_gen_batch.batch["attention_mask"][
+                    :, -val_responses.shape[-1]:
+                ]
+                val_diag = compute_categorical_rollout_diagnostics(
+                    responses=val_responses,
+                    response_mask=val_response_mask,
+                    close_tag_token_id=self.close_tag_token_id,
+                    decode=lambda ids: self.tokenizer.decode(
+                        ids, skip_special_tokens=False
+                    ),
+                )
+            if val_diag is not None:
                 val_examples = val_responses.shape[0]
                 rollout_validation_examples += val_examples
                 validation_response_tokens += int(val_response_mask.sum().item())
@@ -1544,13 +1803,23 @@ class RayPPOTrainer:
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
+            reward_extra_info = result.get("reward_extra_info", {})
+            if self.continuous_replay:
+                if val_diag is None:
+                    raise RuntimeError(
+                        "native-soft validation requires action metadata for boundary scoring"
+                    )
+                reward_tensor, reward_extra_info = mask_invalid_native_boundary_scores(
+                    reward_tensor=reward_tensor,
+                    reward_extra_info=reward_extra_info,
+                    boundary_valid_mask=val_diag.boundary_valid_mask,
+                )
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+            for key, lst in reward_extra_info.items():
+                reward_extra_infos_dict[key].extend(lst)
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
@@ -1587,7 +1856,9 @@ class RayPPOTrainer:
                     metric_dict[pfx] = metric_val
 
         metric_dict.update(validation_metric_aliases(metric_dict))
-        metric_dict["trainer/rollout_iteration"] = max(self.global_steps - 1, 0)
+        metric_dict["trainer/rollout_iteration"] = validation_rollout_iteration(
+            self.global_steps
+        )
         if rollout_validation_examples:
             metric_dict.update(
                 {
@@ -1693,6 +1964,8 @@ class RayPPOTrainer:
         reason: str = "scheduled",
         selection_metric_name: Optional[str] = None,
         selection_metric_value: Optional[float] = None,
+        selection_tiebreak_metric_name: Optional[str] = None,
+        selection_tiebreak_metric_value: Optional[float] = None,
     ):
         """Save and publish one complete-rollout checkpoint atomically.
 
@@ -1708,8 +1981,18 @@ class RayPPOTrainer:
             raise RuntimeError("atomic checkpoints cannot be deleted piecemeal during load")
         if (selection_metric_name is None) != (selection_metric_value is None):
             raise ValueError("checkpoint selection metric name and value must be provided together")
+        if (selection_tiebreak_metric_name is None) != (
+            selection_tiebreak_metric_value is None
+        ):
+            raise ValueError(
+                "checkpoint selection tie-break metric name and value must be provided together"
+            )
         if selection_metric_value is not None and not np.isfinite(float(selection_metric_value)):
             raise RuntimeError("checkpoint selection metric must be finite")
+        if selection_tiebreak_metric_value is not None and not np.isfinite(
+            float(selection_tiebreak_metric_value)
+        ):
+            raise RuntimeError("checkpoint selection tie-break metric must be finite")
         best_mode = str(self.config.trainer.get("checkpoint_best_mode", "max"))
         if best_mode not in {"max", "min"}:
             raise ValueError("trainer.checkpoint_best_mode must be 'max' or 'min'")
@@ -1799,6 +2082,8 @@ class RayPPOTrainer:
                 provenance=self.checkpoint_provenance,
                 selection_metric_name=selection_metric_name,
                 selection_metric_value=selection_metric_value,
+                selection_tiebreak_metric_name=selection_tiebreak_metric_name,
+                selection_tiebreak_metric_value=selection_tiebreak_metric_value,
             )
             _verify_checkpoint(
                 temporary_checkpoint_dir,
@@ -1817,6 +2102,8 @@ class RayPPOTrainer:
                 metric_name=selection_metric_name,
                 metric_value=selection_metric_value,
                 mode=best_mode,
+                tiebreak_metric_name=selection_tiebreak_metric_name,
+                tiebreak_metric_value=selection_tiebreak_metric_value,
                 verified_candidate_manifest=manifest,
             )
             _prune_committed_checkpoints(checkpoint_root, keep_latest=keep_latest)
@@ -1988,7 +2275,35 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            logger.log(
+                data=val_metrics,
+                step=validation_wandb_step(self.global_steps),
+            )
+            selection_metric_name = str(
+                self.config.trainer.get(
+                    "checkpoint_best_metric", "val/math_verify/mean_at_1"
+                )
+            )
+            tiebreak_metric_name = str(
+                self.config.trainer.get(
+                    "checkpoint_best_tiebreak_metric",
+                    "val/released_reward/mean_at_1",
+                )
+            )
+            if not self._resumed and selection_metric_name in val_metrics:
+                if tiebreak_metric_name not in val_metrics:
+                    raise RuntimeError(
+                        "initial validation is missing the BEST tie-break metric "
+                        f"{tiebreak_metric_name!r}"
+                    )
+                _write_initial_best_reference(
+                    self.config.trainer.default_local_dir,
+                    metric_name=selection_metric_name,
+                    metric_value=float(val_metrics[selection_metric_name]),
+                    tiebreak_metric_name=tiebreak_metric_name,
+                    tiebreak_metric_value=float(val_metrics[tiebreak_metric_name]),
+                    provenance=self.checkpoint_provenance,
+                )
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -2015,7 +2330,7 @@ class RayPPOTrainer:
                 val_metrics_this_iteration = None
                 requeue_requested = False
                 invocation_limit_reached = False
-                rollout_iteration = self.global_steps - 1
+                rollout_iteration = training_rollout_iteration(self.global_steps)
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
@@ -2105,19 +2420,24 @@ class RayPPOTrainer:
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                        metrics.update(old_log_prob_metrics)
+                        actor_old_log_probs = old_log_prob.batch["old_log_probs"]
+                        if not self.standalone_opd:
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                            metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        # Standalone uses this forward only as a detached replay
+                        # integrity check.  Do not carry an old policy into the
+                        # optimization batch or expose PPO/GRPO metrics.
+                        if not self.standalone_opd:
+                            batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
-                            actor_old_log_probs = batch.batch["old_log_probs"]
                             attention_mask = batch.batch["attention_mask"]
                             responses = batch.batch["responses"]
                             response_length = responses.size(1)
@@ -2152,7 +2472,11 @@ class RayPPOTrainer:
                         "rollout_topk_gumbels",
                         "gumbel_temperature",
                     }
-                    if replay_keys.issubset(batch.batch.keys()) and self.close_tag_token_id is not None:
+                    if (
+                        self.continuous_replay
+                        and replay_keys.issubset(batch.batch.keys())
+                        and self.close_tag_token_id is not None
+                    ):
                         responses = batch.batch["responses"]
                         response_length = responses.shape[-1]
                         rollout_diagnostics = compute_rollout_diagnostics(
@@ -2163,6 +2487,16 @@ class RayPPOTrainer:
                             gumbel_temperature=float(batch.batch["gumbel_temperature"][0].item()),
                             close_tag_token_id=self.close_tag_token_id,
                             decode=lambda ids: self.tokenizer.decode(ids, skip_special_tokens=False),
+                        )
+                        metrics.update(rollout_diagnostics.metrics)
+                    elif not self.continuous_replay and self.close_tag_token_id is not None:
+                        rollout_diagnostics = compute_categorical_rollout_diagnostics(
+                            responses=batch.batch["responses"],
+                            response_mask=batch.batch["response_mask"],
+                            close_tag_token_id=self.close_tag_token_id,
+                            decode=lambda ids: self.tokenizer.decode(
+                                ids, skip_special_tokens=False
+                            ),
                         )
                         metrics.update(rollout_diagnostics.metrics)
                     elif self.rollout_integrity_config.enabled:
@@ -2198,43 +2532,51 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            use_pf_ppo=self.config.algorithm.use_pf_ppo,
-                            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
-                            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
-                        )
-
                         response_mask = batch.batch["response_mask"].bool()
                         sequence_scores = batch.batch["token_level_scores"].sum(dim=-1)
-                        trajectory_advantages = (
-                            batch.batch["advantages"].masked_fill(~response_mask, 0.0).sum(dim=-1)
-                            / response_mask.sum(dim=-1).clamp_min(1)
-                        )
-                        metrics.update(
-                            reward_and_group_metrics(
-                                sequence_scores=sequence_scores,
-                                trajectory_advantages=trajectory_advantages,
-                                group_ids=batch.non_tensor_batch["uid"],
+                        if self.standalone_opd:
+                            metrics.update(reward_only_metrics(sequence_scores))
+                        else:
+                            # compute rewards and advantages only for grouped RL
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch,
+                                    kl_ctrl=self.kl_ctrl_in_reward,
+                                    kl_penalty=self.config.algorithm.kl_penalty,
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch[
+                                    "token_level_scores"
+                                ]
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
                             )
-                        )
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                use_pf_ppo=self.config.algorithm.use_pf_ppo,
+                                pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
+                                pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+                            )
+                            trajectory_advantages = (
+                                batch.batch["advantages"]
+                                .masked_fill(~response_mask, 0.0)
+                                .sum(dim=-1)
+                                / response_mask.sum(dim=-1).clamp_min(1)
+                            )
+                            metrics.update(
+                                reward_and_group_metrics(
+                                    sequence_scores=sequence_scores,
+                                    trajectory_advantages=trajectory_advantages,
+                                    group_ids=batch.non_tensor_batch["uid"],
+                                )
+                            )
 
                     # update critic
                     if self.use_critic:
@@ -2254,12 +2596,18 @@ class RayPPOTrainer:
                         if self.rollout_integrity_config.enabled:
                             if rollout_diagnostics is None:
                                 raise RuntimeError("rollout diagnostics were not constructed")
-                            validate_rollout_integrity(
-                                diagnostics=rollout_diagnostics,
-                                replay_error=replay_error,
-                                config=self.rollout_integrity_config,
-                                rollout_iteration=rollout_iteration,
-                            )
+                            if self.continuous_replay:
+                                validate_rollout_integrity(
+                                    diagnostics=rollout_diagnostics,
+                                    replay_error=replay_error,
+                                    config=self.rollout_integrity_config,
+                                    rollout_iteration=rollout_iteration,
+                                )
+                            else:
+                                validate_categorical_rollout_integrity(
+                                    replay_error=replay_error,
+                                    config=self.rollout_integrity_config,
+                                )
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
@@ -2268,6 +2616,13 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        validate_full_dose_gradient_integrity(
+                            actor_output_metrics,
+                            self.rollout_integrity_config,
+                            schedule_multiplier=float(
+                                worker_schedule["opd_schedule_multiplier"]
+                            ),
+                        )
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -2292,7 +2647,6 @@ class RayPPOTrainer:
                             val_metrics_this_iteration = val_metrics
                             if is_last_step:
                                 last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
 
                     requeue_signal_file = self.config.trainer.get("requeue_signal_file", None)
                     requeue_requested = _requeue_requested(requeue_signal_file)
@@ -2319,10 +2673,28 @@ class RayPPOTrainer:
                             self.config.trainer.get("checkpoint_best_metric", "val/math_verify/mean_at_1")
                         )
                         selection_metric_value = None
+                        selection_tiebreak_metric_name = str(
+                            self.config.trainer.get(
+                                "checkpoint_best_tiebreak_metric",
+                                "val/released_reward/mean_at_1",
+                            )
+                        )
+                        selection_tiebreak_metric_value = None
                         if val_metrics_this_iteration is not None:
                             candidate_metric = val_metrics_this_iteration.get(selection_metric_name)
                             if candidate_metric is not None:
                                 selection_metric_value = float(candidate_metric)
+                                candidate_tiebreak = val_metrics_this_iteration.get(
+                                    selection_tiebreak_metric_name
+                                )
+                                if candidate_tiebreak is None:
+                                    raise RuntimeError(
+                                        "validation is missing the BEST tie-break metric "
+                                        f"{selection_tiebreak_metric_name!r}"
+                                    )
+                                selection_tiebreak_metric_value = float(
+                                    candidate_tiebreak
+                                )
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint(
                                 rollout_batch=batch,
@@ -2331,6 +2703,12 @@ class RayPPOTrainer:
                                     selection_metric_name if selection_metric_value is not None else None
                                 ),
                                 selection_metric_value=selection_metric_value,
+                                selection_tiebreak_metric_name=(
+                                    selection_tiebreak_metric_name
+                                    if selection_tiebreak_metric_value is not None
+                                    else None
+                                ),
+                                selection_tiebreak_metric_value=selection_tiebreak_metric_value,
                             )
                         if timing_raw["save_checkpoint"] > float(
                             self.config.trainer.get("checkpoint_max_seconds", 720)
@@ -2360,7 +2738,8 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if not self.standalone_opd:
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -2393,7 +2772,12 @@ class RayPPOTrainer:
                     validate_iteration_metric_contract(metrics)
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                logger.log(data=metrics, step=training_wandb_step(self.global_steps))
+                if val_metrics_this_iteration is not None:
+                    logger.log(
+                        data=val_metrics_this_iteration,
+                        step=validation_wandb_step(self.global_steps),
+                    )
 
                 progress_bar.update(1)
                 iterations_this_invocation += 1

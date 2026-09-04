@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s {baseline|opd} [Hydra overrides...]\n' "${0##*/}" >&2
+  printf 'Usage: %s ARM_ID\n' "${0##*/}" >&2
 }
 
 if (($# == 0)); then
@@ -12,10 +12,47 @@ fi
 
 readonly ARM="$1"
 shift
-if [[ "${ARM}" != "baseline" && "${ARM}" != "opd" ]]; then
-  usage
-  exit 2
-fi
+readonly RUN_CONTEXT="${OPD_RUN_CONTEXT:-production}"
+INTERNAL_CONTEXT_OVERRIDES=()
+case "${RUN_CONTEXT}" in
+  production)
+    if (($# != 0)); then
+      printf 'Registered production arms accept no Hydra overrides.\n' >&2
+      exit 2
+    fi
+    ;;
+  sealed_production)
+    if (($# != 0)); then
+      printf 'Sealed production accepts no positional Hydra overrides.\n' >&2
+      exit 2
+    fi
+    readonly PRODUCTION_RUN_ROOT="${OPD_PRODUCTION_RUN_ROOT:?sealed production requires OPD_PRODUCTION_RUN_ROOT}"
+    readonly PRODUCTION_SIGNAL_FILE="${OPD_PRODUCTION_SIGNAL_FILE:?sealed production requires OPD_PRODUCTION_SIGNAL_FILE}"
+    readonly PRODUCTION_MANIFEST="${OPD_STUDY_MANIFEST:?sealed production requires OPD_STUDY_MANIFEST}"
+    readonly PRODUCTION_MANIFEST_SHA256="${OPD_STUDY_MANIFEST_SHA256:?sealed production requires OPD_STUDY_MANIFEST_SHA256}"
+    readonly PRODUCTION_CONTRACT_SHA256="${OPD_ARM_CONTRACT_SHA256:?sealed production requires OPD_ARM_CONTRACT_SHA256}"
+    INTERNAL_CONTEXT_OVERRIDES=(
+      trainer.n_gpus_per_node=8
+      trainer.resume_mode=auto
+      "trainer.requeue_signal_file=${PRODUCTION_SIGNAL_FILE}"
+      "trainer.default_local_dir=${PRODUCTION_RUN_ROOT}"
+      "+trainer.study_arm_id=${ARM}"
+      "+trainer.study_manifest_path=${PRODUCTION_MANIFEST}"
+      "+trainer.study_manifest_sha256=${PRODUCTION_MANIFEST_SHA256}"
+      "+trainer.arm_contract_sha256=${PRODUCTION_CONTRACT_SHA256}"
+    )
+    ;;
+  smoke)
+    # Smoke-only reductions and integrity hooks are owned by the checked-in
+    # smoke launcher. The production wrapper forcibly selects `production`.
+    INTERNAL_CONTEXT_OVERRIDES=("$@")
+    ;;
+  *)
+    printf 'OPD_RUN_CONTEXT must be production, sealed_production, or smoke; found %s.\n' \
+      "${RUN_CONTEXT}" >&2
+    exit 2
+    ;;
+esac
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SOURCE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -41,6 +78,20 @@ export WANDB_DIR="${SCRATCH_ROOT}/wandb"
 export PYTHONPATH="${SOURCE_ROOT}:${VERL_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
 
+if ! EXPERIMENT_NAME="$(${PYTHON_BIN} -m opd_tools.study resolve "${ARM}" --field experiment_name)"; then
+  usage
+  exit 2
+fi
+readonly EXPERIMENT_NAME
+ARM_OVERRIDES=()
+while IFS= read -r override; do
+  ARM_OVERRIDES+=("${override}")
+done < <("${PYTHON_BIN}" -m opd_tools.study hydra-overrides "${ARM}")
+if ((${#ARM_OVERRIDES[@]} == 0)); then
+  printf 'Study registry returned no Hydra overrides for %s.\n' "${ARM}" >&2
+  exit 1
+fi
+
 if [[ "${OPD_ASSETS_PREFLIGHTED:-0}" != 1 ]]; then
   "${PYTHON_BIN}" -m opd_tools.assets \
     --output-dir "${MODEL_ROOT}" \
@@ -54,14 +105,6 @@ if [[ "${OPD_ASSETS_PREFLIGHTED:-0}" != 1 ]]; then
     --max-prompt-length 2048
 fi
 
-if [[ "${ARM}" == "baseline" ]]; then
-  readonly EXPERIMENT_NAME="softgrpo_math_s11"
-  readonly OPD_ENABLED=false
-else
-  readonly EXPERIMENT_NAME="softgrpo_math_opd_s11"
-  readonly OPD_ENABLED=true
-fi
-
 readonly RAY_CPUS="${SLURM_CPUS_PER_TASK:-8}"
 
 cd "${VERL_ROOT}"
@@ -69,16 +112,6 @@ exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
   algorithm.norm_adv_by_std_in_grpo=true \
   algorithm.use_kl_in_reward=false \
-  algorithm.opd.enabled="${OPD_ENABLED}" \
-  algorithm.opd.beta_base=0.001 \
-  algorithm.opd.schedule=warmup_constant \
-  algorithm.opd.warmup_fraction=0.10 \
-  algorithm.opd.teacher.type=ema \
-  algorithm.opd.teacher.ema_decay=0.99 \
-  algorithm.opd.kl_direction=teacher_to_student \
-  algorithm.opd.trajectory_gate=all \
-  algorithm.opd.prompt_template=sdpg \
-  algorithm.opd.temperature=1.0 \
   data.train_files="${DATA_ROOT}/math_lighteval_train.parquet" \
   data.val_files="${DATA_ROOT}/math_lighteval_validation.parquet" \
   data.train_batch_size=64 \
@@ -102,43 +135,24 @@ exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.clip_ratio_low=0.2 \
   actor_rollout_ref.actor.clip_ratio_high=0.2 \
   actor_rollout_ref.actor.grad_clip=1.0 \
-  actor_rollout_ref.actor.use_kl_loss=true \
-  actor_rollout_ref.actor.kl_loss_coef=0.001 \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
   actor_rollout_ref.actor.entropy_coeff=0 \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=30720 \
   actor_rollout_ref.actor.fsdp_config.param_offload=true \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
   actor_rollout_ref.actor.checkpoint.contents="[model,optimizer,extra,hf_model]" \
-  actor_rollout_ref.rollout.name=sglang \
   actor_rollout_ref.rollout.mode=sync \
   actor_rollout_ref.rollout.deterministic_sampling=true \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
   actor_rollout_ref.rollout.max_model_len=12000 \
   actor_rollout_ref.rollout.max_num_batched_tokens=12000 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  actor_rollout_ref.rollout.top_p=0.95 \
-  actor_rollout_ref.rollout.top_k=5 \
-  actor_rollout_ref.rollout.temperature=1.0 \
-  actor_rollout_ref.rollout.after_thinking_temperature=1.0 \
-  actor_rollout_ref.rollout.after_thinking_top_p=0.95 \
-  actor_rollout_ref.rollout.after_thinking_top_k=5 \
-  actor_rollout_ref.rollout.gumbel_softmax_temperature=0.1 \
-  actor_rollout_ref.rollout.enable_soft_thinking=true \
-  actor_rollout_ref.rollout.add_noise_gumbel_softmax=true \
   actor_rollout_ref.rollout.add_noise_dirichlet=false \
-  actor_rollout_ref.rollout.noise_gumbel=true \
   actor_rollout_ref.rollout.noise_gaussian=false \
   actor_rollout_ref.rollout.noise_on_logits=true \
   actor_rollout_ref.rollout.noise_on_inputs=false \
   actor_rollout_ref.rollout.noise_factor=1.0 \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-  actor_rollout_ref.rollout.n=8 \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=true \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
-  actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-  actor_rollout_ref.rollout.val_kwargs.top_k=5 \
-  actor_rollout_ref.rollout.val_kwargs.n=1 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
   actor_rollout_ref.ref.fsdp_config.param_offload=true \
   actor_rollout_ref.ref.strategy=fsdp2 \
@@ -159,4 +173,5 @@ exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   trainer.rollout_integrity.enabled=true \
   trainer.rollout_integrity.gate_first_n_iterations=1 \
   ray_init.num_cpus="${RAY_CPUS}" \
-  "$@"
+  "${ARM_OVERRIDES[@]}" \
+  "${INTERNAL_CONTEXT_OVERRIDES[@]}"

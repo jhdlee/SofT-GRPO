@@ -39,6 +39,8 @@ from .evaluation import (
     MODEL_LABELS,
     GenerationRecord,
     evaluation_request_seed,
+    generation_seeds_sha256,
+    validate_evaluation_cell,
 )
 from .constants import SOFTGRPO_UPSTREAM_COMMIT
 from .manifest import file_sha256
@@ -73,11 +75,41 @@ EVALUATION_SAMPLING_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "gumbel_softmax_temperature": 0.1,
         "max_new_tokens": 8_192,
     },
+    # Preregistered final recipe for the starting checkpoint and all six
+    # native-soft trained arms: training action relaxation with the larger
+    # 32K evaluation budget.
+    "production_native_soft": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 5,
+        "gumbel_softmax_temperature": 0.1,
+        "max_new_tokens": 32_768,
+    },
 }
 
 GENERATION_IMPLEMENTATION = (
     "Soft-Thinking+noise+loss-main/sglang_soft_thinking_pkg/python/sglang"
 )
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def required_source_identity(
+    environ: Mapping[str, str] | None = None,
+) -> Dict[str, str]:
+    """Return the submission-sealed parent and SofT-GRPO commits."""
+
+    values = os.environ if environ is None else environ
+    result = {
+        "parent_commit": values.get("OPD_PARENT_COMMIT", ""),
+        "fork_commit": values.get("OPD_SUBMODULE_COMMIT", ""),
+    }
+    for field, value in result.items():
+        if _GIT_COMMIT_RE.fullmatch(value) is None:
+            raise RuntimeError(
+                "%s requires a full lowercase 40-character Git commit"
+                % field
+            )
+    return result
 
 
 def expected_sampling_source(mode: str, sampling_protocol: str) -> str:
@@ -89,6 +121,8 @@ def expected_sampling_source(mode: str, sampling_protocol: str) -> str:
         raise ValueError("unsupported evaluation sampling protocol: %r" % sampling_protocol)
     if sampling_protocol == "training_matched":
         return "seed-11 training configuration"
+    if sampling_protocol == "production_native_soft":
+        return "seed-11 native-soft action recipe with 32K final-evaluation cap"
     filename = (
         "run_sample_gumbel_raw.sh"
         if mode == "native_soft"
@@ -569,17 +603,36 @@ def required_context_length(
 
 
 def run(args: argparse.Namespace) -> None:
+    source_identity = required_source_identity()
     model_root = Path(args.model_path).expanduser().resolve()
     data_root = Path(args.data_dir).expanduser().resolve()
     output_root = Path(args.output_dir).expanduser().resolve()
     if args.model_label not in MODEL_LABELS or args.mode not in INFERENCE_MODES:
         raise ValueError("invalid model label or inference mode")
+    validate_evaluation_cell(args.model_label, args.mode)
     benchmarks = list(BENCHMARKS) if args.benchmarks == ["all"] else args.benchmarks
     if not benchmarks or len(set(benchmarks)) != len(benchmarks):
         raise ValueError("benchmarks must be a unique non-empty list")
     if any(name not in BENCHMARKS for name in benchmarks):
         raise ValueError("unsupported benchmark selection")
-    protocol = EVALUATION_SAMPLING_PROTOCOLS[args.sampling_protocol]
+    sampling_protocol = args.sampling_protocol
+    if sampling_protocol is None:
+        sampling_protocol = (
+            "production_native_soft"
+            if args.mode == "native_soft"
+            else "released_anchor"
+        )
+    expected_protocol = (
+        "production_native_soft"
+        if args.mode == "native_soft"
+        else "released_anchor"
+    )
+    if sampling_protocol != expected_protocol:
+        raise ValueError(
+            "%s final evaluation requires sampling protocol %s"
+            % (args.mode, expected_protocol)
+        )
+    protocol = EVALUATION_SAMPLING_PROTOCOLS[sampling_protocol]
     seeds = (
         COMMON_GENERATION_SEEDS
         if args.mode == "native_soft"
@@ -670,11 +723,10 @@ def run(args: argparse.Namespace) -> None:
         "evaluation_protocol": EVALUATION_PROTOCOL,
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "softgrpo_upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
-        "parent_commit": os.environ.get("OPD_PARENT_COMMIT"),
-        "fork_commit": os.environ.get("OPD_SUBMODULE_COMMIT"),
+        **source_identity,
         "generation_implementation": GENERATION_IMPLEMENTATION,
         "sampling_source": expected_sampling_source(
-            args.mode, args.sampling_protocol
+            args.mode, sampling_protocol
         ),
         "engine_mode": expected_engine_mode(args.mode),
         "model_label": args.model_label,
@@ -682,7 +734,8 @@ def run(args: argparse.Namespace) -> None:
         "mode": args.mode,
         "benchmarks": benchmarks,
         "generation_seeds": list(seeds),
-        "sampling_protocol": args.sampling_protocol,
+        "generation_seeds_sha256": generation_seeds_sha256(seeds),
+        "sampling_protocol": sampling_protocol,
         "sampling": dict(protocol),
         "parallelism": {
             "tensor_parallel_size": tensor_parallel_size,
@@ -884,7 +937,7 @@ def run(args: argparse.Namespace) -> None:
             "model_label": args.model_label,
             "mode": args.mode,
             "benchmarks": benchmarks,
-            "sampling_protocol": args.sampling_protocol,
+            "sampling_protocol": sampling_protocol,
             "shards_committed": completed,
             "expected_shards": len(benchmarks) * len(seeds),
             "rows_committed": sum(row["row_count"] for row in committed_shards),
@@ -922,7 +975,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sampling-protocol",
         choices=tuple(EVALUATION_SAMPLING_PROTOCOLS),
-        default="released_anchor",
+        default=None,
     )
     parser.add_argument(
         "--num-gpus",

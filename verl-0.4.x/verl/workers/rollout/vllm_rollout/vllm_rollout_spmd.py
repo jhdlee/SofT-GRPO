@@ -47,6 +47,10 @@ from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.sglang_rollout.deterministic_sampling import (
+    derive_request_seed,
+    expand_parallel_seeds,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -72,6 +76,31 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return value.repeat_interleave(repeats, dim=0)
     else:
         return np.repeat(value, repeats, axis=0)
+
+
+def _repeat_non_tensor_batch(
+    non_tensor_batch: Dict[str, np.ndarray],
+    repeats: int,
+    *,
+    expected_batch_size: int,
+) -> Dict[str, np.ndarray]:
+    """Repeat every remaining per-example field in prompt-major order."""
+
+    if repeats < 1:
+        raise ValueError("non-tensor repeat count must be positive")
+    repeated: Dict[str, np.ndarray] = {}
+    for name, value in non_tensor_batch.items():
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                f"vLLM non-tensor field {name!r} must be a numpy array"
+            )
+        if value.shape[0] != expected_batch_size:
+            raise RuntimeError(
+                f"vLLM non-tensor field {name!r} has batch size "
+                f"{value.shape[0]}, expected {expected_batch_size}"
+            )
+        repeated[name] = np.repeat(value, repeats, axis=0)
+    return repeated
 
 
 class vLLMRollout(BaseRollout):
@@ -285,10 +314,69 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            requested_n = int(self.sampling_params.n)
+            request_sampling_params = self.sampling_params
+            generation_inputs = vllm_inputs
+            generation_lora_requests = lora_requests
+            expanded_sampling_seeds = None
+            if bool(self.config.get("deterministic_sampling", False)) and do_sample:
+                if "rollout_iteration" not in prompts.meta_info:
+                    raise RuntimeError(
+                        "deterministic_sampling requires prompts.meta_info['rollout_iteration']"
+                    )
+                if "rollout_seed" not in prompts.meta_info:
+                    raise RuntimeError(
+                        "deterministic_sampling requires prompts.meta_info['rollout_seed']"
+                    )
+                example_identities = non_tensor_batch.get(
+                    "index", np.arange(batch_size, dtype=np.int64)
+                )
+                external_sample_indices = non_tensor_batch.get(
+                    "rollout_sample_index", np.zeros(batch_size, dtype=np.int64)
+                )
+                if len(example_identities) != batch_size or len(external_sample_indices) != batch_size:
+                    raise RuntimeError(
+                        "deterministic vLLM request identities do not match prompt batch"
+                    )
+                base_sampling_seeds = [
+                    derive_request_seed(
+                        root_seed=int(prompts.meta_info["rollout_seed"]),
+                        rollout_iteration=int(prompts.meta_info["rollout_iteration"]),
+                        example_identity=identity,
+                        prompt_token_ids=input_data["prompt_token_ids"],
+                        external_sample_index=int(sample_index),
+                    )
+                    for identity, input_data, sample_index in zip(
+                        example_identities, vllm_inputs, external_sample_indices
+                    )
+                ]
+                expanded_sampling_seeds = expand_parallel_seeds(
+                    base_sampling_seeds, requested_n
+                )
+                # One n=1 request per trajectory makes each RNG stream explicit
+                # and invariant to vLLM scheduler order. vLLM 0.8.5 accepts a
+                # SamplingParams sequence aligned one-to-one with prompt inputs.
+                generation_inputs = [
+                    deepcopy(input_data)
+                    for input_data in vllm_inputs
+                    for _ in range(requested_n)
+                ]
+                request_sampling_params = []
+                for seed in expanded_sampling_seeds:
+                    params = deepcopy(self.sampling_params)
+                    params.n = 1
+                    params.seed = int(seed)
+                    request_sampling_params.append(params)
+                if lora_requests is not None:
+                    generation_lora_requests = [
+                        request
+                        for request in lora_requests
+                        for _ in range(requested_n)
+                    ]
             outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
+                prompts=generation_inputs,  # token IDs were prepared above
+                sampling_params=request_sampling_params,
+                lora_request=generation_lora_requests,
                 use_tqdm=False,
             )
 
@@ -310,14 +398,29 @@ class vLLMRollout(BaseRollout):
             rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
             rollout_log_probs = rollout_log_probs.to(torch.float32)
 
-            if self.sampling_params.n > 1 and do_sample:
-                idx = _repeat_interleave(idx, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_size = batch_size * self.sampling_params.n
-                # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
-                if "tools_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
+            if requested_n > 1 and do_sample:
+                original_batch_size = batch_size
+                idx = _repeat_interleave(idx, requested_n)
+                attention_mask = _repeat_interleave(attention_mask, requested_n)
+                position_ids = _repeat_interleave(position_ids, requested_n)
+                batch_size = batch_size * requested_n
+                non_tensor_batch = _repeat_non_tensor_batch(
+                    non_tensor_batch,
+                    requested_n,
+                    expected_batch_size=original_batch_size,
+                )
+
+            rollout_sampling_seed = torch.full(
+                (batch_size,), -1, dtype=torch.int64, device=idx.device
+            )
+            if expanded_sampling_seeds is not None:
+                if len(expanded_sampling_seeds) != batch_size:
+                    raise RuntimeError(
+                        "expanded deterministic seed count does not match vLLM output batch"
+                    )
+                rollout_sampling_seed = torch.tensor(
+                    expanded_sampling_seeds, dtype=torch.int64, device=idx.device
+                )
 
             seq = torch.cat([idx, response], dim=-1)
 
@@ -343,6 +446,7 @@ class vLLMRollout(BaseRollout):
                 "responses": response,
                 "input_ids": seq,  # here input_ids become the whole sentences
                 'rollout_log_probs': rollout_log_probs, # we will recompute old log prob with actor
+                "rollout_sampling_seed": rollout_sampling_seed,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },

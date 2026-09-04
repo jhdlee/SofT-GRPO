@@ -65,8 +65,8 @@ class _RecordingCausalModel(nn.Module):
         return SimpleNamespace(logits=self.lm_head(hidden[:, logits_to_keep, :]))
 
 
-def _replay(*, gate="all"):
-    config = OPDConfig(trajectory_gate=gate)
+def _replay(*, gate="all", loss_support="latent_only"):
+    config = OPDConfig(trajectory_gate=gate, loss_support=loss_support)
     return PrivilegedReplay(_RecordingCausalModel(), _Tokenizer(), config)
 
 
@@ -202,3 +202,57 @@ def test_positive_advantage_gate_rejects_misaligned_advantages():
             advantages=torch.randn(2, 2, 2),
             latent_support_ids=torch.tensor([[0, 1], [1, 2]]),
         )
+
+
+@pytest.mark.parametrize(
+    ("gate", "expected_selected"),
+    [("all", 5), ("positive_advantage", 3)],
+)
+def test_all_response_replay_splits_latent_and_answer_kl_with_one_denominator(
+    gate,
+    expected_selected,
+):
+    replay = _replay(gate=gate, loss_support="all_response")
+    torch.manual_seed(23)
+    student_logits = torch.randn(5, 11, requires_grad=True)
+    teacher_logits = torch.randn(5, 11, requires_grad=True)
+    latent_mask = torch.tensor([[True, True, False], [True, False, False]])
+    answer_mask = torch.tensor([[False, False, True], [False, True, False]])
+    objective_mask = latent_mask | answer_mask
+    advantages = torch.tensor([[2.0, 2.0, 2.0], [-1.0, -1.0, 0.0]])
+    latent_support_ids = torch.tensor(
+        [[0, 1, 2], [1, 2, 3], [2, 3, 4]],
+    )
+
+    result = replay.loss_from_teacher_logits(
+        student_logits=student_logits,
+        student_query_indices=torch.arange(5),
+        teacher_logits=teacher_logits,
+        teacher_seconds=0.5,
+        latent_mask=latent_mask,
+        objective_mask=objective_mask,
+        answer_mask=answer_mask,
+        advantages=advantages,
+        latent_support_ids=latent_support_ids,
+    )
+
+    per_slot = full_vocab_kl(student_logits, teacher_logits)
+    gate_mask = torch.ones(5, dtype=torch.bool)
+    if gate == "positive_advantage":
+        gate_mask[3:] = False
+    flat_latent = latent_mask[objective_mask]
+    flat_answer = answer_mask[objective_mask]
+    torch.testing.assert_close(result.kl_sum, per_slot[gate_mask].sum())
+    torch.testing.assert_close(
+        result.latent_kl_sum, per_slot[gate_mask & flat_latent].sum()
+    )
+    torch.testing.assert_close(
+        result.answer_kl_sum, per_slot[gate_mask & flat_answer].sum()
+    )
+    assert result.denominator_slots == 5
+    assert result.latent_slots == 3
+    assert result.answer_slots == 2
+    assert result.selected_slots == expected_selected
+    assert result.opd_support_gradient.shape == (3, 3)
+    assert result.student_support_logits.shape == (3, 3)
+    assert teacher_logits.grad is None

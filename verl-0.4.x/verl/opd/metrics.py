@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Union
 
-from .config import OPDConfig
+from .config import ObjectiveMode, OPDConfig, ScheduleType
 from .schedule import effective_beta, schedule_multiplier, warmup_iterations
 
 PRIMARY_STEP_METRIC = "trainer/rollout_iteration"
@@ -21,10 +21,14 @@ ITERATION_METRICS = frozenset(
         "train/nonzero_advantage_group_fraction",
         "loss/grpo",
         "loss/native_ref_kl",
+        "loss/opd_kl_latent",
+        "loss/opd_kl_answer",
         "loss/opd_kl_unweighted",
         "loss/opd_weighted",
         "loss/total",
+        "algorithm/objective_mode",
         "opd/beta_base",
+        "opd/loss_support",
         "opd/warmup_fraction",
         "opd/warmup_iterations",
         "opd/schedule_multiplier",
@@ -32,6 +36,9 @@ ITERATION_METRICS = frozenset(
         "opd/teacher_type",
         "opd/teacher_student_param_rms",
         "opd/ema_update_count",
+        "opd/latent_slot_count",
+        "opd/answer_slot_count",
+        "opd/selected_slot_fraction",
         "ppo/ratio_mean",
         "ppo/ratio_p95",
         "ppo/clip_fraction",
@@ -66,11 +73,32 @@ ITERATION_METRICS = frozenset(
     }
 )
 
+# Standalone OPD has no grouped reward optimization, frozen-reference anchor,
+# advantages, or PPO ratio.  These fields must be absent rather than populated
+# with synthetic zeroes.  Keep ``ITERATION_METRICS`` as the auxiliary-mode
+# compatibility contract used by existing callers.
+STANDALONE_INAPPLICABLE_METRICS = frozenset(
+    {
+        "train/nonzero_advantage_group_fraction",
+        "loss/grpo",
+        "loss/native_ref_kl",
+        "ppo/ratio_mean",
+        "ppo/ratio_p95",
+        "ppo/clip_fraction",
+        "ppo/approx_kl",
+        "grad/grpo_norm",
+        "grad/grpo_opd_cosine",
+    }
+)
+STANDALONE_ITERATION_METRICS = ITERATION_METRICS - STANDALONE_INAPPLICABLE_METRICS
+
 VALIDATION_METRICS = frozenset(
     {
         PRIMARY_STEP_METRIC,
         "val/math_verify/mean_at_1",
+        "val/math_verify/pass_at_1",
         "val/released_reward/mean_at_1",
+        "val/released_reward/pass_at_1",
         "val/response_length_mean",
         "val/latent_length_mean",
         "val/cap_rate",
@@ -79,7 +107,28 @@ VALIDATION_METRICS = frozenset(
 )
 
 FORBIDDEN_METRICS = frozenset({"opd/kl_weight"})
-STRING_METRICS = frozenset({"opd/teacher_type", "grad/diagnostic_space"})
+STRING_METRICS = frozenset(
+    {
+        "algorithm/objective_mode",
+        "opd/loss_support",
+        "opd/teacher_type",
+        "grad/diagnostic_space",
+    }
+)
+
+
+def required_iteration_metrics(
+    mode: Union[ObjectiveMode, str],
+) -> frozenset[str]:
+    """Return the fail-closed W&B contract for an objective mode."""
+
+    try:
+        objective_mode = ObjectiveMode(mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unknown OPD objective mode: {mode!r}") from exc
+    if objective_mode is ObjectiveMode.STANDALONE:
+        return STANDALONE_ITERATION_METRICS
+    return ITERATION_METRICS
 
 
 def validate_resource_limits(
@@ -127,14 +176,43 @@ def opd_schedule_metrics(config: OPDConfig, rollout_iteration: int, total_iterat
             schedule=config.schedule,
             warmup_fraction=config.warmup_fraction,
         )
+    resolved_warmup = 0
+    if config.schedule is not ScheduleType.CONSTANT:
+        resolved_warmup = warmup_iterations(total_iterations, config.warmup_fraction)
     return {
+        "algorithm/objective_mode": config.mode.value,
         "opd/beta_base": config.beta_base,
+        "opd/loss_support": config.loss_support.value,
         "opd/warmup_fraction": config.warmup_fraction,
-        "opd/warmup_iterations": warmup_iterations(total_iterations, config.warmup_fraction),
+        "opd/warmup_iterations": resolved_warmup,
         "opd/schedule_multiplier": multiplier,
         "opd/beta_effective": effective_beta(config, rollout_iteration, total_iterations),
         "opd/teacher_type": config.teacher.type.value,
     }
+
+
+def validation_pass_at_1_aliases(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Return pass@1 aliases for canonical one-sample validation means.
+
+    With exactly one response per validation example, mean@1 and pass@1 are
+    the same estimator.  This helper does not trigger another generation; it
+    copies each available canonical mean and rejects contradictory preexisting
+    aliases.
+    """
+
+    aliases: dict[str, Any] = {}
+    for stem in ("val/math_verify", "val/released_reward"):
+        mean_name = f"{stem}/mean_at_1"
+        pass_name = f"{stem}/pass_at_1"
+        if mean_name not in metrics:
+            continue
+        mean_value = metrics[mean_name]
+        if pass_name in metrics and float(metrics[pass_name]) != float(mean_value):
+            raise ValueError(
+                f"validation pass@1 alias {pass_name!r} disagrees with {mean_name!r}"
+            )
+        aliases[pass_name] = mean_value
+    return aliases
 
 
 def validate_metric_payload(

@@ -2,10 +2,12 @@ import pytest
 import torch
 
 from verl.opd import (
+    categorical_suffix_mask,
     ddp_scaled_local_loss,
     full_vocab_kl,
     latent_kl_sum_and_count,
     latent_mask_from_topk_support,
+    opd_loss_support_mask,
     safe_mean_from_sum,
 )
 
@@ -69,6 +71,102 @@ def test_latent_mask_uses_released_categorical_support_sentinel():
     )
     expected = torch.tensor([[True, False, True, False]])
     assert torch.equal(latent_mask_from_topk_support(response_mask, supports), expected)
+
+
+def test_latent_only_loss_support_is_exact_compatibility_alias():
+    response_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+    supports = torch.tensor(
+        [[[4, 3, 2], [9, 0, 0], [7, 6, 5], [8, 0, 0]]]
+    )
+
+    expected = latent_mask_from_topk_support(response_mask, supports)
+    actual = opd_loss_support_mask(response_mask, supports)
+    assert torch.equal(actual, expected)
+
+
+def test_all_response_mask_is_action_aligned_and_excludes_close_transition():
+    # Positions: two continuous actions, categorical </think>, two sampled
+    # categorical answer actions, then padding.  The mask labels response
+    # actions whose causal prediction logits receive OPD KL.
+    responses = torch.tensor([[4, 5, 99, 7, 8, 0]])
+    response_mask = torch.tensor([[1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+    supports = torch.tensor(
+        [[
+            [4, 2, 3],
+            [5, 6, 7],
+            [99, 0, 0],
+            [7, 0, 0],
+            [8, 0, 0],
+            [0, 0, 0],
+        ]]
+    )
+
+    suffix = categorical_suffix_mask(response_mask, supports, responses, 99)
+    combined = opd_loss_support_mask(
+        response_mask,
+        supports,
+        loss_support="all_response",
+        responses=responses,
+        close_tag_token_id=99,
+    )
+
+    assert torch.equal(
+        suffix,
+        torch.tensor([[False, False, False, True, True, False]]),
+    )
+    assert torch.equal(
+        combined,
+        torch.tensor([[True, True, False, True, True, False]]),
+    )
+
+
+def test_all_response_mask_supports_capped_all_soft_trajectory():
+    responses = torch.tensor([[4, 5, 6, 0]])
+    response_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+    supports = torch.tensor(
+        [[[4, 2, 3], [5, 6, 7], [6, 4, 8], [0, 0, 0]]]
+    )
+
+    suffix = categorical_suffix_mask(response_mask, supports, responses, 99)
+    combined = opd_loss_support_mask(
+        response_mask,
+        supports,
+        loss_support="all_response",
+        responses=responses,
+        close_tag_token_id=99,
+    )
+
+    assert not suffix.any()
+    assert torch.equal(combined, response_mask)
+
+
+def test_all_response_mask_excludes_mode_metadata_violations():
+    # Categorical before close and continuous after close are neither valid
+    # pre-close latent actions nor valid post-close categorical answer actions.
+    responses = torch.tensor([[4, 5, 99, 7, 8]])
+    response_mask = torch.ones_like(responses, dtype=torch.bool)
+    supports = torch.tensor(
+        [[[4, 2, 3], [5, 0, 0], [99, 0, 0], [7, 6, 5], [8, 0, 0]]]
+    )
+
+    combined = opd_loss_support_mask(
+        response_mask,
+        supports,
+        loss_support="all_response",
+        responses=responses,
+        close_tag_token_id=99,
+    )
+    assert torch.equal(
+        combined,
+        torch.tensor([[True, False, False, False, True]]),
+    )
+
+
+def test_all_response_mask_requires_boundary_metadata():
+    response_mask = torch.ones(1, 2, dtype=torch.bool)
+    supports = torch.tensor([[[4, 3], [5, 6]]])
+    with pytest.raises(ValueError, match="required for all_response"):
+        opd_loss_support_mask(response_mask, supports, loss_support="all_response")
 
 
 def test_positive_gate_preserves_all_latent_slot_denominator():

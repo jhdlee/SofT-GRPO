@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     "Usage:" \
-    "  ${0##*/} generate {initial|baseline|opd} MODEL_PATH {native_soft|hard_token} [generate_eval options...]" \
+    "  ${0##*/} generate MODEL_LABEL MODEL_PATH {native_soft|hard_token} [generate_eval options...]" \
     "  ${0##*/} aggregate [aggregate_eval options...]" >&2
 }
 
@@ -54,7 +54,8 @@ case "${COMMAND}" in
       --mode "${MODE}" \
       --data-dir "${DATA_ROOT}" \
       --output-dir "${EVALUATION_ROOT}" \
-      --num-gpus "${SLURM_GPUS_ON_NODE:-8}" \
+      --tensor-parallel-size "${OPD_EVAL_TENSOR_PARALLEL_SIZE:-1}" \
+      --data-parallel-size "${OPD_EVAL_DATA_PARALLEL_SIZE:-${SLURM_GPUS_ON_NODE:-1}}" \
       "$@"
     ;;
   aggregate)

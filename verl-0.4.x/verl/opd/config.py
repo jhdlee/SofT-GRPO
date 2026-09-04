@@ -14,8 +14,19 @@ class _StringEnum(str, Enum):
 
 
 class ScheduleType(_StringEnum):
+    CONSTANT = "constant"
     WARMUP_CONSTANT = "warmup_constant"
     WARMUP_DECAY = "warmup_decay"
+
+
+class ObjectiveMode(_StringEnum):
+    AUXILIARY = "auxiliary"
+    STANDALONE = "standalone"
+
+
+class LossSupport(_StringEnum):
+    LATENT_ONLY = "latent_only"
+    ALL_RESPONSE = "all_response"
 
 
 class TeacherType(_StringEnum):
@@ -105,6 +116,10 @@ class OPDConfig:
     trajectory_gate: TrajectoryGate = TrajectoryGate.ALL
     prompt_template: PromptTemplate = PromptTemplate.SDPG
     temperature: float = 1.0
+    # New fields are appended so positional construction using the historical
+    # field order remains source compatible. New callers should use keywords.
+    mode: ObjectiveMode = ObjectiveMode.AUXILIARY
+    loss_support: LossSupport = LossSupport.LATENT_ONLY
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
@@ -125,6 +140,12 @@ class OPDConfig:
             raise ValueError(f"temperature must be positive; got {temperature}")
         object.__setattr__(self, "temperature", temperature)
 
+        object.__setattr__(self, "mode", _as_enum(self.mode, ObjectiveMode, "mode"))
+        object.__setattr__(
+            self,
+            "loss_support",
+            _as_enum(self.loss_support, LossSupport, "loss_support"),
+        )
         object.__setattr__(self, "schedule", _as_enum(self.schedule, ScheduleType, "schedule"))
         object.__setattr__(self, "kl_direction", _as_enum(self.kl_direction, KLDirection, "kl_direction"))
         object.__setattr__(
@@ -160,6 +181,8 @@ class OPDConfig:
         allowed = {
             "enabled",
             "beta_base",
+            "mode",
+            "loss_support",
             "schedule",
             "warmup_fraction",
             "teacher",

@@ -263,7 +263,9 @@ algorithm:
   opd:
     enabled: true
     beta_base: 0.001
-    schedule: warmup_constant  # [warmup_constant, warmup_decay]
+    mode: auxiliary  # [auxiliary, standalone]
+    loss_support: latent_only  # [latent_only, all_response]
+    schedule: warmup_constant  # [constant, warmup_constant, warmup_decay]
     warmup_fraction: 0.10
     teacher:
       type: ema  # [ema, current_actor, frozen_initial]
@@ -303,7 +305,11 @@ trainer:
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
   checkpoint_best_metric: val/math_verify/mean_at_1
+  checkpoint_best_tiebreak_metric: val/released_reward/mean_at_1
   checkpoint_best_mode: max
+  # Fixed namespace reused at every validation event for paired trajectories.
+  validation_seed: ${data.seed}
+  validation_seed_iteration: 0
   checkpoint_max_seconds: 720
   # Optional file touched by a Slurm signal handler. It is polled only after a
   # complete rollout iteration, then forces a committed checkpoint and a clean
@@ -327,6 +333,12 @@ trainer:
     min_soft_to_hard_rate: 0.95
     min_categorical_boxed_answer_rate: 0.95
     max_replay_ratio_abs_error: 1.0e-4
+    # Optional post-update smoke gate, evaluated only once the OPD schedule is
+    # at full dose. Production and non-primary smoke arms leave this disabled.
+    full_dose_gradient_gate_enabled: false
+    min_opd_grpo_support_gradient_ratio: 0.1
+    max_opd_grpo_support_gradient_ratio: 10.0
+    max_full_dose_gradient_clip_fraction: 0.5
 
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.

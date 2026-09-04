@@ -494,6 +494,10 @@ class ActorRolloutRefWorker(Worker):
             resolve=True,
         )
         self.opd_config = OPDConfig.from_mapping(opd_mapping)
+        if self.opd_config.active and not bool(
+            self.config.rollout.get("enable_soft_thinking", True)
+        ):
+            raise RuntimeError("active OPD requires rollout.enable_soft_thinking=true")
         self.opd_teacher_module_fsdp = None
         self.opd_checkpoint_manager = None
 
@@ -638,6 +642,9 @@ class ActorRolloutRefWorker(Worker):
         data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
+        data.meta_info["continuous_replay"] = bool(
+            self.config.rollout.get("enable_soft_thinking", True)
+        )
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
@@ -736,6 +743,9 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info['add_noise_dirichlet'] = self.config.rollout.add_noise_dirichlet
         data.meta_info['add_noise_gumbel_softmax'] = self.config.rollout.add_noise_gumbel_softmax
+        data.meta_info["continuous_replay"] = bool(
+            self.config.rollout.get("enable_soft_thinking", True)
+        )
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
@@ -782,6 +792,9 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info['add_noise_dirichlet'] = self.config.rollout.add_noise_dirichlet
         data.meta_info['add_noise_gumbel_softmax'] = self.config.rollout.add_noise_gumbel_softmax
+        data.meta_info["continuous_replay"] = bool(
+            self.config.rollout.get("enable_soft_thinking", True)
+        )
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)

@@ -8,12 +8,19 @@ from opd_tools.evaluation import (
     BOOTSTRAP_RESAMPLES,
     COMMON_GENERATION_SEEDS,
     HARD_TOKEN_GENERATION_SEEDS,
+    EVALUATION_CELLS,
+    MODEL_LABELS,
+    PAIRED_COMPARISONS,
     GenerationRecord,
     correctness_by_example,
     evaluation_request_seed,
     example_level_metric,
+    graders_for_benchmark,
+    generation_seeds_sha256,
     paired_bootstrap_difference,
     pass_at_k,
+    validate_evaluation_cell,
+    validate_generation_seed_manifest,
 )
 from opd_tools.generate_eval import (
     EVALUATION_SAMPLING_PROTOCOLS,
@@ -26,6 +33,7 @@ from opd_tools.generate_eval import (
     expected_sampling_source,
     native_soft_diagnostics,
     required_context_length,
+    required_source_identity,
     resolve_parallelism,
 )
 
@@ -42,11 +50,11 @@ def generation_record(**overrides):
             COMMON_GENERATION_SEEDS[0], "math500", "math500-0"
         ),
         "response": "reasoning</think>\\boxed{1}",
-        "response_token_count": 3,
+        "response_token_count": 4,
         "finish_reason": "stop",
         "capped": False,
         "latent_token_count": 2,
-        "hard_token_count": 1,
+        "hard_token_count": 2,
         "close_tag": True,
         "soft_to_hard": True,
         "all_soft": False,
@@ -60,6 +68,26 @@ def generation_record(**overrides):
 
 
 class EvaluationFormulaTests(unittest.TestCase):
+    def test_generation_requires_sealed_full_source_commits(self):
+        self.assertEqual(
+            required_source_identity(
+                {
+                    "OPD_PARENT_COMMIT": "a" * 40,
+                    "OPD_SUBMODULE_COMMIT": "b" * 40,
+                }
+            ),
+            {"parent_commit": "a" * 40, "fork_commit": "b" * 40},
+        )
+        with self.assertRaisesRegex(RuntimeError, "parent_commit"):
+            required_source_identity({"OPD_SUBMODULE_COMMIT": "b" * 40})
+        with self.assertRaisesRegex(RuntimeError, "fork_commit"):
+            required_source_identity(
+                {
+                    "OPD_PARENT_COMMIT": "a" * 40,
+                    "OPD_SUBMODULE_COMMIT": "not-a-commit",
+                }
+            )
+
     def test_mode_specific_upstream_sampler_provenance(self):
         self.assertEqual(
             expected_sampling_source("native_soft", "released_anchor"),
@@ -80,7 +108,7 @@ class EvaluationFormulaTests(unittest.TestCase):
 
     def test_locked_common_seed_inventory(self):
         self.assertEqual(COMMON_GENERATION_SEEDS, tuple(range(11, 43)))
-        self.assertEqual(HARD_TOKEN_GENERATION_SEEDS, (11,))
+        self.assertEqual(HARD_TOKEN_GENERATION_SEEDS, COMMON_GENERATION_SEEDS)
         seeds = {
             evaluation_request_seed(seed, "math500", "example")
             for seed in COMMON_GENERATION_SEEDS
@@ -94,6 +122,18 @@ class EvaluationFormulaTests(unittest.TestCase):
             evaluation_request_seed(11, "math500", "example"),
             evaluation_request_seed(11, "math500", "other"),
         )
+
+    def test_generation_seed_manifest_hash_detects_tampering(self):
+        manifest = {
+            "generation_seeds": list(COMMON_GENERATION_SEEDS),
+            "generation_seeds_sha256": generation_seeds_sha256(
+                COMMON_GENERATION_SEEDS
+            ),
+        }
+        validate_generation_seed_manifest(manifest, COMMON_GENERATION_SEEDS)
+        manifest["generation_seeds_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "seed hash mismatch"):
+            validate_generation_seed_manifest(manifest, COMMON_GENERATION_SEEDS)
 
     def test_pass_at_k_exact_boundaries(self):
         self.assertEqual(pass_at_k(32, 0, 8), 0.0)
@@ -110,6 +150,28 @@ class EvaluationFormulaTests(unittest.TestCase):
         passes = example_level_metric(outcomes, "pass_at_32")
         self.assertEqual(means, {"a": 1 / 32, "b": 0.0})
         self.assertEqual(passes, {"a": 1.0, "b": 0.0})
+
+    def test_sparse_starting_plus_seven_arm_evaluation_matrix(self):
+        self.assertEqual(len(MODEL_LABELS), 8)
+        self.assertEqual(len(EVALUATION_CELLS), 8)
+        self.assertEqual(EVALUATION_CELLS[0], ("initial", "native_soft"))
+        self.assertIn(("hardgrpo_math_s11", "hard_token"), EVALUATION_CELLS)
+        self.assertEqual(
+            sum(mode == "native_soft" for _, mode in EVALUATION_CELLS), 7
+        )
+        with self.assertRaisesRegex(ValueError, "must use"):
+            validate_evaluation_cell("initial", "hard_token")
+        with self.assertRaisesRegex(ValueError, "must use"):
+            validate_evaluation_cell("hardgrpo_math_s11", "native_soft")
+        self.assertEqual(len(PAIRED_COMPARISONS), 8)
+        self.assertEqual(
+            graders_for_benchmark("math500"),
+            ("math_verify", "released_last_boxed"),
+        )
+        self.assertEqual(
+            graders_for_benchmark("aime2024"),
+            ("math_verify", "released_last_boxed"),
+        )
 
     def test_pairing_requires_exact_common_seed_set(self):
         rows = [
@@ -153,10 +215,46 @@ class EvaluationSchemaTests(unittest.TestCase):
     def test_generation_record_round_trip_and_unknown_field_rejection(self):
         record = generation_record()
         self.assertEqual(GenerationRecord.from_mapping(record.to_dict()), record)
+        self.assertTrue(record.boundary_valid)
         bad = record.to_dict()
         bad["unexpected"] = 1
         with self.assertRaisesRegex(ValueError, "unknown"):
             GenerationRecord.from_mapping(bad)
+
+    def test_native_soft_boundary_requires_boxed_categorical_suffix(self):
+        self.assertFalse(
+            generation_record(
+                response="latent \\boxed{1}</think>plain suffix",
+            ).boundary_valid
+        )
+        self.assertFalse(
+            generation_record(
+                response="latent \\boxed{1}",
+                response_token_count=3,
+                close_tag=False,
+                soft_to_hard=False,
+                latent_token_count=3,
+                hard_token_count=0,
+                all_soft=True,
+            ).boundary_valid
+        )
+
+    def test_hard_token_boundary_is_not_subject_to_native_soft_gate(self):
+        record = generation_record(
+            model_label="hardgrpo_math_s11",
+            inference_mode="hard_token",
+            response="plain categorical response",
+            response_token_count=3,
+            latent_token_count=0,
+            hard_token_count=3,
+            close_tag=False,
+            soft_to_hard=False,
+            all_soft=False,
+            mixture_entropy_mean=None,
+            top1_weight_mean=None,
+            soft_hard_agreement=None,
+        )
+        self.assertTrue(record.boundary_valid)
 
     def test_generation_shard_is_atomic_and_authenticated(self):
         record = generation_record()
@@ -206,7 +304,9 @@ class EvaluationSchemaTests(unittest.TestCase):
     def test_hard_token_schema_rejects_latent_diagnostics(self):
         with self.assertRaisesRegex(ValueError, "hard-token"):
             generation_record(
+                model_label="hardgrpo_math_s11",
                 inference_mode="hard_token",
+                response_token_count=3,
                 latent_token_count=0,
                 hard_token_count=3,
                 soft_to_hard=False,
@@ -234,10 +334,19 @@ class EvaluationSchemaTests(unittest.TestCase):
     def test_released_and_training_matched_sampling_are_not_ambiguous(self):
         released = EVALUATION_SAMPLING_PROTOCOLS["released_anchor"]
         matched = EVALUATION_SAMPLING_PROTOCOLS["training_matched"]
+        production_soft = EVALUATION_SAMPLING_PROTOCOLS["production_native_soft"]
         self.assertEqual((released["top_k"], released["max_new_tokens"]), (30, 32768))
         self.assertEqual(
             (matched["top_k"], matched["gumbel_softmax_temperature"]),
             (5, 0.1),
+        )
+        self.assertEqual(
+            (
+                production_soft["top_k"],
+                production_soft["gumbel_softmax_temperature"],
+                production_soft["max_new_tokens"],
+            ),
+            (5, 0.1, 32_768),
         )
 
     def test_paper_anchor_uses_data_parallel_whole_node(self):

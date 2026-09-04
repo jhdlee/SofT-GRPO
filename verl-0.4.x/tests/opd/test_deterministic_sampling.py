@@ -1,8 +1,11 @@
+import ast
 import importlib.util
 import sys
 import types
 from pathlib import Path
+from typing import Any, Dict, List, Union
 
+import numpy as np
 import torch
 
 SGLANG_PYTHON = (
@@ -42,6 +45,35 @@ assert seed_spec.loader is not None
 seed_spec.loader.exec_module(seed_module)
 build_request_sampling_params = seed_module.build_request_sampling_params
 expand_parallel_seeds = seed_module.expand_parallel_seeds
+
+VLLM_ROLLOUT = (
+    Path(__file__).resolve().parents[2]
+    / "verl"
+    / "workers"
+    / "rollout"
+    / "vllm_rollout"
+    / "vllm_rollout_spmd.py"
+)
+
+
+def _load_vllm_repeat_helper():
+    parsed = ast.parse(VLLM_ROLLOUT.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_repeat_interleave", "_repeat_non_tensor_batch"}
+    ]
+    namespace = {
+        "Any": Any,
+        "Dict": Dict,
+        "List": List,
+        "Union": Union,
+        "np": np,
+        "torch": torch,
+    }
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(VLLM_ROLLOUT), "exec"), namespace)
+    return namespace["_repeat_non_tensor_batch"]
 
 
 def test_seed_derivation_is_stable_and_identity_sensitive():
@@ -138,6 +170,25 @@ def test_parallel_params_are_unaliased_and_children_are_prompt_major():
         derive_parallel_seed(202, 2),
     ]
     assert actual == expected
+
+
+def test_vllm_g8_repeats_every_non_tensor_field_in_request_seed_order():
+    repeat_non_tensor_batch = _load_vllm_repeat_helper()
+    original = {
+        "index": np.array(["math-7", "math-9"], dtype=object),
+        "rollout_sample_index": np.array([0, 1], dtype=np.int64),
+        "extra_info": np.array([{"answer": "7"}, {"answer": "9"}], dtype=object),
+        "tools_kwargs": np.array([{"a": 1}, {"b": 2}], dtype=object),
+    }
+    repeated = repeat_non_tensor_batch(original, 8, expected_batch_size=2)
+    seeds = expand_parallel_seeds([101, 202], 8)
+
+    assert all(value.shape[0] == 16 for value in repeated.values())
+    assert repeated["index"].tolist() == ["math-7"] * 8 + ["math-9"] * 8
+    assert repeated["rollout_sample_index"].tolist() == [0] * 8 + [1] * 8
+    assert len(seeds) == len(repeated["index"])
+    assert seeds[:8] == expand_parallel_seeds([101], 8)
+    assert seeds[8:] == expand_parallel_seeds([202], 8)
 
 
 def test_request_seed_includes_iteration_identity_prompt_and_external_sample():

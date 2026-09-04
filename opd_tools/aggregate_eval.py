@@ -1,9 +1,10 @@
 """Grade, aggregate, bootstrap, and publish the final seed-11 evaluation.
 
-The command is intentionally strict: it refuses to report Mean@32 or pass@k
-unless initial, baseline, and OPD have exactly the same examples and common
-generation seeds.  Raw completions remain in scratch; only compact JSON/CSV
-reports and their authenticated manifest are uploaded to W&B.
+The command is intentionally strict: it refuses to report pass@k unless the
+starting checkpoint and all seven production arms have exactly the same
+examples and common generation seeds.  Each checkpoint has exactly one
+preregistered inference mode.  Raw completions remain in scratch; only compact
+JSON/CSV reports and their authenticated manifest are uploaded to W&B.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import io
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -27,16 +29,19 @@ from .evaluation import (
     BOOTSTRAP_RESAMPLES,
     BOOTSTRAP_SEED,
     COMMON_GENERATION_SEEDS,
+    EVALUATION_CELLS,
     EVALUATION_PROTOCOL,
     EXPECTED_EXAMPLE_COUNTS,
     HARD_TOKEN_GENERATION_SEEDS,
-    INFERENCE_MODES,
     MODEL_LABELS,
+    PAIRED_COMPARISONS,
     GenerationRecord,
     correctness_by_example,
     example_level_metric,
     graders_for_benchmark,
+    inference_mode_for_model,
     paired_bootstrap_difference,
+    validate_generation_seed_manifest,
 )
 from .generate_eval import (
     EVALUATION_SAMPLING_PROTOCOLS,
@@ -46,27 +51,70 @@ from .generate_eval import (
     _verify_shard,
     expected_engine_mode,
     expected_sampling_source,
+    required_source_identity,
 )
-from .graders import grade_gsm8k_interfaces, math_verify_full_response_grade
+from .graders import math_verify_full_response_grade, released_last_boxed_grade
 from .manifest import file_sha256
 
 
-REPORT_SCHEMA_VERSION = 1
-REPORT_PROTOCOL = "opd-softgrpo-seed11-report-v1"
+REPORT_SCHEMA_VERSION = 2
+REPORT_PROTOCOL = "opd-softgrpo-seven-arm-seed11-report-v2"
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def validate_common_source_identity(
+    manifests: Sequence[Mapping[str, Any]],
+    *,
+    expected_parent_commit: str | None = None,
+    expected_fork_commit: str | None = None,
+) -> Dict[str, str]:
+    """Require every generation cell to use one sealed source checkout."""
+
+    if not manifests:
+        raise ValueError("generation manifest inventory is empty")
+    observed: set[tuple[str, str]] = set()
+    for manifest in manifests:
+        parent = manifest.get("parent_commit")
+        fork = manifest.get("fork_commit")
+        if (
+            not isinstance(parent, str)
+            or _GIT_COMMIT_RE.fullmatch(parent) is None
+            or not isinstance(fork, str)
+            or _GIT_COMMIT_RE.fullmatch(fork) is None
+        ):
+            raise ValueError("generation manifest source commits are invalid")
+        observed.add((parent, fork))
+    if len(observed) != 1:
+        raise ValueError("generation jobs did not use one source identity")
+    parent, fork = observed.pop()
+    if (expected_parent_commit is None) != (expected_fork_commit is None):
+        raise ValueError("expected source identity must provide both commits")
+    if expected_parent_commit is not None and (
+        parent != expected_parent_commit or fork != expected_fork_commit
+    ):
+        raise ValueError("generation source identity differs from aggregation checkout")
+    return {"parent_commit": parent, "fork_commit": fork}
 
 
 def _score_record(value: Mapping[str, Any]) -> Dict[str, Any]:
     record = GenerationRecord.from_mapping(value)
-    if record.benchmark == "gsm8k_test":
-        interfaces = grade_gsm8k_interfaces(record.response, record.gold_answer)
-        scores = {name: bool(result["correct"]) for name, result in interfaces.items()}
+    if record.inference_mode == "native_soft" and not record.boundary_valid:
+        # A text decoder can expose a boxed hard shadow even when the continuous
+        # trajectory never crossed the released soft-to-hard boundary.  Such a
+        # response is a failed native-soft sample, not a correct hard fallback.
+        scores = {"math_verify": False, "released_last_boxed": False}
     else:
         scores = {
             "math_verify": bool(
                 math_verify_full_response_grade(
                     record.response, record.gold_answer
                 ).correct
-            )
+            ),
+            "released_last_boxed": bool(
+                released_last_boxed_grade(
+                    record.response, record.gold_answer
+                ).correct
+            ),
         }
     if set(scores) != set(graders_for_benchmark(record.benchmark)):
         raise AssertionError("grader inventory differs from the benchmark contract")
@@ -125,31 +173,51 @@ def _chunks(
 
 def expected_shards(input_dir: Path) -> list[tuple[Path, Path]]:
     result = []
-    for model in MODEL_LABELS:
-        for mode in INFERENCE_MODES:
-            seeds = (
-                COMMON_GENERATION_SEEDS
-                if mode == "native_soft"
-                else HARD_TOKEN_GENERATION_SEEDS
-            )
-            for benchmark in BENCHMARKS:
-                directory = input_dir / "raw" / model / mode / benchmark
-                for seed in seeds:
-                    data = directory / ("seed_%d.jsonl" % seed)
-                    result.append((data, data.with_suffix(".manifest.json")))
+    for model, mode in EVALUATION_CELLS:
+        seeds = (
+            COMMON_GENERATION_SEEDS
+            if mode == "native_soft"
+            else HARD_TOKEN_GENERATION_SEEDS
+        )
+        for benchmark in BENCHMARKS:
+            directory = input_dir / "raw" / model / mode / benchmark
+            for seed in seeds:
+                data = directory / ("seed_%d.jsonl" % seed)
+                result.append((data, data.with_suffix(".manifest.json")))
     return result
 
 
-def authenticate_input(input_dir: Path) -> Dict[str, Any]:
+def authenticate_input(
+    input_dir: Path,
+    *,
+    expected_parent_commit: str | None = None,
+    expected_fork_commit: str | None = None,
+) -> Dict[str, Any]:
     """Authenticate the exact shard inventory and generation configurations."""
 
     input_dir = input_dir.expanduser().resolve()
     expected = expected_shards(input_dir)
     expected_paths = {path.resolve() for pair in expected for path in pair}
+    expected_auxiliary_paths = {
+        (
+            input_dir / "raw" / model / mode / filename
+        ).resolve()
+        for model, mode in EVALUATION_CELLS
+        for filename in ("generation_manifest.json", "completion.json")
+    }
+    observed_auxiliary_paths = {
+        path.resolve()
+        for path in (input_dir / "raw").rglob("*")
+        if path.is_file()
+        and path.name in {"generation_manifest.json", "completion.json"}
+    }
+    if observed_auxiliary_paths != expected_auxiliary_paths:
+        raise ValueError("evaluation manifest/completion inventory differs")
     observed_paths = {
         path.resolve()
         for path in (input_dir / "raw").rglob("*")
-        if path.is_file() and path.name != "generation_manifest.json"
+        if path.is_file()
+        and path.name not in {"generation_manifest.json", "completion.json"}
     }
     if observed_paths != expected_paths:
         missing = sorted(str(path) for path in expected_paths - observed_paths)
@@ -175,31 +243,68 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
         )
 
     generation_manifests = []
-    for model in MODEL_LABELS:
-        for mode in INFERENCE_MODES:
-            path = input_dir / "raw" / model / mode / "generation_manifest.json"
-            if not path.is_file():
-                raise ValueError("missing generation manifest: %s" % path)
-            value = json.loads(path.read_text(encoding="utf-8"))
-            if (
-                value.get("evaluation_protocol") != EVALUATION_PROTOCOL
-                or value.get("model_label") != model
-                or value.get("mode") != mode
-                or value.get("benchmarks") != list(BENCHMARKS)
-            ):
-                raise ValueError("generation manifest differs from the report contract")
-            generation_manifests.append(
-                {
-                    "path": path.relative_to(input_dir).as_posix(),
-                    "sha256": file_sha256(path),
-                    "content": value,
-                }
-            )
+    for model, mode in EVALUATION_CELLS:
+        path = input_dir / "raw" / model / mode / "generation_manifest.json"
+        if not path.is_file():
+            raise ValueError("missing generation manifest: %s" % path)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            value.get("evaluation_protocol") != EVALUATION_PROTOCOL
+            or value.get("model_label") != model
+            or value.get("mode") != mode
+            or value.get("benchmarks") != list(BENCHMARKS)
+        ):
+            raise ValueError("generation manifest differs from the report contract")
+        generation_manifests.append(
+            {
+                "path": path.relative_to(input_dir).as_posix(),
+                "sha256": file_sha256(path),
+                "content": value,
+            }
+        )
+        completion_path = path.parent / "completion.json"
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        expected_data = {
+            data.relative_to(input_dir).as_posix(): _verify_shard(data, sidecar)
+            for data, sidecar in expected
+            if data.parents[1] == path.parent
+        }
+        completion_shards = completion.get("shards")
+        if not isinstance(completion_shards, list):
+            raise ValueError("generation completion has no shard inventory")
+        observed_data = {
+            item.get("path"): item
+            for item in completion_shards
+            if isinstance(item, Mapping)
+        }
+        if set(observed_data) != set(expected_data):
+            raise ValueError("generation completion shard inventory differs")
+        for relative, shard in expected_data.items():
+            item = observed_data[relative]
+            if any(item.get(key) != shard[key] for key in ("size", "sha256", "row_count")):
+                raise ValueError("generation completion shard hash differs")
+        expected_shard_count = len(BENCHMARKS) * len(COMMON_GENERATION_SEEDS)
+        expected_row_count = sum(EXPECTED_EXAMPLE_COUNTS.values()) * len(
+            COMMON_GENERATION_SEEDS
+        )
+        if (
+            completion.get("evaluation_protocol") != EVALUATION_PROTOCOL
+            or completion.get("generation_manifest_sha256") != file_sha256(path)
+            or completion.get("model_label") != model
+            or completion.get("mode") != mode
+            or completion.get("benchmarks") != list(BENCHMARKS)
+            or completion.get("sampling_protocol") != value.get("sampling_protocol")
+            or completion.get("shards_committed") != expected_shard_count
+            or completion.get("expected_shards") != expected_shard_count
+            or completion.get("rows_committed") != expected_row_count
+        ):
+            raise ValueError("generation completion differs from the report contract")
     sampling_protocols = {
         item["content"].get("sampling_protocol") for item in generation_manifests
     }
-    if len(sampling_protocols) != 1:
-        raise ValueError("models/modes used different evaluation sampling protocols")
+    expected_protocols = {"production_native_soft", "released_anchor"}
+    if sampling_protocols != expected_protocols:
+        raise ValueError("evaluation cells used the wrong sampling protocols")
     data_hashes = {
         item["content"].get("data_manifest_content_sha256")
         for item in generation_manifests
@@ -215,10 +320,14 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
             if content["mode"] == "native_soft"
             else list(HARD_TOKEN_GENERATION_SEEDS)
         )
-        if content.get("generation_seeds") != expected_seeds:
-            raise ValueError("generation manifest has the wrong common seed set")
+        validate_generation_seed_manifest(content, expected_seeds)
+        expected_protocol = (
+            "production_native_soft"
+            if content["mode"] == "native_soft"
+            else "released_anchor"
+        )
         if (
-            sampling_protocol not in EVALUATION_SAMPLING_PROTOCOLS
+            sampling_protocol != expected_protocol
             or content.get("sampling")
             != EVALUATION_SAMPLING_PROTOCOLS[sampling_protocol]
             or content.get("sampling_source")
@@ -234,12 +343,20 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
         ):
             raise ValueError("generation manifest has no model fingerprint")
         by_model[content["model_label"]].add(model["tree_sha256"])
-    if any(len(hashes) != 1 for hashes in by_model.values()):
-        raise ValueError("soft and hard modes did not use the same model export")
+    if set(by_model) != set(MODEL_LABELS) or any(
+        len(hashes) != 1 for hashes in by_model.values()
+    ):
+        raise ValueError("each evaluation label must use exactly one model export")
+    source_identity = validate_common_source_identity(
+        [item["content"] for item in generation_manifests],
+        expected_parent_commit=expected_parent_commit,
+        expected_fork_commit=expected_fork_commit,
+    )
     return {
         "input_dir": str(input_dir),
-        "sampling_protocol": sampling_protocols.pop(),
+        "sampling_protocols": sorted(sampling_protocols),
         "data_manifest_content_sha256": data_hashes.pop(),
+        "source_identity": source_identity,
         "generation_manifests": generation_manifests,
         "shards": shard_inventory,
     }
@@ -299,9 +416,8 @@ class _Accumulator:
     def validate(self) -> None:
         expected_groups = {
             (model, benchmark, mode, grader)
-            for model in MODEL_LABELS
+            for model, mode in EVALUATION_CELLS
             for benchmark in BENCHMARKS
-            for mode in INFERENCE_MODES
             for grader in graders_for_benchmark(benchmark)
         }
         if set(self.outcomes) != expected_groups:
@@ -403,107 +519,103 @@ def aggregate(
     metric_rows: list[Dict[str, Any]] = []
     example_metrics: Dict[tuple[str, str, str, str, str], Dict[str, float]] = {}
 
-    for model in MODEL_LABELS:
-        model_summary: Dict[str, Any] = {"benchmarks": {}}
+    for model, mode in EVALUATION_CELLS:
+        model_summary: Dict[str, Any] = {
+            "inference_mode": mode,
+            "benchmarks": {},
+        }
         summary["models"][model] = model_summary
         for benchmark in BENCHMARKS:
             benchmark_summary: Dict[str, Any] = {}
             model_summary["benchmarks"][benchmark] = benchmark_summary
-            for mode in INFERENCE_MODES:
-                behavior = accumulator.behavior[(model, benchmark, mode)]
-                behavior_summary = {
-                    "response_length_mean": _mean(behavior["response_length"]),
-                    "cap_rate": _mean(behavior["cap"]),
-                    "latent_length_mean": _mean(behavior["latent_length"]),
-                    "hard_answer_length_mean": _mean(behavior["hard_length"]),
-                    "close_tag_rate": _mean(behavior["close_tag"]),
-                    "soft_to_hard_rate": _mean(behavior["soft_to_hard"]),
-                    "all_soft_rate": _mean(behavior["all_soft"]),
-                    "mixture_entropy_mean": _mean(behavior["mixture_entropy"]),
-                    "top1_weight_mean": _mean(behavior["top1_weight"]),
-                    "soft_hard_agreement": _mean(behavior["soft_hard_agreement"]),
-                }
-                mode_summary: Dict[str, Any] = {
-                    **behavior_summary,
-                    "graders": {},
-                }
-                benchmark_summary[mode] = mode_summary
-                for grader in graders_for_benchmark(benchmark):
-                    outcomes = _ordered_outcomes(
-                        accumulator, model, benchmark, mode, grader
+            behavior = accumulator.behavior[(model, benchmark, mode)]
+            behavior_summary = {
+                "response_length_mean": _mean(behavior["response_length"]),
+                "cap_rate": _mean(behavior["cap"]),
+                "latent_length_mean": _mean(behavior["latent_length"]),
+                "hard_answer_length_mean": _mean(behavior["hard_length"]),
+                "close_tag_rate": _mean(behavior["close_tag"]),
+                "soft_to_hard_rate": _mean(behavior["soft_to_hard"]),
+                "all_soft_rate": _mean(behavior["all_soft"]),
+                "mixture_entropy_mean": _mean(behavior["mixture_entropy"]),
+                "top1_weight_mean": _mean(behavior["top1_weight"]),
+                "soft_hard_agreement": _mean(behavior["soft_hard_agreement"]),
+            }
+            mode_summary: Dict[str, Any] = {
+                **behavior_summary,
+                "graders": {},
+            }
+            benchmark_summary[mode] = mode_summary
+            for grader in graders_for_benchmark(benchmark):
+                outcomes = _ordered_outcomes(
+                    accumulator, model, benchmark, mode, grader
+                )
+                metric_names = (
+                    "pass_at_1",
+                    "pass_at_8",
+                    "pass_at_16",
+                    "pass_at_32",
+                )
+                values: Dict[str, float] = {}
+                for metric in metric_names:
+                    per_example = example_level_metric(outcomes, metric)
+                    example_metrics[(model, benchmark, mode, grader, metric)] = (
+                        per_example
                     )
-                    if mode == "native_soft":
-                        metric_names = (
-                            "mean_at_32",
-                            "pass_at_8",
-                            "pass_at_16",
-                            "pass_at_32",
-                        )
-                    else:
-                        metric_names = ("accuracy",)
-                    values: Dict[str, float] = {}
-                    for metric in metric_names:
-                        per_example = example_level_metric(outcomes, metric)
-                        example_metrics[(model, benchmark, mode, grader, metric)] = (
-                            per_example
-                        )
-                        values[metric] = float(np.mean(list(per_example.values())))
-                    mode_summary["graders"][grader] = values
-                    metric_rows.append(
-                        {
-                            "model": model,
-                            "benchmark": benchmark,
-                            "inference_mode": mode,
-                            "grader": grader,
-                            "example_count": len(outcomes),
-                            "sample_count": len(next(iter(outcomes.values()))),
-                            **{
-                                name: values.get(name)
-                                for name in (
-                                    "mean_at_32",
-                                    "pass_at_8",
-                                    "pass_at_16",
-                                    "pass_at_32",
-                                    "accuracy",
-                                )
-                            },
-                            **behavior_summary,
-                        }
-                    )
+                    values[metric] = float(np.mean(list(per_example.values())))
+                # Explicit estimator alias retained for readers comparing old
+                # reports. It is numerically identical to pass@1 here.
+                values["mean_sample_accuracy"] = values["pass_at_1"]
+                mode_summary["graders"][grader] = values
+                metric_rows.append(
+                    {
+                        "model": model,
+                        "benchmark": benchmark,
+                        "inference_mode": mode,
+                        "grader": grader,
+                        "example_count": len(outcomes),
+                        "sample_count": len(next(iter(outcomes.values()))),
+                        **{
+                            name: values.get(name)
+                            for name in (
+                                "pass_at_1",
+                                "pass_at_8",
+                                "pass_at_16",
+                                "pass_at_32",
+                                "mean_sample_accuracy",
+                            )
+                        },
+                        **behavior_summary,
+                    }
+                )
 
     comparison_rows: list[Dict[str, Any]] = []
-    comparisons = (
-        ("baseline", "initial"),
-        ("opd", "initial"),
-        ("opd", "baseline"),
-    )
-    for treatment, control in comparisons:
+    for treatment, control in PAIRED_COMPARISONS:
+        treatment_mode = inference_mode_for_model(treatment)
+        control_mode = inference_mode_for_model(control)
         for benchmark in BENCHMARKS:
-            for mode in INFERENCE_MODES:
-                for grader in graders_for_benchmark(benchmark):
-                    metric_names = (
-                        ("mean_at_32", "pass_at_8", "pass_at_16", "pass_at_32")
-                        if mode == "native_soft"
-                        else ("accuracy",)
+            for grader in graders_for_benchmark(benchmark):
+                for metric in ("pass_at_1", "pass_at_8", "pass_at_16", "pass_at_32"):
+                    result = paired_bootstrap_difference(
+                        example_metrics[
+                            (treatment, benchmark, treatment_mode, grader, metric)
+                        ],
+                        example_metrics[
+                            (control, benchmark, control_mode, grader, metric)
+                        ],
                     )
-                    for metric in metric_names:
-                        result = paired_bootstrap_difference(
-                            example_metrics[
-                                (treatment, benchmark, mode, grader, metric)
-                            ],
-                            example_metrics[(control, benchmark, mode, grader, metric)],
-                        )
-                        row = {
-                            "treatment": treatment,
-                            "control": control,
-                            "benchmark": benchmark,
-                            "inference_mode": mode,
-                            "grader": grader,
-                            "metric": metric,
-                            **result,
-                        }
-                        comparison_rows.append(row)
-                        summary["comparisons"].append(row)
+                    row = {
+                        "treatment": treatment,
+                        "control": control,
+                        "benchmark": benchmark,
+                        "treatment_inference_mode": treatment_mode,
+                        "control_inference_mode": control_mode,
+                        "grader": grader,
+                        "metric": metric,
+                        **result,
+                    }
+                    comparison_rows.append(row)
+                    summary["comparisons"].append(row)
     return summary, metric_rows, comparison_rows
 
 
@@ -553,21 +665,22 @@ def _flatten_wandb_metrics(
             row["grader"],
         )
         for name in (
-            "mean_at_32",
+            "pass_at_1",
             "pass_at_8",
             "pass_at_16",
             "pass_at_32",
-            "accuracy",
+            "mean_sample_accuracy",
         ):
             value = row.get(name)
             if value is not None:
                 result[prefix + "/" + name] = float(value)
     for row in comparison_rows:
-        prefix = "eval_difference/%s/%s_minus_%s/%s/%s/%s" % (
+        prefix = "eval_difference/%s/%s_minus_%s/%s_vs_%s/%s/%s" % (
             row["benchmark"],
             row["treatment"],
             row["control"],
-            row["inference_mode"],
+            row["treatment_inference_mode"],
+            row["control_inference_mode"],
             row["grader"],
             row["metric"],
         )
@@ -683,12 +796,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    input_manifest = authenticate_input(Path(args.input_dir))
+    source_identity = required_source_identity()
+    input_manifest = authenticate_input(
+        Path(args.input_dir),
+        expected_parent_commit=source_identity["parent_commit"],
+        expected_fork_commit=source_identity["fork_commit"],
+    )
     accumulator = score_input(
         input_manifest, workers=args.workers, chunk_size=args.chunk_size
     )
     summary, metric_rows, comparison_rows = aggregate(accumulator)
-    summary["sampling_protocol"] = input_manifest["sampling_protocol"]
+    summary["sampling_protocols"] = input_manifest["sampling_protocols"]
     manifest = write_report(
         output_dir=Path(args.output_dir),
         input_manifest=input_manifest,
