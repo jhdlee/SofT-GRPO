@@ -17,6 +17,7 @@ No full-vocabulary logits are written to disk.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -24,9 +25,10 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -1055,6 +1057,98 @@ class ReleasedSofTGRPOEngine:
         if len(outputs) != len(prompts):
             raise RuntimeError("SGLang changed the request/output cardinality")
         return list(outputs)
+
+    def generate_as_completed(
+        self,
+        prompts: Sequence[str],
+        seeds: Sequence[int],
+        *,
+        queue_size: int,
+    ) -> Iterator[tuple[int, Mapping[str, Any], float, float]]:
+        """Continuously feed bounded single requests to SGLang.
+
+        ``Engine.generate`` waits for the slowest member of a batch before the
+        caller can enqueue more work.  The asynchronous engine API avoids that
+        barrier: each completed request is replaced immediately while results
+        are yielded with their original input position.  Bounding the number
+        of live tasks also bounds prompt and response telemetry retained by the
+        Python frontend.
+        """
+
+        if not prompts or len(prompts) != len(seeds):
+            raise ValueError("prompts and seeds must be aligned and nonempty")
+        if (
+            isinstance(queue_size, bool)
+            or not isinstance(queue_size, int)
+            or queue_size <= 0
+        ):
+            raise ValueError("queue_size must be a positive integer")
+        params = [self.settings.request_params(int(seed)) for seed in seeds]
+
+        async def iter_completed():
+            pending: dict[asyncio.Task[Any], tuple[int, float]] = {}
+            next_index = 0
+
+            def submit(index: int) -> None:
+                submitted_at = time.perf_counter()
+                task = asyncio.create_task(
+                    self.engine.async_generate(
+                        prompt=prompts[index],
+                        sampling_params=params[index],
+                        return_logprob=True,
+                    )
+                )
+                pending[task] = (index, submitted_at)
+
+            try:
+                while next_index < len(prompts) and len(pending) < queue_size:
+                    submit(next_index)
+                    next_index += 1
+
+                while pending:
+                    done, _ = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # Stable processing order makes mocked and very short
+                    # requests deterministic without constraining scheduling.
+                    for task in sorted(done, key=lambda item: pending[item][0]):
+                        index, submitted_at = pending.pop(task)
+                        output = task.result()
+                        completed_at = time.perf_counter()
+                        if next_index < len(prompts):
+                            submit(next_index)
+                            next_index += 1
+                            # Start tokenization/submission before yielding to
+                            # synchronous parsing and durable persistence.
+                            await asyncio.sleep(0)
+                        if not isinstance(output, Mapping):
+                            raise RuntimeError(
+                                "SGLang returned a non-mapping completion"
+                            )
+                        yield index, output, submitted_at, completed_at
+            finally:
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+        loop = getattr(self, "_event_loop", None)
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            self._event_loop = loop
+        if loop.is_running():
+            raise RuntimeError(
+                "synchronous ICL generation requires a non-running event loop"
+            )
+        iterator = iter_completed()
+        try:
+            while True:
+                try:
+                    yield loop.run_until_complete(iterator.__anext__())
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.run_until_complete(iterator.aclose())
 
     def shutdown(self) -> None:
         self.engine.shutdown()

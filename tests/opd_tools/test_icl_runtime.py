@@ -1,3 +1,4 @@
+import asyncio
 import ast
 import json
 import sys
@@ -65,6 +66,52 @@ def test_engine_uses_replica_parallelism_with_round_robin(monkeypatch):
     assert captured["enable_soft_thinking"]
     engine.shutdown()
     assert captured["shutdown"]
+
+
+def test_engine_continuously_refills_bounded_async_request_queue():
+    class _AsyncEngine:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.calls = []
+
+        async def async_generate(
+            self, *, prompt, sampling_params, return_logprob
+        ):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append((prompt, sampling_params["seed"], return_logprob))
+            await asyncio.sleep(0.01 if prompt == "slow" else 0)
+            self.active -= 1
+            return {"text": prompt, "meta_info": {}}
+
+    backend = _AsyncEngine()
+    engine = object.__new__(ReleasedSofTGRPOEngine)
+    engine.settings = SamplingSettings(max_new_tokens=7)
+    engine.engine = backend
+    completions = engine.generate_as_completed(
+        ["slow", "fast-1", "fast-2", "fast-3"],
+        [10, 11, 12, 13],
+        queue_size=2,
+    )
+    first = next(completions)
+    assert len(backend.calls) == 3
+    results = [first, *completions]
+
+    assert backend.max_active == 2
+    assert [index for index, *_ in results][0] == 1
+    assert sorted((index, output["text"]) for index, output, *_ in results) == [
+        (0, "slow"),
+        (1, "fast-1"),
+        (2, "fast-2"),
+        (3, "fast-3"),
+    ]
+    assert sorted(backend.calls) == [
+        ("fast-1", 11, True),
+        ("fast-2", 12, True),
+        ("fast-3", 13, True),
+        ("slow", 10, True),
+    ]
 
 
 class _ReleasedTextTokenizer:

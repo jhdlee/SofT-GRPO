@@ -611,6 +611,7 @@ def test_public_cli_exposes_all_four_commands_and_output_overrides():
     assert generate.tensor_parallel_size == 1
     assert generate.data_parallel_size == 1
     assert generate.chunk_size == 64
+    assert generate.queue_size is None
     replay = parser.parse_args(
         [
             "replay",
@@ -662,6 +663,25 @@ def test_generate_cli_binds_tp_times_dp_to_slurm_allocation(monkeypatch):
     assert len(observed) == 1
     assert observed[0].tensor_parallel_size == 1
     assert observed[0].data_parallel_size == 8
+
+    with pytest.raises(ValueError, match="queue"):
+        cli.main(
+            [
+                "generate",
+                "--root",
+                "/scratch/root",
+                "--model",
+                "starting",
+                "--mode",
+                "native_soft",
+                "--tensor-parallel-size",
+                "1",
+                "--data-parallel-size",
+                "8",
+                "--queue-size",
+                "0",
+            ]
+        )
 
     with pytest.raises(RuntimeError, match="SLURM_GPUS_ON_NODE"):
         cli.main(

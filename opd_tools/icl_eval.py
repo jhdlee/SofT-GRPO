@@ -12,7 +12,6 @@ import hashlib
 import json
 import math
 import os
-import time
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -359,6 +358,11 @@ def run_generate(args: argparse.Namespace) -> None:
             "position requires %d positions, model supports %d"
             % (settings.max_new_tokens, context_length, maximum)
         )
+    queue_size = (
+        args.queue_size
+        if args.queue_size is not None
+        else 2 * args.data_parallel_size * args.max_running_requests
+    )
     config = {
         "protocol": "opd-softgrpo-native-soft-icl-generation-v3-math-aime-matched",
         "source_provenance": source_provenance(),
@@ -375,6 +379,7 @@ def run_generate(args: argparse.Namespace) -> None:
             "load_balance_method": "round_robin",
         },
         "chunk_size": args.chunk_size,
+        "request_queue_size": queue_size,
         "max_running_requests": args.max_running_requests,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "context_length": context_length,
@@ -411,10 +416,14 @@ def run_generate(args: argparse.Namespace) -> None:
             max_running_requests=args.max_running_requests,
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
+        queued_prompts = []
+        queued_seeds = []
+        queued_refs = []
+        pending_chunks = {}
         for cell, _, prompts, rendered in cell_payloads:
-            # Keep all common-random-number samples for a prompt chunk adjacent
-            # so each data-parallel replica can reuse the long ICL prefix in its
-            # radix cache. Chunk identities and request seeds remain unchanged.
+            # Arrange unfinished work in cell/chunk/sample-major order. This
+            # keeps shared prefixes adjacent while allowing one continuous
+            # queue to span every condition and benchmark in this invocation.
             for chunk_index, start in enumerate(
                 range(0, len(prompts), args.chunk_size)
             ):
@@ -429,18 +438,16 @@ def run_generate(args: argparse.Namespace) -> None:
                         sample_index,
                         chunk_index,
                     )
-                    identity = {
-                        "generation_manifest_sha256": hashlib.sha256(
-                            canonical_json_bytes(config)
-                        ).hexdigest(),
-                        "model_label": args.model,
-                        "mode": args.mode,
-                        "benchmark": cell.benchmark,
-                        "condition": cell.condition,
-                        "sample_index": sample_index,
-                        "chunk_index": chunk_index,
-                        "example_ids": [prompt.example_id for prompt in chunk_prompts],
-                    }
+                    identity = _generation_chunk_identity(
+                        config,
+                        model_label=args.model,
+                        inference_mode=args.mode,
+                        benchmark=cell.benchmark,
+                        condition=cell.condition,
+                        sample_index=sample_index,
+                        chunk_index=chunk_index,
+                        example_ids=[prompt.example_id for prompt in chunk_prompts],
+                    )
                     committed = store.resume_state(key, expected_identity=identity)
                     if committed is not None:
                         old_records, _ = store.load(key)
@@ -448,42 +455,93 @@ def run_generate(args: argparse.Namespace) -> None:
                         resumed = True
                         step += 1
                         continue
-                    seeds = [
-                        request_seed(cell.benchmark, prompt.example_id, sample_index)
-                        for prompt in chunk_prompts
-                    ]
-                    started = time.perf_counter()
-                    outputs = engine.generate(rendered[start:stop], seeds)
-                    records = []
-                    trajectories = []
-                    for row, (prompt, output) in enumerate(zip(chunk_prompts, outputs, strict=True)):
-                        record, trajectory = parse_sglang_completion(
-                            output=output,
-                            model_label=args.model,
-                            mode=args.mode,
-                            benchmark=cell.benchmark,
-                            condition=cell.condition,
-                            example_id=prompt.example_id,
-                            sample_index=sample_index,
-                            replay_row=row,
-                            settings=settings,
-                            think_end_id=think_end_id,
+                    pending_chunks[key] = {
+                        "key": key,
+                        "identity": identity,
+                        "cell": cell,
+                        "sample_index": sample_index,
+                        "records": [None] * len(chunk_prompts),
+                        "trajectories": [None] * len(chunk_prompts),
+                        "submitted_at": [None] * len(chunk_prompts),
+                        "completed_at": [None] * len(chunk_prompts),
+                        "remaining": len(chunk_prompts),
+                    }
+                    for row, prompt in enumerate(chunk_prompts):
+                        queued_prompts.append(rendered[start + row])
+                        queued_seeds.append(
+                            request_seed(
+                                cell.benchmark, prompt.example_id, sample_index
+                            )
                         )
-                        records.append(record)
-                        trajectories.append(trajectory)
-                    store.commit(key, records, trajectories, identity=identity)
-                    elapsed = max(time.perf_counter() - started, 1e-12)
-                    step += 1
-                    cell_records[(cell.benchmark, cell.condition)].extend(records)
-                    metrics = generation_chunk_metrics(records, elapsed_seconds=elapsed)
-                    metrics.update(
-                        {
-                            "generation/chunks_committed": step,
-                            "generation/sample_index": sample_index,
-                            "integrity/resumed": int(resumed),
-                        }
+                        queued_refs.append((key, row, prompt))
+
+        # Each completion is replaced in the SGLang queue before it is yielded
+        # for parsing and persistence, so CPU bookkeeping does not create a
+        # batch barrier. The queue drains only after the full invocation ends.
+        if queued_prompts:
+            completed = engine.generate_as_completed(
+                queued_prompts, queued_seeds, queue_size=queue_size
+            )
+            for request_index, output, submitted_at, completed_at in completed:
+                key, row, prompt = queued_refs[request_index]
+                state = pending_chunks[key]
+                if state["records"][row] is not None:
+                    raise RuntimeError("SGLang completed one queued request twice")
+                queued_cell = state["cell"]
+                sample_index = state["sample_index"]
+                record, trajectory = parse_sglang_completion(
+                    output=output,
+                    model_label=args.model,
+                    mode=args.mode,
+                    benchmark=queued_cell.benchmark,
+                    condition=queued_cell.condition,
+                    example_id=prompt.example_id,
+                    sample_index=sample_index,
+                    replay_row=row,
+                    settings=settings,
+                    think_end_id=think_end_id,
+                )
+                state["records"][row] = record
+                state["trajectories"][row] = trajectory
+                state["submitted_at"][row] = submitted_at
+                state["completed_at"][row] = completed_at
+                state["remaining"] -= 1
+                if state["remaining"]:
+                    continue
+
+                records = state["records"]
+                trajectories = state["trajectories"]
+                if any(value is None for value in records + trajectories):
+                    raise RuntimeError(
+                        "completed generation chunk contains an empty row"
                     )
-                    wandb_run.log(metrics, step=step)
+                store.commit(
+                    state["key"], records, trajectories, identity=state["identity"]
+                )
+                elapsed = max(
+                    max(state["completed_at"]) - min(state["submitted_at"]),
+                    1e-12,
+                )
+                step += 1
+                cell_records[
+                    (queued_cell.benchmark, queued_cell.condition)
+                ].extend(records)
+                metrics = generation_chunk_metrics(
+                    records, elapsed_seconds=elapsed
+                )
+                metrics.update(
+                    {
+                        "generation/chunks_committed": step,
+                        "generation/sample_index": sample_index,
+                        "generation/request_queue_size": queue_size,
+                        "generation/chunks_remaining": len(pending_chunks) - 1,
+                        "integrity/resumed": int(resumed),
+                    }
+                )
+                wandb_run.log(metrics, step=step)
+                del pending_chunks[key]
+        if pending_chunks:
+            raise RuntimeError("SGLang queue ended before every chunk completed")
 
         invalid_cells = []
         demonstrated_boundary_count = 0
@@ -2001,6 +2059,14 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--data-parallel-size", type=int, default=1)
     generate.add_argument("--chunk-size", type=int, default=64)
     generate.add_argument("--max-running-requests", type=int, default=16)
+    generate.add_argument(
+        "--queue-size",
+        type=int,
+        help=(
+            "maximum asynchronous requests kept in flight; defaults to twice "
+            "the aggregate data-parallel running-request capacity"
+        ),
+    )
     generate.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     generate.add_argument("--smoke", action="store_true")
     generate.set_defaults(handler=run_generate)
@@ -2039,8 +2105,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             or args.data_parallel_size <= 0
             or args.chunk_size <= 0
             or args.max_running_requests <= 0
+            or (args.queue_size is not None and args.queue_size <= 0)
         ):
-            raise ValueError("GPU, chunk, and running-request counts must be positive")
+            raise ValueError(
+                "GPU, chunk, queue, and running-request counts must be positive"
+            )
         if not 0.0 < args.gpu_memory_utilization < 1.0:
             raise ValueError("gpu-memory-utilization must be in (0, 1)")
         if "all" in args.benchmarks and args.benchmarks != ["all"]:
