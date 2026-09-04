@@ -102,8 +102,7 @@ def source_provenance() -> dict[str, Any]:
     repository = Path(__file__).resolve().parents[1]
     try:
         fork_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository,
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -128,16 +127,20 @@ def source_provenance() -> dict[str, Any]:
 
     try:
         superproject = subprocess.check_output(
-            ["git", "rev-parse", "--show-superproject-working-tree"],
-            cwd=repository,
+            [
+                "git",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--show-superproject-working-tree",
+            ],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
         if not superproject:
             raise RuntimeError("SofT-GRPO must run as the pinned parent submodule")
         parent_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=superproject,
+            ["git", "-C", superproject, "rev-parse", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()

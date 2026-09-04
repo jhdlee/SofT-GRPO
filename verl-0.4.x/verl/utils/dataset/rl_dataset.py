@@ -34,6 +34,15 @@ from verl.utils.model import compute_position_id_with_mask
 logger = logging.getLogger(__name__)
 
 
+def _dataset_filter_kwargs(num_workers: int) -> dict:
+    """Keep a one-worker filter in-process instead of spawning a manager."""
+    if num_workers < 1:
+        raise ValueError(f"filter_overlong_prompts_workers must be positive, got {num_workers}")
+    if num_workers == 1:
+        return {}
+    return {"num_proc": num_workers}
+
+
 def collate_fn(data_list: list[dict]) -> dict:
     """
     Collate a batch of sample dicts into batched tensors and arrays.
@@ -139,10 +148,11 @@ class RLHFDataset(Dataset):
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
+            filter_kwargs = _dataset_filter_kwargs(self.num_workers)
             self.dataframe = self.dataframe.filter(
                 lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
-                num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                **filter_kwargs,
             )
 
             print(f"filter dataset len: {len(self.dataframe)}")

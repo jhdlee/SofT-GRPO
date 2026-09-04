@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
+
+if "verl" not in sys.modules:
+    verl_package = types.ModuleType("verl")
+    verl_package.__path__ = [
+        str(Path(__file__).resolve().parents[2] / "verl-0.4.x" / "verl")
+    ]
+    sys.modules["verl"] = verl_package
 
 from opd_tools.select_checkpoint import resolve_selected_checkpoint
 from opd_tools.assets import MODEL_ASSET_PROTOCOL
