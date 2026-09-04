@@ -54,7 +54,7 @@ def render_sdpg_prompt(original_user_content: str, gold_solution: str, gold_answ
 def render_privileged_prompt(
     original_user_content: str,
     gold_cot: str,
-    template: Union[PromptTemplate, str] = PromptTemplate.SDFT,
+    template: Union[PromptTemplate, str] = PromptTemplate.SDPG,
     gold_answer: Optional[str] = None,
 ) -> str:
     """Render one of the supported privileged teacher prompts."""

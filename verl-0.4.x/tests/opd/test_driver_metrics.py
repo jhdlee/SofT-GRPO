@@ -142,8 +142,8 @@ def test_reward_metrics_count_informative_groups_not_trajectories():
 
 
 def test_schedule_metadata_uses_zero_based_iteration_and_resolved_warmup():
-    metadata = schedule_meta_info(OPDConfig(), rollout_iteration=0, total_iterations=327)
-    assert metadata["opd_warmup_iterations"] == 33
+    metadata = schedule_meta_info(OPDConfig(), rollout_iteration=0, total_iterations=109)
+    assert metadata["opd_warmup_iterations"] == 11
     assert metadata["opd_schedule_multiplier"] == 0.0
     assert metadata["opd_beta_effective"] == 0.0
     assert "warmup_iterations" not in metadata["opd_config"]

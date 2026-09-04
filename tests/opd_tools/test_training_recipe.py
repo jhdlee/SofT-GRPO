@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import unittest
 from pathlib import Path
@@ -101,7 +102,6 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
             "trainer.save_freq",
             "trainer.test_freq",
             "trainer.default_local_dir",
-            "trainer.total_epochs",
         }
         compared = set(self.upstream) - deliberate
         self.assertGreaterEqual(len(compared), 45)
@@ -174,7 +174,7 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
             "custom_reward_function.name": "compute_score",
             "trainer.logger": ["console", "wandb"],
             "trainer.project_name": "opd-softgrpo-math",
-            "trainer.total_epochs": 3,
+            "trainer.total_epochs": 1,
             "trainer.total_training_steps": None,
             "trainer.save_freq": 25,
             "trainer.test_freq": 25,
@@ -192,6 +192,7 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
         self.assertEqual(self.study_overrides["algorithm.opd.beta_base"], 0.001)
         self.assertEqual(self.study_overrides["algorithm.opd.warmup_fraction"], 0.10)
         self.assertEqual(self.study_overrides["algorithm.opd.teacher.type"], "ema")
+        self.assertEqual(self.study_overrides["algorithm.opd.prompt_template"], "sdpg")
 
         # Slurm owns device visibility; the released hard-coded mask must not
         # leak into the study launcher.
@@ -210,8 +211,15 @@ class ReleasedTrainingRecipeTest(unittest.TestCase):
         ]
         rollout_iterations = (MATH_TRAIN_SIZE // prompt_batch) * epochs
         optimizer_steps = rollout_iterations * (prompt_batch // mini_batch)
-        self.assertEqual(rollout_iterations, 327)
-        self.assertEqual(optimizer_steps, 654)
+        self.assertEqual(rollout_iterations, 109)
+        self.assertEqual(optimizer_steps, 218)
+        self.assertEqual(
+            math.ceil(
+                self.study_overrides["algorithm.opd.warmup_fraction"]
+                * rollout_iterations
+            ),
+            11,
+        )
         self.assertEqual(
             self.study_overrides["data.max_prompt_length"], TRAIN_MAX_PROMPT_TOKENS
         )

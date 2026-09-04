@@ -5,6 +5,7 @@ import pytest
 from verl.opd import (
     KLDirection,
     OPDConfig,
+    PromptTemplate,
     ScheduleType,
     TeacherType,
     effective_beta,
@@ -25,6 +26,7 @@ def test_primary_defaults_and_mapping_conversion():
     assert config.uses_ema_teacher
     assert config.teacher.type is TeacherType.EMA
     assert config.kl_direction is KLDirection.TEACHER_TO_STUDENT
+    assert config.prompt_template is PromptTemplate.SDPG
     assert config.schedule is ScheduleType.WARMUP_CONSTANT
     assert config.warmup_fraction == 0.10
 
@@ -43,23 +45,23 @@ def test_configuration_rejects_unknown_and_invalid_values():
 
 
 def test_ten_percent_warmup_is_derived_from_total_iterations():
-    assert warmup_iterations(327, 0.10) == 33
+    assert warmup_iterations(109, 0.10) == 11
     config = OPDConfig(beta_base=0.001)
 
-    assert effective_beta(config, 0, 327) == 0.0
-    assert math.isclose(effective_beta(config, 16, 327), 0.001 * 16 / 33)
-    assert effective_beta(config, 33, 327) == 0.001
-    assert effective_beta(config, 326, 327) == 0.001
+    assert effective_beta(config, 0, 109) == 0.0
+    assert math.isclose(effective_beta(config, 5, 109), 0.001 * 5 / 11)
+    assert effective_beta(config, 11, 109) == 0.001
+    assert effective_beta(config, 108, 109) == 0.001
 
 
 def test_schedule_is_iteration_based_and_warmup_decay_is_available():
-    assert schedule_multiplier(33, 327, "warmup_decay", 0.10) == 1.0
-    assert 0.0 < schedule_multiplier(326, 327, "warmup_decay", 0.10) < 0.01
-    assert schedule_multiplier(327, 327, "warmup_decay", 0.10) == 0.0
+    assert schedule_multiplier(11, 109, "warmup_decay", 0.10) == 1.0
+    assert 0.0 < schedule_multiplier(108, 109, "warmup_decay", 0.10) < 0.02
+    assert schedule_multiplier(109, 109, "warmup_decay", 0.10) == 0.0
 
 
 @pytest.mark.parametrize("config", [OPDConfig(enabled=False), OPDConfig(beta_base=0.0)])
 def test_disabled_or_zero_beta_is_an_exact_inactive_configuration(config):
     assert not config.active
     assert not config.uses_ema_teacher
-    assert effective_beta(config, 10, 327) == 0.0
+    assert effective_beta(config, 10, 109) == 0.0

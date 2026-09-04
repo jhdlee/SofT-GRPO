@@ -217,7 +217,7 @@ class DataParallelPPOActor(BasePPOActor):
         if compute_opd and self.use_ulysses_sp:
             raise RuntimeError("OPD currently requires Ulysses sequence parallel size 1")
         if compute_opd and float(temperature) != 1.0:
-            raise RuntimeError("OPD pilot requires released LM temperature 1.0")
+            raise RuntimeError("OPD production study requires released LM temperature 1.0")
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -618,7 +618,7 @@ class DataParallelPPOActor(BasePPOActor):
             if not math.isfinite(opd_beta) or opd_beta < 0.0:
                 raise RuntimeError(f"invalid effective OPD coefficient {opd_beta}")
             if int(self.config.ppo_epochs) != 1:
-                raise RuntimeError("OPD pilot requires exactly one PPO epoch")
+                raise RuntimeError("OPD production study requires exactly one PPO epoch")
             if self.config.use_dynamic_bsz:
                 raise RuntimeError("OPD requires fixed microbatches for global slot weighting")
         compute_opd = opd_active and opd_beta > 0.0
@@ -634,7 +634,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if compute_opd and has_multi_modal_inputs:
-            raise RuntimeError("OPD MATH pilot does not support multimodal replay")
+            raise RuntimeError("OPD MATH production study does not support multimodal replay")
         if compute_opd:
             if "extra_info" not in data.non_tensor_batch:
                 raise RuntimeError("OPD update is missing privileged example metadata")

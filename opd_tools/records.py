@@ -171,6 +171,31 @@ def render_sdft_teacher_user_content(
     )
 
 
+def render_sdpg_teacher_user_content(
+    original_user_content: str,
+    gold_cot: str,
+    gold_answer: str,
+) -> str:
+    """Render the default SDPG answer-and-solution privileged prompt."""
+
+    original = _require_nonempty_text(original_user_content, "original_user_content")
+    rationale = _require_nonempty_text(gold_cot, "gold_cot")
+    answer = _require_nonempty_text(gold_answer, "gold_answer")
+    return (
+        "\n"
+        + original
+        + "\n\n[Hint] The correct answer is "
+        + answer
+        + ". A common way to solve this is:\n"
+        + rationale
+        + "\n\n[Instruction] If possible, derive the answer "
+        + answer
+        + " using an alternative, equally rigorous mathematical approach to the one provided above. "
+        "Otherwise, improve the given reasoning by making it clearer, more complete, and logically sound. "
+        "Do NOT state that you were given the answer or reference."
+    )
+
+
 def build_student_record(example_id: str, split: str, question: str) -> StudentRecord:
     record = StudentRecord(
         example_id=_require_nonempty_text(example_id, "example_id"),
@@ -191,7 +216,7 @@ def build_record_bundle(example: MathExample) -> RecordBundle:
     teacher = TeacherRecord(
         example_id=example.example_id,
         split=example.split,
-        user_content=render_sdft_teacher_user_content(
+        user_content=render_sdpg_teacher_user_content(
             student.prompt[0]["content"], example.gold_cot, example.gold_answer
         ),
     )

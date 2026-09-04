@@ -131,19 +131,21 @@ class MathDataTest(unittest.TestCase):
         self.assertEqual(bundle.teacher.user_content.count(assigned.gold_cot), 1)
         self.assertEqual(
             bundle.teacher.user_content.count(
-                "The final answer is: \\boxed{%s}" % assigned.gold_answer
+                "[Hint] The correct answer is %s." % assigned.gold_answer
             ),
             1,
         )
         self.assertEqual(
             bundle.teacher.user_content,
-            "\n%s\n\n"
-            "This is an example for a response to the question:\n"
-            "%s\n"
-            "The final answer is: \\boxed{%s}\n\n"
-            "Now answer with a response of your own, including the thinking process.\n"
+            "\n%s\n\n[Hint] The correct answer is %s. A common way to solve this is:\n"
+            "%s\n\n"
+            "[Instruction] If possible, derive the answer %s using an alternative, "
+            "equally rigorous mathematical approach to the one provided above. Otherwise, "
+            "improve the given reasoning by making it clearer, more complete, and logically "
+            "sound. Do NOT state that you were given the answer or reference."
             % (
                 bundle.student.prompt[0]["content"],
+                assigned.gold_answer,
                 assigned.gold_cot,
                 assigned.gold_answer,
             ),

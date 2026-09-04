@@ -102,21 +102,29 @@ def test_sdpg_prompt_requires_answer_and_dispatches():
     assert "[Instruction]" in rendered
 
 
+def test_default_privileged_prompt_dispatches_to_sdpg():
+    rendered = render_privileged_prompt(
+        "Question", "Solution", gold_answer="1"
+    )
+    assert "[Hint] The correct answer is 1." in rendered
+    assert "This is an example for a response" not in rendered
+
+
 def test_metric_contract_contains_required_names_and_separates_weight_terms():
     assert "opd/kl_weight" in FORBIDDEN_METRICS
     assert "opd/schedule_multiplier" in ITERATION_METRICS
     assert "opd/beta_effective" in ITERATION_METRICS
     assert "val/math_verify/mean_at_1" in VALIDATION_METRICS
 
-    metrics = opd_schedule_metrics(OPDConfig(), rollout_iteration=33, total_iterations=327)
-    assert metrics["opd/warmup_iterations"] == 33
+    metrics = opd_schedule_metrics(OPDConfig(), rollout_iteration=11, total_iterations=109)
+    assert metrics["opd/warmup_iterations"] == 11
     assert metrics["opd/schedule_multiplier"] == 1.0
     assert metrics["opd/beta_effective"] == 0.001
     validate_metric_payload(metrics, required=metrics.keys())
 
 
 def test_zero_beta_schedule_metrics_are_zero_without_hiding_base_config():
-    metrics = opd_schedule_metrics(OPDConfig(beta_base=0.0), rollout_iteration=33, total_iterations=327)
+    metrics = opd_schedule_metrics(OPDConfig(beta_base=0.0), rollout_iteration=11, total_iterations=109)
     assert metrics["opd/beta_base"] == 0.0
     assert metrics["opd/schedule_multiplier"] == 0.0
     assert metrics["opd/beta_effective"] == 0.0

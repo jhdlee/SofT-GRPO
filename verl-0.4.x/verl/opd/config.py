@@ -103,7 +103,7 @@ class OPDConfig:
     teacher: OPDTeacherConfig = OPDTeacherConfig()
     kl_direction: KLDirection = KLDirection.TEACHER_TO_STUDENT
     trajectory_gate: TrajectoryGate = TrajectoryGate.ALL
-    prompt_template: PromptTemplate = PromptTemplate.SDFT
+    prompt_template: PromptTemplate = PromptTemplate.SDPG
     temperature: float = 1.0
 
     def __post_init__(self) -> None:

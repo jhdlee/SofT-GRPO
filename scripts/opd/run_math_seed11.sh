@@ -77,7 +77,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   algorithm.opd.teacher.ema_decay=0.99 \
   algorithm.opd.kl_direction=teacher_to_student \
   algorithm.opd.trajectory_gate=all \
-  algorithm.opd.prompt_template=sdft \
+  algorithm.opd.prompt_template=sdpg \
   algorithm.opd.temperature=1.0 \
   data.train_files="${DATA_ROOT}/math_lighteval_train.parquet" \
   data.val_files="${DATA_ROOT}/math_lighteval_validation.parquet" \
@@ -148,7 +148,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   trainer.project_name=opd-softgrpo-math \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.val_before_train=true \
-  trainer.total_epochs=3 \
+  trainer.total_epochs=1 \
   trainer.total_training_steps=null \
   trainer.n_gpus_per_node="${SLURM_GPUS_ON_NODE:-8}" \
   trainer.nnodes=1 \

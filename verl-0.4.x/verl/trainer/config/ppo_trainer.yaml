@@ -270,12 +270,12 @@ algorithm:
       ema_decay: 0.99
     kl_direction: teacher_to_student  # [teacher_to_student, student_to_teacher]
     trajectory_gate: all  # [all, positive_advantage]
-    prompt_template: sdft  # [sdft, sdpg]
+    prompt_template: sdpg  # [sdft, sdpg]
     temperature: 1.0
 
 trainer:
   balance_batch: True
-  total_epochs: 30
+  total_epochs: 1
   total_training_steps: null
   project_name: verl_examples
   experiment_name: gsm8k
