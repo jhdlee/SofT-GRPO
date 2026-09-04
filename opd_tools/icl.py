@@ -1703,9 +1703,15 @@ def normalized_answer_copy(response: str, demonstrated_answer: str, benchmark: s
     """Whether the response's final boxed value equals the demonstrated answer."""
 
     boxed = extract_last_boxed_answer(response)
-    return boxed is not None and normalize_answer_key(boxed, benchmark) == normalize_answer_key(
-        demonstrated_answer, benchmark
-    )
+    if boxed is None:
+        return False
+    try:
+        generated = normalize_answer_key(boxed, benchmark)
+    except ValueError:
+        # This is a copy diagnostic, not a grading precondition. A malformed
+        # generated AIME box is simply not a copy of the valid demonstration.
+        return False
+    return generated == normalize_answer_key(demonstrated_answer, benchmark)
 
 
 __all__ = [

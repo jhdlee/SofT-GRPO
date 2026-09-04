@@ -92,6 +92,9 @@ class ICLStatisticsTests(unittest.TestCase):
     def test_copy_diagnostics_have_explicit_semantics(self):
         self.assertTrue(normalized_answer_copy("Work. \\boxed{007}", "7", "aime2024"))
         self.assertFalse(normalized_answer_copy("Work. \\boxed{008}", "7", "aime2024"))
+        self.assertFalse(
+            normalized_answer_copy("Work. \\boxed{\\frac{7}{2}}", "7", "aime2024")
+        )
         self.assertEqual(rationale_token_overlap_f1("alpha beta", "alpha beta"), 1.0)
         overlap = rationale_token_overlap_f1("alpha beta", "alpha gamma")
         self.assertGreater(overlap, 0.0)
