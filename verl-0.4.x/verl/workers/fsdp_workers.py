@@ -638,6 +638,15 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        from verl.opd.chat import QWEN3_TRAINING_PROFILE
+
+        benchmark_timing = self.opd_config.prompt_profile == QWEN3_TRAINING_PROFILE
+        if benchmark_timing:
+            import time
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            worker_update_started = time.perf_counter()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
@@ -653,8 +662,12 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
+            if benchmark_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
+                if benchmark_timing and torch.cuda.is_available():
+                    torch.cuda.synchronize()
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -692,6 +705,35 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        if benchmark_timing:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            rank_timing = {
+                "rank": self.rank,
+                "teacher_seconds": float(metrics.get("perf/teacher_seconds", 0.0)),
+                "policy_update_seconds": float(delta_time),
+                "worker_update_seconds": time.perf_counter() - worker_update_started,
+                "optimizer_steps": float(metrics["trainer/optimizer_steps_this_iteration"]),
+                "ema_updates_this_iteration": float(metrics.get("opd/ema_updates_this_iteration", 0.0)),
+                "ema_update_count": float(metrics.get("opd/ema_update_count", 0.0)),
+            }
+            rank_timings = [None] * self.world_size
+            dist.all_gather_object(rank_timings, rank_timing)
+            timing = {
+                "ranks": rank_timings,
+                "teacher_seconds_max": max(item["teacher_seconds"] for item in rank_timings),
+                "policy_update_seconds_max": max(item["policy_update_seconds"] for item in rank_timings),
+                "worker_update_seconds_max": max(item["worker_update_seconds"] for item in rank_timings),
+                "timing_method": "cuda_synchronized_wall" if torch.cuda.is_available() else "cpu_wall",
+                "timing_note": (
+                    "Teacher time sums completed teacher spans per rank. Policy/worker times "
+                    "include teacher work and synchronization overhead; these nested times "
+                    "must not be added to the driver's update_actor wall duration."
+                ),
+            }
+            output.meta_info["actor_update_timing"] = timing
+            output.meta_info["metrics"]["perf/teacher_seconds_max"] = timing["teacher_seconds_max"]
+
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -717,6 +759,17 @@ class ActorRolloutRefWorker(Worker):
             output = self.rollout_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
+        if "rollout_timing" in output.meta_info:
+            rank_timing = {
+                **output.meta_info["rollout_timing"],
+                **getattr(self.rollout_sharding_manager, "last_rollout_timing", {}),
+                "rank": self.rank,
+            }
+            # DataProto.concat preserves only the first rank's meta_info. Give
+            # every rank the identical compact inventory before Ray collects it.
+            rank_timings = [None] * self.world_size
+            dist.all_gather_object(rank_timings, rank_timing)
+            output.meta_info["rollout_timing"] = {"ranks": rank_timings}
 
         # clear kv cache
         get_torch_device().empty_cache()

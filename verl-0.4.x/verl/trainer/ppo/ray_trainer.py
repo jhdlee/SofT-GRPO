@@ -2254,6 +2254,10 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=tracking_config,
         )
+        if hasattr(self, "record_benchmark_iteration"):
+            # Keep ownership through timing-only validation and explicit W&B
+            # finalization; Tracking.__del__ otherwise finishes too early.
+            self._benchmark_logger = logger
         if "wandb" in logger.logger:
             # W&B still receives its monotonically increasing internal step,
             # but all charts use rollout iteration as the explicit study axis.
@@ -2629,6 +2633,8 @@ class RayPPOTrainer:
                             batch.meta_info['add_noise_dirichlet'] = self.config.actor_rollout_ref.rollout.add_noise_dirichlet
                             batch.meta_info['add_noise_gumbel_softmax'] = self.config.actor_rollout_ref.rollout.add_noise_gumbel_softmax
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                        if "actor_update_timing" in actor_output.meta_info:
+                            batch.meta_info["actor_update_timing"] = actor_output.meta_info["actor_update_timing"]
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
                         validate_full_dose_gradient_integrity(
@@ -2785,6 +2791,11 @@ class RayPPOTrainer:
                 )
                 if self.rollout_integrity_config.enabled:
                     validate_iteration_metric_contract(metrics)
+
+                if hasattr(self, "record_benchmark_iteration"):
+                    self.record_benchmark_iteration(
+                        rollout_iteration, timing_raw, metrics, batch.meta_info
+                    )
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=training_wandb_step(self.global_steps))

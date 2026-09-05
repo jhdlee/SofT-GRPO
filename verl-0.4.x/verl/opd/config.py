@@ -120,8 +120,12 @@ class OPDConfig:
     # field order remains source compatible. New callers should use keywords.
     mode: ObjectiveMode = ObjectiveMode.AUXILIARY
     loss_support: LossSupport = LossSupport.LATENT_ONLY
+    prompt_profile: str | None = None
 
     def __post_init__(self) -> None:
+        from .chat import validate_prompt_profile
+
+        validate_prompt_profile(self.prompt_profile)
         if type(self.enabled) is not bool:
             raise TypeError(f"enabled must be bool; got {self.enabled!r}")
 
@@ -189,6 +193,7 @@ class OPDConfig:
             "kl_direction",
             "trajectory_gate",
             "prompt_template",
+            "prompt_profile",
             "temperature",
         }
         unknown = set(values) - allowed

@@ -254,6 +254,7 @@ class ResourceMonitor:
         *,
         interval_seconds: float = 1.0,
         command_timeout_seconds: float = 2.0,
+        gpu_visibility_environment: Mapping[str, str] | None = None,
     ) -> None:
         if (
             isinstance(interval_seconds, bool)
@@ -273,6 +274,11 @@ class ResourceMonitor:
             )
         self.interval_seconds = float(interval_seconds)
         self.command_timeout_seconds = float(command_timeout_seconds)
+        # A CPU-only Ray driver has empty CUDA visibility. A caller can supply
+        # its enclosing allocation for telemetry without changing CUDA access.
+        self._gpu_visibility_environment = (
+            None if gpu_visibility_environment is None else dict(gpu_visibility_environment)
+        )
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._first_sample_event = threading.Event()
@@ -328,7 +334,7 @@ class ResourceMonitor:
                         self._gpu_selection_source,
                         self._gpu_selectors,
                         self._expected_gpu_count,
-                    ) = _gpu_visibility_from_environment()
+                    ) = _gpu_visibility_from_environment(self._gpu_visibility_environment)
                 except ValueError as error:
                     self._gpu_error = "%s: %s" % (type(error).__name__, error)
                     self._gpu_disabled = True

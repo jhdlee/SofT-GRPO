@@ -216,7 +216,12 @@ class TaskRunner:
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
-        trainer = RayPPOTrainer(
+        trainer_class = RayPPOTrainer
+        if config.trainer.get("training_benchmark_mode", None) is not None:
+            from verl.trainer.ppo.qwen_benchmark import QwenTrainingBenchmarkTrainer
+
+            trainer_class = QwenTrainingBenchmarkTrainer
+        trainer = trainer_class(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

@@ -1,3 +1,4 @@
+import os
 import subprocess
 import threading
 import types
@@ -42,6 +43,24 @@ def _monitor_threads():
         for thread in threading.enumerate()
         if thread.name == "opd-icl-resource-monitor" and thread.is_alive()
     ]
+
+
+def test_cpu_ray_driver_can_sample_allocation_without_changing_cuda_visibility(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(resource_monitor, "_is_linux", lambda: True)
+    monkeypatch.setattr(resource_monitor, "_load_psutil", lambda: (_FakePsutil(), None))
+    monkeypatch.setattr(resource_monitor.subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(
+        stdout="0, GPU-zero, 1024, 20\n1, GPU-one, 2048, 40\n2, GPU-two, 3072, 60\n"
+    ))
+    monitor = ResourceMonitor(
+        interval_seconds=0.01,
+        gpu_visibility_environment={"CUDA_VISIBLE_DEVICES": "1,2", "OPD_EXPECTED_VISIBLE_GPUS": "2"},
+    ).start()
+    assert monitor._first_sample_event.wait(timeout=1.0)
+    result = monitor.stop()
+    assert result.gpu_selectors == ("1", "2")
+    assert result.peak_hbm_gib_per_gpu == {"1": 2.0, "2": 3.0}
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
 
 
 def test_resource_monitor_collects_peaks_means_and_stops_cleanly(monkeypatch):

@@ -11,8 +11,17 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from .config import OPDConfig
+from .chat import render_training_prompt, validate_training_reasoning_tokens
 from .losses import full_vocab_kl
 from .prompts import render_privileged_prompt
+from .chat import QWEN3_TRAINING_PROFILE
+
+
+def _synchronize_benchmark_teacher(device: torch.device) -> None:
+    """Finish CUDA work at benchmark timing boundaries; CPU mocks need no sync."""
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 @dataclass
@@ -100,6 +109,8 @@ class PrivilegedReplay:
         self.tokenizer = tokenizer
         self.config = config
         self.think_start_id, self.think_end_id = validate_reasoning_tokenizer(tokenizer)
+        if config.prompt_profile is not None:
+            validate_training_reasoning_tokens(tokenizer, config.prompt_profile)
 
     def _prompt_ids(self, extra: Mapping[str, Any]) -> list[int]:
         content = render_privileged_prompt(
@@ -108,10 +119,10 @@ class PrivilegedReplay:
             gold_answer=extra.get("opd_gold_answer"),
             template=self.config.prompt_template,
         )
-        rendered = self.tokenizer.apply_chat_template(
+        rendered = render_training_prompt(
+            self.tokenizer,
             [{"role": "user", "content": content}],
-            add_generation_prompt=True,
-            tokenize=False,
+            profile=self.config.prompt_profile,
         )
         ids = self.tokenizer.encode(rendered, add_special_tokens=False)
         if not ids:
@@ -142,6 +153,9 @@ class PrivilegedReplay:
         if len(extra_infos) != response_embeddings.shape[0]:
             raise ValueError("privileged metadata is not aligned with the replay batch")
 
+        benchmark_timing = self.config.prompt_profile == QWEN3_TRAINING_PROFILE
+        if benchmark_timing:
+            _synchronize_benchmark_teacher(response_embeddings.device)
         started = time.perf_counter()
         active_logits = []
         # Actor microbatches have equal row counts on every FSDP rank.  Execute
@@ -192,7 +206,13 @@ class PrivilegedReplay:
                     f"expected {active.numel()}, got {logits.shape[0]}"
                 )
             active_logits.append(logits.detach())
-        return torch.cat(active_logits, dim=0), time.perf_counter() - started
+        logits = torch.cat(active_logits, dim=0)
+        if benchmark_timing:
+            # Include prompt preparation, teacher compute/collectives and final
+            # concatenation through GPU completion. The benchmark's enclosing
+            # actor timer includes this synchronization overhead too.
+            _synchronize_benchmark_teacher(response_embeddings.device)
+        return logits, time.perf_counter() - started
 
     def loss(
         self,

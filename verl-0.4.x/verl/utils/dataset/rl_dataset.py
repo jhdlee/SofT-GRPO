@@ -106,6 +106,14 @@ class RLHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        from verl.opd.chat import validate_prompt_profile, validate_training_reasoning_tokens
+
+        self.prompt_profile = config.get("prompt_profile", None)
+        validate_prompt_profile(self.prompt_profile)
+        if self.prompt_profile is not None:
+            if processor is not None:
+                raise ValueError("the Qwen3 training prompt profile accepts text-only datasets")
+            validate_training_reasoning_tokens(tokenizer, self.prompt_profile)
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
@@ -149,8 +157,15 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             filter_kwargs = _dataset_filter_kwargs(self.num_workers)
+            from verl.opd.chat import render_training_prompt
+
+            prompt_profile = getattr(self, "prompt_profile", None)
             self.dataframe = self.dataframe.filter(
-                lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                lambda doc: (
+                    len(tokenizer.encode(render_training_prompt(tokenizer, doc[prompt_key], prompt_profile), add_special_tokens=False))
+                    if prompt_profile is not None
+                    else len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+                ) <= self.max_prompt_length,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
                 **filter_kwargs,
             )
@@ -228,7 +243,9 @@ class RLHFDataset(Dataset):
             row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            from verl.opd.chat import render_training_prompt
+
+            raw_prompt = render_training_prompt(self.tokenizer, messages, getattr(self, "prompt_profile", None))
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")

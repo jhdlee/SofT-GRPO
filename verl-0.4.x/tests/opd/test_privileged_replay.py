@@ -161,6 +161,51 @@ def test_teacher_replay_fails_if_teacher_forward_reenables_autograd():
         )
 
 
+def test_benchmark_teacher_sync_is_cuda_specific_and_cpu_safe(monkeypatch):
+    devices = []
+    monkeypatch.setattr(torch.cuda, "synchronize", devices.append)
+    replay_module._synchronize_benchmark_teacher(torch.device("cpu"))
+    assert devices == []
+    replay_module._synchronize_benchmark_teacher(torch.device("cuda:2"))
+    assert devices == [torch.device("cuda:2")]
+
+
+@pytest.mark.parametrize("profile", [None, "qwen3-training-benchmark-v1"])
+def test_teacher_wall_timer_brackets_completed_work_only_for_benchmark(monkeypatch, profile):
+    replay = _replay()
+    replay.config = SimpleNamespace(prompt_profile=profile)
+    replay._prompt_ids = lambda extra: [3, 1]
+    events = []
+    ticks = iter([10.0, 14.0])
+
+    def clock():
+        events.append("clock")
+        return next(ticks)
+
+    original_forward = replay.teacher_module.forward
+
+    def forward(**kwargs):
+        events.append("teacher")
+        return original_forward(**kwargs)
+
+    monkeypatch.setattr(replay.teacher_module, "forward", forward)
+    monkeypatch.setattr(replay_module, "_synchronize_benchmark_teacher", lambda device: events.append("sync"))
+    monkeypatch.setattr(replay_module.time, "perf_counter", clock)
+    logits, elapsed = replay.teacher_logits(
+        response_embeddings=torch.randn(1, 2, 5),
+        response_mask=torch.tensor([[True, True]]),
+        latent_mask=torch.tensor([[True, False]]),
+        extra_infos=[{}],
+    )
+    assert elapsed == 4.0
+    assert logits.shape == (1, 11)
+    assert not logits.requires_grad
+    assert events == (
+        ["sync", "clock", "teacher", "sync", "clock"]
+        if profile else ["clock", "teacher", "clock"]
+    )
+
+
 @pytest.mark.parametrize(
     ("gate", "expected_selected"),
     [("all", 4), ("positive_advantage", 2)],

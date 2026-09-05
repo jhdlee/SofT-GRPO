@@ -1,4 +1,5 @@
 data:
+  prompt_profile: null # opt-in model-specific training prompt contract
   tokenizer: null
   use_shm: False
   train_files: ~/data/rlhf/gsm8k/train.parquet
@@ -17,6 +18,7 @@ data:
   seed: 1
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
   filter_overlong_prompts_workers: 1
+  dataloader_num_workers: 8
   truncation: error
   image_key: images
   video_key: videos
@@ -119,6 +121,10 @@ actor_rollout_ref:
     max_num_batched_tokens: 8192
     max_model_len: null
     deterministic_sampling: false
+    dispatch_mode: legacy_batch # SGLang: legacy_batch | expanded_batch | bounded_async
+    async_queue_size: 32 # frontend trajectory bound within one frozen-policy rollout
+    max_running_requests: null # SGLang scheduler bound; null preserves engine default
+    engine_context_length: null # opt-in SGLang context_length; null preserves legacy default
     max_num_seqs: 1024
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
@@ -261,6 +267,7 @@ algorithm:
   # ``algorithm.opd``; main_ppo copies the resolved mapping into the colocated
   # actor/rollout worker config before worker construction.
   opd:
+    prompt_profile: null
     enabled: true
     beta_base: 0.001
     mode: auxiliary  # [auxiliary, standalone]
@@ -276,6 +283,7 @@ algorithm:
     temperature: 1.0
 
 trainer:
+  training_profile: null
   balance_batch: True
   total_epochs: 1
   total_training_steps: null

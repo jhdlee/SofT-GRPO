@@ -81,6 +81,14 @@ from verl.workers.rollout.sglang_rollout.deterministic_sampling import (
     build_request_sampling_params,
     expand_parallel_seeds,
 )
+from verl.workers.rollout.sglang_rollout.request_dispatch import (
+    benchmark_response_cap,
+    check_collective_error,
+    dispatch_generation,
+    positive_integer,
+    require_healthy_engine,
+    validate_dispatch_options,
+)
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
 try:
@@ -145,11 +153,13 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
 
     async def release_memory_occupation(self):
         """Release GPU occupation temporarily."""
+        require_healthy_engine(self)
         obj = ReleaseMemoryOccupationReqInput()
         return await self.tokenizer_manager.release_memory_occupation(obj, None)
 
     async def resume_memory_occupation(self):
         """Resume GPU occupation."""
+        require_healthy_engine(self)
 
         # because __init__ is a sync method, it can not call the async release_memory_occupation
         # have to move release_memory_occupation from __init__ to here
@@ -168,6 +178,7 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
+        require_healthy_engine(self)
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in
                                       range(self.server_args.tp_size)],
@@ -177,6 +188,7 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
         return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
 
     async def flush_cache(self):
+        require_healthy_engine(self)
         return await self.tokenizer_manager.flush_cache()
 
 
@@ -353,6 +365,20 @@ class SGLangRollout(BaseRollout):
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
         # initialize the inference engine
+        validate_dispatch_options(
+            self.config.get("dispatch_mode", "legacy_batch"),
+            self.config.get("async_queue_size", 32),
+            self.config.get("max_running_requests"),
+        )
+        engine_options = {}
+        if self.config.get("max_running_requests") is not None:
+            engine_options["max_running_requests"] = self.config.max_running_requests
+        if self.config.get("engine_context_length") is not None:
+            engine_options["context_length"] = positive_integer(
+                self.config.engine_context_length, "engine_context_length"
+            )
+            if engine_options["context_length"] < self.config.max_model_len:
+                raise ValueError("engine_context_length must cover rollout.max_model_len")
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
         if nnodes > 1:
             ip = get_ip()
@@ -399,6 +425,7 @@ class SGLangRollout(BaseRollout):
                 # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
                 # when random.seed is being set during training
                 port=30000 + rank,
+                **engine_options,
                 # NOTE(Chenyang): if you want to debug the SGLang engine output
                 # please set the following parameters
                 # Otherwise, it will make the engine run too slow
@@ -610,192 +637,251 @@ class SGLangRollout(BaseRollout):
         messages, reward scores, etc.) n times to match the expanded
         tensor data. This is done in the `_non_tensor_batch` dictionary.
         """
-        # input ids: (bs, prompt_length), left-padded
-        idx = prompts.batch["input_ids"]
-        # attention_mask: (bs, seq_length), left-padded
-        attention_mask = prompts.batch["attention_mask"]
-        position_ids = prompts.batch["position_ids"]
+        preparation_error = None
+        try:
+            # input ids: (bs, prompt_length), left-padded
+            idx = prompts.batch["input_ids"]
+            # attention_mask: (bs, seq_length), left-padded
+            attention_mask = prompts.batch["attention_mask"]
+            position_ids = prompts.batch["position_ids"]
 
-        # used to generate attention mask for the
-        # response based on EOS token position
-        eos_token_id = prompts.meta_info["eos_token_id"]
+            # used to generate attention mask for the
+            # response based on EOS token position
+            eos_token_id = prompts.meta_info["eos_token_id"]
 
-        batch_size = idx.size(0)
+            batch_size = idx.size(0)
 
-        # Extract non-tensor data
-        non_tensor_batch = prompts.non_tensor_batch
-        if "raw_prompt_ids" not in non_tensor_batch:
-            non_tensor_batch["raw_prompt_ids"] = np.array(
-                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
-                dtype=object,
-            )
-
-        if "multi_modal_data" in non_tensor_batch:
-            sglang_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                    non_tensor_batch.pop("raw_prompt_ids"),
-                    non_tensor_batch.pop("multi_modal_data"),
-            ):
-                sglang_inputs.append(
-                    {
-                        "prompt_token_ids": raw_prompt_ids,
-                        "multi_modal_data": multi_modal_data,
-                        "image_data": (
-                            multi_modal_data.get("image", None) if isinstance(multi_modal_data, dict) else None),
-                    }
+            # Extract non-tensor data
+            non_tensor_batch = prompts.non_tensor_batch
+            if "raw_prompt_ids" not in non_tensor_batch:
+                non_tensor_batch["raw_prompt_ids"] = np.array(
+                    [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
+                    dtype=object,
                 )
-        else:
-            sglang_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in
-                             non_tensor_batch.pop("raw_prompt_ids")]
 
-        # Ensure token IDs are lists or numpy arrays
-        for input_data in sglang_inputs:
-            if isinstance(input_data["prompt_token_ids"], np.ndarray):
-                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
-            elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(
-                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+            if "multi_modal_data" in non_tensor_batch:
+                sglang_inputs = []
+                for raw_prompt_ids, multi_modal_data in zip(
+                        non_tensor_batch.pop("raw_prompt_ids"),
+                        non_tensor_batch.pop("multi_modal_data"),
+                ):
+                    sglang_inputs.append(
+                        {
+                            "prompt_token_ids": raw_prompt_ids,
+                            "multi_modal_data": multi_modal_data,
+                            "image_data": (
+                                multi_modal_data.get("image", None) if isinstance(multi_modal_data, dict) else None),
+                        }
+                    )
+            else:
+                sglang_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in
+                                 non_tensor_batch.pop("raw_prompt_ids")]
 
-        # Extract token IDs and image data for SGLang Engine
-        idx_list = [input_data["prompt_token_ids"] for input_data in sglang_inputs]
-        image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
-        # Check idx is okay there
-        do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = dict(
-                n=1,
-                presence_penalty=0.0,
-                frequency_penalty=0.0,
-                repetition_penalty=1.0,
-                temperature=0,
-                top_p=1,
-                top_k=-1,
-                ignore_eos=False,
-                min_new_tokens=0,
-                max_new_tokens=self.config.response_length,
-                skip_special_tokens=True,
-                spaces_between_special_tokens=True,
-            )
-        elif is_validate:
-            kwargs = dict(
-                top_k=self.config.val_kwargs.top_k,
-                top_p=self.config.val_kwargs.top_p,
-                temperature=self.config.val_kwargs.temperature,
-                after_thinking_temperature=self.config.val_kwargs.temperature,
-                n=1,  # if validate, already repeat in ray_trainer
-            )
+            # Ensure token IDs are lists or numpy arrays
+            for input_data in sglang_inputs:
+                if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                    input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+                elif not isinstance(input_data["prompt_token_ids"], list):
+                    raise TypeError(
+                        f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
 
-        # users can customize different sampling_params at different run
+            # Extract token IDs and image data for SGLang Engine
+            idx_list = [input_data["prompt_token_ids"] for input_data in sglang_inputs]
+            image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
+            # Check idx is okay there
+            do_sample = prompts.meta_info.get("do_sample", True)
+            is_validate = prompts.meta_info.get("validate", False)
+            if not do_sample:
+                kwargs = dict(
+                    n=1,
+                    presence_penalty=0.0,
+                    frequency_penalty=0.0,
+                    repetition_penalty=1.0,
+                    temperature=0,
+                    top_p=1,
+                    top_k=-1,
+                    ignore_eos=False,
+                    min_new_tokens=0,
+                    max_new_tokens=self.config.response_length,
+                    skip_special_tokens=True,
+                    spaces_between_special_tokens=True,
+                )
+            elif is_validate:
+                kwargs = dict(
+                    top_k=self.config.val_kwargs.top_k,
+                    top_p=self.config.val_kwargs.top_p,
+                    temperature=self.config.val_kwargs.temperature,
+                    after_thinking_temperature=self.config.val_kwargs.temperature,
+                    n=1,  # if validate, already repeat in ray_trainer
+                )
+
+            if "benchmark_max_new_tokens" in prompts.meta_info:
+                kwargs["max_new_tokens"] = benchmark_response_cap(
+                    prompts.meta_info, self.config.response_length
+                )
+        except BaseException as error:
+            preparation_error = error
+        check_collective_error(self._engine, dist, preparation_error, "preparation")
+
+        # Snapshot sampling settings once; concurrent requests own independent
+        # dictionaries and all complete before the actor weights can change.
         with self.update_sampling_params(**kwargs):
-            request_sampling_params = self.sampling_params
-            expanded_sampling_seeds = None
-            if bool(self.config.get("deterministic_sampling", False)) and do_sample:
-                if "rollout_iteration" not in prompts.meta_info:
-                    raise RuntimeError(
-                        "deterministic_sampling requires prompts.meta_info['rollout_iteration']"
+            generation_error = None
+            engine_timing = {}
+            output = None
+            try:
+                request_sampling_params = self.sampling_params
+                expanded_sampling_seeds = None
+                if bool(self.config.get("deterministic_sampling", False)) and do_sample:
+                    if "rollout_iteration" not in prompts.meta_info:
+                        raise RuntimeError(
+                            "deterministic_sampling requires prompts.meta_info['rollout_iteration']"
+                        )
+                    if "rollout_seed" not in prompts.meta_info:
+                        raise RuntimeError(
+                            "deterministic_sampling requires prompts.meta_info['rollout_seed']"
+                        )
+
+                    example_identities = non_tensor_batch.get(
+                        "index", np.arange(batch_size, dtype=np.int64)
                     )
-                if "rollout_seed" not in prompts.meta_info:
-                    raise RuntimeError(
-                        "deterministic_sampling requires prompts.meta_info['rollout_seed']"
+                    external_sample_indices = non_tensor_batch.get(
+                        "rollout_sample_index", np.zeros(batch_size, dtype=np.int64)
+                    )
+                    request_sampling_params, base_sampling_seeds = build_request_sampling_params(
+                        self.sampling_params,
+                        root_seed=int(prompts.meta_info["rollout_seed"]),
+                        rollout_iteration=int(prompts.meta_info["rollout_iteration"]),
+                        example_identities=example_identities,
+                        prompt_token_ids=idx_list,
+                        external_sample_indices=external_sample_indices,
+                    )
+                    expanded_sampling_seeds = expand_parallel_seeds(
+                        base_sampling_seeds,
+                        int(self.sampling_params.get("n", 1)),
                     )
 
-                example_identities = non_tensor_batch.get(
-                    "index", np.arange(batch_size, dtype=np.int64)
-                )
-                external_sample_indices = non_tensor_batch.get(
-                    "rollout_sample_index", np.zeros(batch_size, dtype=np.int64)
-                )
-                request_sampling_params, base_sampling_seeds = build_request_sampling_params(
-                    self.sampling_params,
-                    root_seed=int(prompts.meta_info["rollout_seed"]),
-                    rollout_iteration=int(prompts.meta_info["rollout_iteration"]),
-                    example_identities=example_identities,
-                    prompt_token_ids=idx_list,
-                    external_sample_indices=external_sample_indices,
-                )
-                expanded_sampling_seeds = expand_parallel_seeds(
-                    base_sampling_seeds,
-                    int(self.sampling_params.get("n", 1)),
-                )
-
-            if self._tp_rank == 0:  # go in
-                loop = asyncio.get_event_loop()
-                output = loop.run_until_complete(
-                    self._engine.async_generate(
-                        prompt=None,  # because we have already convert it to prompt token id
-                        sampling_params=request_sampling_params,
-                        return_logprob=True,
+                if self._tp_rank == 0:
+                    loop = asyncio.get_event_loop()
+                    output, engine_timing = loop.run_until_complete(dispatch_generation(
+                        self._engine,
+                        mode=self.config.get("dispatch_mode", "legacy_batch"),
+                        queue_size=self.config.get("async_queue_size", 32),
                         input_ids=idx_list,
                         image_data=image_list,
-                    )
+                        sampling_params=request_sampling_params,
+                        expanded_sampling_seeds=expanded_sampling_seeds,
+                    ))
+            except BaseException as error:
+                generation_error = error
+            # Every DP/TP rank participates even if one engine fails. Retire all
+            # engines before propagating the failure out of the sharding context.
+            check_collective_error(self._engine, dist, generation_error, "generation")
+            broadcast_error = None
+            try:
+                output, engine_timing = broadcast_pyobj(
+                    data=[output, engine_timing],
+                    rank=self._rank,
+                    dist_group=self._device_mesh_cpu["tp"].get_group(),
+                    src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                    force_cpu_device=False,
                 )
-            else:
-                output = None
+            except BaseException as error:
+                broadcast_error = error
+            # Keep DP ranks at the same failure boundary. A serialization or
+            # allocation failure must not jump to the sharding-exit collective
+            # while healthy ranks enter tensor assembly's collective.
+            check_collective_error(self._engine, dist, broadcast_error, "output broadcast")
+            assembly_started = time.perf_counter()
+            assembly_error = None
+            try:
+                result = self._assemble_single_turn_outputs(
+                    output, idx, attention_mask, position_ids, non_tensor_batch,
+                    eos_token_id, do_sample, expanded_sampling_seeds,
+                )
+            except BaseException as error:
+                assembly_error = error
+            assembly_seconds = time.perf_counter() - assembly_started
+            check_collective_error(self._engine, dist, assembly_error, "tensor assembly")
 
-            # Most naive implementation, can extract tensor and send via gloo if too slow
-            dist.barrier()
-            [output] = broadcast_pyobj(
-                data=[output],
-                rank=self._rank,
-                dist_group=self._device_mesh_cpu["tp"].get_group(),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
-                force_cpu_device=False,
-            )
-            out = _post_process_outputs(self.tokenizer, output)
+        cache_started = time.perf_counter()
+        cache_error = None
+        try:
+            if self.config.free_cache_engine and self._engine is not None:
+                asyncio.get_event_loop().run_until_complete(self._engine.flush_cache())
+        except BaseException as error:
+            cache_error = error
+        cache_seconds = time.perf_counter() - cache_started
+        check_collective_error(self._engine, dist, cache_error, "cache flush")
+        result.meta_info["rollout_timing"] = {
+            **engine_timing,
+            "rank": self._rank,
+            "tensor_assembly_seconds": assembly_seconds,
+            "cache_flush_seconds": cache_seconds,
+            "benchmark_warmup": "benchmark_max_new_tokens" in prompts.meta_info,
+        }
+        return result
 
-            response = out[0].to(idx.device)
-            rollout_log_probs = out[1].to(idx.device)
-            # print(f"log_prob {rollout_log_probs.max().item()} {rollout_log_probs.min().item()}")
+    def _assemble_single_turn_outputs(
+        self, output, idx, attention_mask, position_ids, non_tensor_batch,
+        eos_token_id, do_sample, expanded_sampling_seeds,
+    ) -> DataProto:
+        """Keep the released tensor/replay representation for every dispatcher."""
+        batch_size = idx.size(0)
+        out = _post_process_outputs(self.tokenizer, output)
 
-            rollout_topk_ids = out[2].to(idx.device)
-            rollout_topk_gumbels = out[3].to(idx.device)
-            # print("previous", end=' ')
-            # print(response.size(), rollout_log_probs.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
-            K = rollout_topk_ids.size(-1)
-            idx_topk = torch.zeros_like(idx, device=idx.device).unsqueeze(-1).repeat(1, 1, K)
-            idx_topk[..., 0] = idx
-            if response.shape[1] < self.config.response_length:
-                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-                rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length,
-                                                           self.pad_token_id)
-                rollout_topk_ids = pad_sequence_to_length_1(rollout_topk_ids, self.config.response_length,
+        response = out[0].to(idx.device)
+        rollout_log_probs = out[1].to(idx.device)
+        # print(f"log_prob {rollout_log_probs.max().item()} {rollout_log_probs.min().item()}")
+
+        rollout_topk_ids = out[2].to(idx.device)
+        rollout_topk_gumbels = out[3].to(idx.device)
+        # print("previous", end=' ')
+        # print(response.size(), rollout_log_probs.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
+        K = rollout_topk_ids.size(-1)
+        idx_topk = torch.zeros_like(idx, device=idx.device).unsqueeze(-1).repeat(1, 1, K)
+        idx_topk[..., 0] = idx
+        if response.shape[1] < self.config.response_length:
+            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+            rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length,
+                                                       self.pad_token_id)
+            rollout_topk_ids = pad_sequence_to_length_1(rollout_topk_ids, self.config.response_length,
+                                                        self.pad_token_id)
+            rollout_topk_gumbels = pad_sequence_to_length_1(rollout_topk_gumbels, self.config.response_length,
                                                             self.pad_token_id)
-                rollout_topk_gumbels = pad_sequence_to_length_1(rollout_topk_gumbels, self.config.response_length,
-                                                                self.pad_token_id)
-            # print(f"end {self.config.response_length}", end=' ')
-            # print(response.size(), rollout_log_probs.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
+        # print(f"end {self.config.response_length}", end=' ')
+        # print(response.size(), rollout_log_probs.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
 
-            # utilize current sampling params
-            if self.sampling_params.get("n", 1) > 1 and do_sample:
-                idx = idx.repeat_interleave(self.sampling_params["n"], dim=0)
-                idx_topk = idx_topk.repeat_interleave(self.sampling_params["n"], dim=0)
-                attention_mask = attention_mask.repeat_interleave(self.sampling_params["n"], dim=0)
-                position_ids = position_ids.repeat_interleave(self.sampling_params["n"], dim=0)
-                batch_size = batch_size * self.sampling_params["n"]
-                _non_tensor_batch = {}
-                for key, val in non_tensor_batch.items():
-                    _non_tensor_batch[key] = np.repeat(val, self.sampling_params["n"], axis=0)
-            else:
-                _non_tensor_batch = non_tensor_batch
+        # utilize current sampling params
+        if self.sampling_params.get("n", 1) > 1 and do_sample:
+            idx = idx.repeat_interleave(self.sampling_params["n"], dim=0)
+            idx_topk = idx_topk.repeat_interleave(self.sampling_params["n"], dim=0)
+            attention_mask = attention_mask.repeat_interleave(self.sampling_params["n"], dim=0)
+            position_ids = position_ids.repeat_interleave(self.sampling_params["n"], dim=0)
+            batch_size = batch_size * self.sampling_params["n"]
+            _non_tensor_batch = {}
+            for key, val in non_tensor_batch.items():
+                _non_tensor_batch[key] = np.repeat(val, self.sampling_params["n"], axis=0)
+        else:
+            _non_tensor_batch = non_tensor_batch
 
-            if expanded_sampling_seeds is None:
-                rollout_sampling_seed = torch.full(
-                    (batch_size,), -1, dtype=torch.int64, device=idx.device
+        if expanded_sampling_seeds is None:
+            rollout_sampling_seed = torch.full(
+                (batch_size,), -1, dtype=torch.int64, device=idx.device
+            )
+        else:
+            if len(expanded_sampling_seeds) != batch_size:
+                raise RuntimeError(
+                    "expanded deterministic seed count does not match rollout batch "
+                    f"({len(expanded_sampling_seeds)} != {batch_size})"
                 )
-            else:
-                if len(expanded_sampling_seeds) != batch_size:
-                    raise RuntimeError(
-                        "expanded deterministic seed count does not match rollout batch "
-                        f"({len(expanded_sampling_seeds)} != {batch_size})"
-                    )
-                rollout_sampling_seed = torch.tensor(
-                    expanded_sampling_seeds, dtype=torch.int64, device=idx.device
-                )
-            seq = torch.cat([idx, response], dim=-1)
-            rollout_topk_ids = torch.cat([idx_topk, rollout_topk_ids], dim=1)
-            rollout_topk_gumbels = torch.cat(
-                [torch.zeros_like(idx_topk, dtype=rollout_topk_gumbels.dtype), rollout_topk_gumbels], dim=1)
+            rollout_sampling_seed = torch.tensor(
+                expanded_sampling_seeds, dtype=torch.int64, device=idx.device
+            )
+        seq = torch.cat([idx, response], dim=-1)
+        rollout_topk_ids = torch.cat([idx_topk, rollout_topk_ids], dim=1)
+        rollout_topk_gumbels = torch.cat(
+            [torch.zeros_like(idx_topk, dtype=rollout_topk_gumbels.dtype), rollout_topk_gumbels], dim=1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
@@ -832,11 +918,6 @@ class SGLangRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
-
-        # free cache engine
-        if self.config.free_cache_engine and self._engine is not None:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self._engine.flush_cache())
 
         return DataProto(batch=batch, non_tensor_batch=_non_tensor_batch)
 

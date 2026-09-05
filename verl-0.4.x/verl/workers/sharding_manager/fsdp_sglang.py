@@ -17,6 +17,7 @@
 import asyncio
 import logging
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,11 @@ from verl.protocol import all_gather_data_proto
 from verl.utils.debug import GPUMemoryLogger, log_gpu_memory_usage
 from verl.utils.fsdp_utils import fsdp_version, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.torch_functional import check_device_is_available
+from verl.workers.rollout.sglang_rollout.request_dispatch import (
+    check_collective_error,
+    poison_engine,
+    require_healthy_engine,
+)
 
 from .base import BaseShardingManager
 
@@ -63,6 +69,8 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         self.model_config = model_config
         self.device_mesh = device_mesh
         self.offload_param = offload_param
+        self._opd_poisoned = None
+        self.last_rollout_timing = {}
 
         # Full params
         self.full_params = full_params
@@ -91,6 +99,11 @@ class FSDPSGLangShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
     def __enter__(self):
+        if self._opd_poisoned:
+            raise RuntimeError(f"rollout sharding manager is poisoned: {self._opd_poisoned}")
+        require_healthy_engine(self.inference_engine)
+        self.last_rollout_timing = {}
+        entered_at = time.perf_counter()
         torch.cuda.empty_cache()
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
@@ -114,12 +127,33 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.torch_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.gen_random_states)
+        self.last_rollout_timing["sharding_enter_seconds"] = time.perf_counter() - entered_at
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager exit", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            # Include failures in TP postprocessing, outside the adapter, so
+            # healthy ranks cannot enter normal memory release on their own.
+            check_collective_error(self.inference_engine, dist, exc_value, "sharding context")
+        except BaseException as error:
+            # async_generate cancellation leaves scheduler work alive. A failed
+            # outer batch must never release/reuse that engine through the
+            # ordinary inference-to-training memory transition.
+            self._opd_poisoned = f"{type(error).__name__}: {error}"
+            poison_engine(self.inference_engine, self._opd_poisoned)
+            if self.device_mesh is not None:
+                torch.cuda.set_rng_state(self.torch_random_states)
+            raise
         log_gpu_memory_usage("Before SGLang offload in sharding manager", logger=logger)
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.release_memory())
+        try:
+            loop.run_until_complete(self.release_memory())
+        except BaseException as error:
+            self._opd_poisoned = f"{type(error).__name__}: {error}"
+            poison_engine(self.inference_engine, self._opd_poisoned)
+            if self.device_mesh is not None:
+                torch.cuda.set_rng_state(self.torch_random_states)
+            raise
         log_gpu_memory_usage("After SGLang offload in sharding manager", logger=logger)
 
         self.module.train()
@@ -133,8 +167,12 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.torch_random_states)
 
     async def update_weights(self, params):
+        require_healthy_engine(self.inference_engine)
+        resumed_at = time.perf_counter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self.inference_engine.resume_memory_occupation()
+        self.last_rollout_timing["memory_resume_seconds"] = time.perf_counter() - resumed_at
+        synchronized_at = time.perf_counter()
 
         # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
         named_tensors = [(k, v) for k, v in params.items()]
@@ -164,13 +202,24 @@ class FSDPSGLangShardingManager(BaseShardingManager):
                     load_format=load_format,
                     flush_cache=tensor_index == len(named_tensors) - 1,
                 )
+        self.last_rollout_timing["weight_sync_seconds"] = time.perf_counter() - synchronized_at
 
     async def release_memory(self):
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self.inference_engine.release_memory_occupation()
+        released_at = time.perf_counter()
+        release_error = None
+        try:
+            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                await self.inference_engine.release_memory_occupation()
+        except BaseException as error:
+            release_error = error
+        self.last_rollout_timing["memory_release_seconds"] = time.perf_counter() - released_at
+        check_collective_error(self.inference_engine, dist, release_error, "memory release")
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
     async def wake_up(self):
+        if self._opd_poisoned:
+            raise RuntimeError(f"rollout sharding manager is poisoned: {self._opd_poisoned}")
+        require_healthy_engine(self.inference_engine)
         torch.cuda.empty_cache()
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
