@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,16 @@ from opd_tools.generate_eval import (
 from opd_tools.graders import Grade
 from opd_tools.constants import MODEL_ID, MODEL_REVISION, SOFTGRPO_UPSTREAM_COMMIT
 from opd_tools import paper_anchor
+
+
+REGRADER_ENV = {
+    "OPD_PAPER_REGRADE_PARENT_COMMIT": "e" * 40,
+    "OPD_PAPER_REGRADE_SUBMODULE_COMMIT": "f" * 40,
+}
+
+
+def _locked_distribution_version(distribution: str) -> str:
+    return paper_anchor.UPSTREAM_GRADER_DEPENDENCY_VERSIONS[distribution]
 
 
 def _record(*, example_id: str, sample_index: int, seed: int) -> GenerationRecord:
@@ -263,6 +274,8 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
                     "example_id": "math500-%d" % example_index,
                     "generation_seed": seed,
                     "correct": example_index == 0,
+                    "upstream_rule_correct": example_index == 0,
+                    "upstream_extracted_answer": "1" if example_index == 0 else "0",
                     "response_length": 100.0 + example_index,
                     "latent_length": 90.0,
                     "hard_answer_length": 10.0 + example_index,
@@ -280,18 +293,122 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
     def test_math_verify_scoring_uses_the_full_response_grader(self):
         record = _record(example_id="math500-0", sample_index=0, seed=11)
         grade = Grade(True, None, None, "1")
-        with patch.object(
-            paper_anchor, "math_verify_full_response_grade", return_value=grade
-        ) as scorer:
+        with (
+            patch.object(
+                paper_anchor, "math_verify_full_response_grade", return_value=grade
+            ) as scorer,
+            patch.object(
+                paper_anchor,
+                "upstream_math500_rule_judge",
+                return_value=(False, "0"),
+            ) as upstream_scorer,
+        ):
             row = paper_anchor._score_record(record.to_dict())
         scorer.assert_called_once_with(record.response, record.gold_answer)
+        upstream_scorer.assert_called_once_with(record.response, record.gold_answer)
         self.assertTrue(row["correct"])
+        self.assertFalse(row["upstream_rule_correct"])
+        self.assertEqual(row["upstream_extracted_answer"], "0")
+
+    def test_upstream_rule_judge_calls_the_authenticated_released_api(self):
+        class Evaluator:
+            def __init__(self):
+                self.calls = []
+
+            def rule_judge(self, response, gold_answer, finish_generation):
+                self.calls.append((response, gold_answer, finish_generation))
+                return True, ["parsed"]
+
+        evaluator = Evaluator()
+        with patch.object(
+            paper_anchor, "_upstream_math500_evaluator", return_value=evaluator
+        ):
+            correct, extracted = paper_anchor.upstream_math500_rule_judge(
+                "work \\boxed{1}", "1"
+            )
+        self.assertTrue(correct)
+        self.assertEqual(extracted, "['parsed']")
+        self.assertEqual(evaluator.calls, [("work \\boxed{1}", "1", False)])
+
+    def test_upstream_grader_source_is_pinned_to_the_released_commit(self):
+        with patch.object(
+            paper_anchor,
+            "distribution_version",
+            side_effect=_locked_distribution_version,
+        ):
+            provenance = paper_anchor.upstream_math500_grader_provenance()
+        self.assertEqual(
+            provenance,
+            {
+                "path": "Soft-Thinking+noise+loss-main/matheval.py",
+                "sha256": paper_anchor.UPSTREAM_MATH500_GRADER_SHA256,
+                "api": "MATH500Evaluator.rule_judge",
+                "upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
+                "dependencies": {
+                    "math-verify": "0.8.0",
+                    "latex2sympy2-extended": "1.10.2",
+                },
+            },
+        )
+
+    def test_upstream_grader_dependency_versions_fail_closed(self):
+        with patch.object(
+            paper_anchor,
+            "distribution_version",
+            side_effect=_locked_distribution_version,
+        ):
+            self.assertEqual(
+                paper_anchor.upstream_grader_dependency_versions(),
+                paper_anchor.UPSTREAM_GRADER_DEPENDENCY_VERSIONS,
+            )
+        with patch.object(
+            paper_anchor, "distribution_version", return_value="wrong"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires math-verify==0.8.0"):
+                paper_anchor.upstream_grader_dependency_versions()
+
+    def test_regrader_source_requires_commits_and_hashes_implementation(self):
+        identity = paper_anchor.required_regrader_source_identity(REGRADER_ENV)
+        self.assertEqual(identity["parent_commit"], "e" * 40)
+        self.assertEqual(identity["submodule_commit"], "f" * 40)
+        self.assertEqual(
+            identity["implementation_path"], "opd_tools/paper_anchor.py"
+        )
+        self.assertEqual(
+            identity["implementation_sha256"],
+            paper_anchor.file_sha256(Path(paper_anchor.__file__)),
+        )
+        legacy = paper_anchor.required_regrader_source_identity(
+            {
+                "OPD_PARENT_COMMIT": "a" * 40,
+                "OPD_SUBMODULE_COMMIT": "b" * 40,
+            }
+        )
+        self.assertEqual(legacy["parent_commit"], "a" * 40)
+        self.assertEqual(legacy["submodule_commit"], "b" * 40)
+        with self.assertRaisesRegex(RuntimeError, "is required"):
+            paper_anchor.required_regrader_source_identity({})
+        with self.assertRaisesRegex(RuntimeError, "disagree"):
+            paper_anchor.required_regrader_source_identity(
+                {
+                    **REGRADER_ENV,
+                    "OPD_PARENT_COMMIT": "a" * 40,
+                }
+            )
 
     def test_reports_paper_mean32_aliases_pass_metrics_and_boundary_diagnostics(self):
         grouped = self._grouped()
-        with patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2):
+        with (
+            patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+            patch.object(
+                paper_anchor,
+                "distribution_version",
+                side_effect=_locked_distribution_version,
+            ),
+        ):
             summary, rows, wandb_metrics = paper_anchor.aggregate(grouped)
         metrics = summary["math_verify"]["metrics"]
+        upstream_metrics = summary["upstream_rule_judge"]["metrics"]
         self.assertEqual(metrics["mean_at_32"]["estimate"], 0.5)
         self.assertEqual(metrics["pass_at_1"]["estimate"], 0.5)
         self.assertEqual(metrics["pass_at_1"]["alias_of"], "mean_at_32")
@@ -300,6 +417,11 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
         self.assertEqual(metrics["pass_at_16"]["estimate"], 0.5)
         self.assertEqual(metrics["pass_at_32"]["estimate"], 0.5)
         self.assertEqual(metrics["mean_at_32"]["resamples"], 10_000)
+        self.assertEqual(upstream_metrics["pass_at_1"]["estimate"], 0.5)
+        self.assertEqual(
+            summary["upstream_rule_judge"]["provenance"]["sha256"],
+            paper_anchor.UPSTREAM_MATH500_GRADER_SHA256,
+        )
         self.assertTrue(summary["boundary_gate"]["valid"])
         self.assertEqual(
             summary["native_soft_diagnostics"]["soft_to_hard_mean"]["estimate"],
@@ -308,6 +430,45 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual(
             wandb_metrics["paper_anchor/math500/math_verify/pass_at_1"], 0.5
+        )
+        self.assertEqual(
+            wandb_metrics[
+                "paper_anchor/math500/upstream_rule_judge/pass_at_1"
+            ],
+            0.5,
+        )
+
+    def test_upstream_rule_reports_boundary_sensitivity_without_replacing_score(self):
+        grouped = self._grouped()
+        grouped["math500-0"][COMMON_GENERATION_SEEDS[0]]["capped"] = 1.0
+        with (
+            patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+            patch.object(
+                paper_anchor,
+                "distribution_version",
+                side_effect=_locked_distribution_version,
+            ),
+        ):
+            summary, rows, wandb_metrics = paper_anchor.aggregate(grouped)
+        upstream = summary["upstream_rule_judge"]
+        self.assertEqual(upstream["metrics"]["pass_at_1"]["estimate"], 0.5)
+        sensitivity = upstream["boundary_sensitivity"]
+        self.assertEqual(sensitivity["correct_invalid_response_count"], 1)
+        self.assertLess(
+            sensitivity["invalid_as_incorrect_pass_at_1"]["estimate"], 0.5
+        )
+        self.assertEqual(
+            sensitivity["valid_boundary_only_sample_accuracy"]["estimate"], 0.5
+        )
+        self.assertTrue(
+            any(row["category"] == "upstream_rule_judge_boundary" for row in rows)
+        )
+        self.assertEqual(
+            wandb_metrics[
+                "paper_anchor/math500/upstream_rule_judge/"
+                "correct_invalid_response_count"
+            ],
+            1.0,
         )
 
     def test_bootstrap_is_deterministic_and_requires_ten_thousand_resamples(self):
@@ -332,9 +493,23 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
         def publish(**kwargs):
             return kwargs["report_manifest"]["wandb_run_id"]
 
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            paper_anchor, "_publish_wandb", side_effect=publish
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(paper_anchor, "_publish_wandb", side_effect=publish),
+            patch.object(
+                paper_anchor,
+                "distribution_version",
+                side_effect=_locked_distribution_version,
+            ),
+            patch.dict(os.environ, REGRADER_ENV, clear=True),
         ):
+            legacy_paths = [
+                Path(directory) / "paper_anchor_summary.json",
+                Path(directory) / "paper_anchor_metrics.csv",
+                Path(directory) / "paper_anchor_manifest.json",
+            ]
+            for path in legacy_paths:
+                path.write_text("legacy-authenticated-report\n", encoding="utf-8")
             first = paper_anchor.write_report(
                 output_dir=Path(directory),
                 input_manifest=input_manifest,
@@ -350,12 +525,96 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
                 wandb_metrics=metrics,
             )
             self.assertEqual(first["wandb_run_id"], second["wandb_run_id"])
-            self.assertTrue((Path(directory) / "paper_anchor_summary.json").is_file())
-            self.assertTrue((Path(directory) / "paper_anchor_metrics.csv").is_file())
+            for path in legacy_paths:
+                self.assertEqual(
+                    path.read_text(encoding="utf-8"),
+                    "legacy-authenticated-report\n",
+                )
+            self.assertTrue(
+                (
+                    Path(directory)
+                    / "paper_anchor_upstream_rule_summary.json"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    Path(directory)
+                    / "paper_anchor_upstream_rule_metrics.csv"
+                ).is_file()
+            )
             stored = json.loads(
-                (Path(directory) / "paper_anchor_manifest.json").read_text()
+                (
+                    Path(directory)
+                    / "paper_anchor_upstream_rule_manifest.json"
+                ).read_text()
             )
             self.assertEqual(stored, second)
+            self.assertEqual(stored["report_variant"], "upstream-rule-judge-v1")
+            self.assertIn("upstream_rule_judge", stored)
+            self.assertEqual(stored["regrader_source"]["parent_commit"], "e" * 40)
+            self.assertEqual(
+                stored["regrader_source"]["submodule_commit"], "f" * 40
+            )
+            self.assertEqual(
+                stored["regrader_source"]["implementation_sha256"],
+                paper_anchor.file_sha256(Path(paper_anchor.__file__)),
+            )
+            self.assertTrue(
+                stored["wandb_run_id"].startswith(
+                    "paper-anchor-base-upstream-rule-"
+                )
+            )
+
+    def test_wandb_identity_changes_with_regrader_commit_or_implementation(self):
+        input_manifest = {
+            "model": {"tree_sha256": "a" * 64},
+            "data_manifest_content_sha256": "b" * 64,
+            "generation_manifest": {"sha256": "c" * 64},
+            "shards": [{"sha256": "d" * 64}],
+        }
+        grader = {
+            "path": paper_anchor.UPSTREAM_MATH500_GRADER_PATH,
+            "sha256": paper_anchor.UPSTREAM_MATH500_GRADER_SHA256,
+            "api": paper_anchor.UPSTREAM_MATH500_GRADER_API,
+            "upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
+            "dependencies": dict(
+                paper_anchor.UPSTREAM_GRADER_DEPENDENCY_VERSIONS
+            ),
+        }
+        source = {
+            "parent_commit": "a" * 40,
+            "submodule_commit": "b" * 40,
+            "implementation_path": paper_anchor.PAPER_ANCHOR_IMPLEMENTATION_PATH,
+            "implementation_sha256": "c" * 64,
+        }
+        baseline = paper_anchor.stable_wandb_run_id(
+            input_manifest, source, grader
+        )
+        changed_commit = paper_anchor.stable_wandb_run_id(
+            input_manifest,
+            {**source, "submodule_commit": "d" * 40},
+            grader,
+        )
+        changed_implementation = paper_anchor.stable_wandb_run_id(
+            input_manifest,
+            {**source, "implementation_sha256": "e" * 64},
+            grader,
+        )
+        changed_dependency = paper_anchor.stable_wandb_run_id(
+            input_manifest,
+            source,
+            {
+                **grader,
+                "dependencies": {
+                    **grader["dependencies"],
+                    "math-verify": "different",
+                },
+            },
+        )
+        self.assertEqual(
+            len({baseline, changed_commit, changed_implementation, changed_dependency}),
+            4,
+        )
 
 
 if __name__ == "__main__":

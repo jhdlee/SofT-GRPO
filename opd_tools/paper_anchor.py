@@ -10,21 +10,27 @@ This command intentionally accepts exactly one evaluation cell:
 
 The strict, standalone contract prevents a partial ICL matrix or a
 training-matched sampler from being reported as the paper's ``Mean@32``
-baseline.  Raw generations remain in scratch.  Only compact authenticated
-JSON/CSV reports are written and published to W&B.
+baseline.  Both the repository's Math-Verify metric and the exact rule judge
+shipped by upstream are reported.  Raw generations remain in scratch.  The
+compact authenticated reports use an ``upstream_rule`` sibling prefix so a
+post-hoc pass cannot overwrite the reports produced by the original job.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import hashlib
+import importlib.util
 import io
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
@@ -61,8 +67,11 @@ from .graders import math_verify_full_response_grade
 from .manifest import file_sha256
 
 
-PAPER_ANCHOR_SCHEMA_VERSION = 1
+PAPER_ANCHOR_SCHEMA_VERSION = 2
 PAPER_ANCHOR_PROTOCOL = "softgrpo-paper-base-math500-anchor-v1"
+PAPER_ANCHOR_REPORT_VARIANT = "upstream-rule-judge-v1"
+PAPER_ANCHOR_REPORT_PREFIX = "paper_anchor_upstream_rule"
+PAPER_ANCHOR_IMPLEMENTATION_PATH = "opd_tools/paper_anchor.py"
 PAPER_ANCHOR_MODEL_LABEL = "initial"
 PAPER_ANCHOR_MODE = "native_soft"
 PAPER_ANCHOR_BENCHMARK = "math500"
@@ -76,6 +85,149 @@ PAPER_ANCHOR_PARALLELISM = {
     "world_size": 8,
     "load_balance_method": "round_robin",
 }
+
+UPSTREAM_MATH500_GRADER_PATH = (
+    "Soft-Thinking+noise+loss-main/matheval.py"
+)
+UPSTREAM_MATH500_GRADER_SHA256 = (
+    "43845ffe8520029e93e5f86967bee419203b755253314bf6065ff093e18ff5d1"
+)
+UPSTREAM_MATH500_GRADER_API = "MATH500Evaluator.rule_judge"
+UPSTREAM_GRADER_DEPENDENCY_VERSIONS = {
+    "math-verify": MATH_VERIFY_VERSION,
+    "latex2sympy2-extended": "1.10.2",
+}
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _required_commit_from_environment(
+    environ: Mapping[str, str], *, preferred: str, legacy: str
+) -> str:
+    declared = {
+        name: environ[name]
+        for name in (preferred, legacy)
+        if environ.get(name)
+    }
+    if not declared:
+        raise RuntimeError(
+            "%s (or legacy %s) is required" % (preferred, legacy)
+        )
+    values = set(declared.values())
+    if len(values) != 1:
+        raise RuntimeError("%s and %s disagree" % (preferred, legacy))
+    value = next(iter(values))
+    if _GIT_COMMIT_RE.fullmatch(value) is None:
+        raise RuntimeError("%s must be a full lowercase Git commit" % preferred)
+    return value
+
+
+def required_regrader_source_identity(
+    environ: Mapping[str, str] | None = None,
+) -> Dict[str, str]:
+    """Bind each post-hoc report to its exact parent and regrader source."""
+
+    values = os.environ if environ is None else environ
+    implementation_path = Path(__file__).resolve()
+    if not implementation_path.is_file() or implementation_path.is_symlink():
+        raise RuntimeError("paper-anchor implementation is missing or a symlink")
+    return {
+        "parent_commit": _required_commit_from_environment(
+            values,
+            preferred="OPD_PAPER_REGRADE_PARENT_COMMIT",
+            legacy="OPD_PARENT_COMMIT",
+        ),
+        "submodule_commit": _required_commit_from_environment(
+            values,
+            preferred="OPD_PAPER_REGRADE_SUBMODULE_COMMIT",
+            legacy="OPD_SUBMODULE_COMMIT",
+        ),
+        "implementation_path": PAPER_ANCHOR_IMPLEMENTATION_PATH,
+        "implementation_sha256": file_sha256(implementation_path),
+    }
+
+
+def _upstream_math500_grader_source() -> Path:
+    return Path(__file__).resolve().parents[1] / UPSTREAM_MATH500_GRADER_PATH
+
+
+def upstream_grader_dependency_versions() -> Dict[str, str]:
+    """Require the two parsing libraries used by upstream at their locked versions."""
+
+    observed: Dict[str, str] = {}
+    for distribution, expected in UPSTREAM_GRADER_DEPENDENCY_VERSIONS.items():
+        try:
+            value = distribution_version(distribution)
+        except PackageNotFoundError as error:
+            raise RuntimeError(
+                "released MATH-500 grader requires %s==%s"
+                % (distribution, expected)
+            ) from error
+        if value != expected:
+            raise RuntimeError(
+                "released MATH-500 grader requires %s==%s, found %s"
+                % (distribution, expected, value)
+            )
+        observed[distribution] = value
+    return observed
+
+
+def upstream_math500_grader_provenance() -> Dict[str, Any]:
+    """Authenticate the exact released MATH-500 rule grader source."""
+
+    path = _upstream_math500_grader_source()
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError("released MATH-500 grader source is missing or a symlink")
+    observed = file_sha256(path)
+    if observed != UPSTREAM_MATH500_GRADER_SHA256:
+        raise RuntimeError("released MATH-500 grader source hash differs from upstream")
+    return {
+        "path": UPSTREAM_MATH500_GRADER_PATH,
+        "sha256": observed,
+        "api": UPSTREAM_MATH500_GRADER_API,
+        "upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
+        "dependencies": upstream_grader_dependency_versions(),
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def _upstream_math500_evaluator() -> Any:
+    """Load the released evaluator lazily from its authenticated source file."""
+
+    provenance = upstream_math500_grader_provenance()
+    path = _upstream_math500_grader_source()
+    module_name = "_opd_authenticated_upstream_matheval"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load released MATH-500 grader source")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    evaluator_map = getattr(module, "evaluator_map", None)
+    evaluator = evaluator_map.get("math500") if isinstance(evaluator_map, dict) else None
+    if evaluator is None or not callable(getattr(evaluator, "rule_judge", None)):
+        raise RuntimeError(
+            "authenticated source does not expose %s" % provenance["api"]
+        )
+    return evaluator
+
+
+def upstream_math500_rule_judge(response: str, gold_answer: str) -> tuple[bool, str]:
+    """Run the paper repository's rule judge with its original soft-run API.
+
+    The released soft-thinking evaluator passes ``finish_generation=False`` for
+    every native-soft response.  ``MATH500Evaluator.rule_judge`` currently
+    ignores that argument, but preserving it here makes the post-hoc metric an
+    exact call through the released implementation rather than a reimplementation.
+    """
+
+    result = _upstream_math500_evaluator().rule_judge(
+        response, gold_answer, False
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("released MATH-500 rule_judge must return a pair")
+    correct, extracted = result
+    if not isinstance(correct, (bool, np.bool_)):
+        raise TypeError("released MATH-500 rule_judge correctness must be Boolean")
+    return bool(correct), str(extracted)
 
 
 def _read_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
@@ -360,13 +512,20 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
 
 def _score_record(value: Mapping[str, Any]) -> Dict[str, Any]:
     record = GenerationRecord.from_mapping(value)
-    correct = math_verify_full_response_grade(
+    math_verify_correct = math_verify_full_response_grade(
         record.response, record.gold_answer
     ).correct
+    upstream_rule_correct, upstream_extracted_answer = upstream_math500_rule_judge(
+        record.response, record.gold_answer
+    )
     return {
         "example_id": record.example_id,
         "generation_seed": record.generation_seed,
-        "correct": bool(correct),
+        # Retain ``correct`` as the historical Math-Verify field so callers
+        # consuming an in-memory score table do not silently change meaning.
+        "correct": bool(math_verify_correct),
+        "upstream_rule_correct": bool(upstream_rule_correct),
+        "upstream_extracted_answer": upstream_extracted_answer,
         "response_length": float(record.response_token_count),
         "latent_length": float(record.latent_token_count),
         "hard_answer_length": float(record.hard_token_count),
@@ -471,24 +630,16 @@ def _per_example_diagnostic(
     return result, observed_sequences
 
 
-def aggregate(
-    grouped: Mapping[str, Mapping[int, Mapping[str, Any]]]
-) -> tuple[Dict[str, Any], list[Dict[str, Any]], Dict[str, float]]:
-    if len(grouped) != PAPER_ANCHOR_EXAMPLE_COUNT:
-        raise ValueError("paper-anchor aggregate requires exactly 500 examples")
-    expected_seeds = set(COMMON_GENERATION_SEEDS)
-    if any(set(by_seed) != expected_seeds for by_seed in grouped.values()):
-        raise ValueError("paper-anchor aggregate requires the exact 32-seed inventory")
-    outcomes = {
-        example_id: tuple(int(by_seed[seed]["correct"]) for seed in COMMON_GENERATION_SEEDS)
-        for example_id, by_seed in grouped.items()
-    }
+def _aggregate_binary_outcomes(
+    outcomes: Mapping[str, Sequence[int]],
+    *,
+    category: str,
+    wandb_namespace: str,
+    total_samples: int,
+) -> tuple[Dict[str, Dict[str, Any]], list[Dict[str, Any]], Dict[str, float]]:
     metrics: Dict[str, Dict[str, Any]] = {}
     metric_rows: list[Dict[str, Any]] = []
     wandb_metrics: Dict[str, float] = {}
-    total_correct = sum(sum(values) for values in outcomes.values())
-    total_samples = PAPER_ANCHOR_EXAMPLE_COUNT * PAPER_ANCHOR_SAMPLE_COUNT
-
     for name in ("mean_at_32", "pass_at_8", "pass_at_16", "pass_at_32"):
         result = bootstrap_mean(example_level_metric(outcomes, name))
         estimator = (
@@ -500,13 +651,13 @@ def aggregate(
         metrics[name] = result
         metric_rows.append(
             {
-                "category": "math_verify",
+                "category": category,
                 "metric": name,
                 **result,
                 "observed_sequence_count": total_samples,
             }
         )
-        wandb_metrics["paper_anchor/math500/math_verify/%s" % name] = float(
+        wandb_metrics["%s/%s" % (wandb_namespace, name)] = float(
             result["estimate"]
         )
 
@@ -521,17 +672,58 @@ def aggregate(
         "alias_of": "mean_at_32",
     }
     for alias in ("pass_at_1", "sample_accuracy"):
-        wandb_metrics["paper_anchor/math500/math_verify/%s" % alias] = float(
+        wandb_metrics["%s/%s" % (wandb_namespace, alias)] = float(
             metrics[alias]["estimate"]
         )
         metric_rows.append(
             {
-                "category": "math_verify",
+                "category": category,
                 "metric": alias,
                 **metrics[alias],
                 "observed_sequence_count": total_samples,
             }
         )
+    return metrics, metric_rows, wandb_metrics
+
+
+def aggregate(
+    grouped: Mapping[str, Mapping[int, Mapping[str, Any]]]
+) -> tuple[Dict[str, Any], list[Dict[str, Any]], Dict[str, float]]:
+    if len(grouped) != PAPER_ANCHOR_EXAMPLE_COUNT:
+        raise ValueError("paper-anchor aggregate requires exactly 500 examples")
+    expected_seeds = set(COMMON_GENERATION_SEEDS)
+    if any(set(by_seed) != expected_seeds for by_seed in grouped.values()):
+        raise ValueError("paper-anchor aggregate requires the exact 32-seed inventory")
+    math_verify_outcomes = {
+        example_id: tuple(int(by_seed[seed]["correct"]) for seed in COMMON_GENERATION_SEEDS)
+        for example_id, by_seed in grouped.items()
+    }
+    upstream_rule_outcomes = {
+        example_id: tuple(
+            int(by_seed[seed]["upstream_rule_correct"])
+            for seed in COMMON_GENERATION_SEEDS
+        )
+        for example_id, by_seed in grouped.items()
+    }
+    total_samples = PAPER_ANCHOR_EXAMPLE_COUNT * PAPER_ANCHOR_SAMPLE_COUNT
+    math_verify_total_correct = sum(sum(values) for values in math_verify_outcomes.values())
+    upstream_rule_total_correct = sum(
+        sum(values) for values in upstream_rule_outcomes.values()
+    )
+    metrics, metric_rows, wandb_metrics = _aggregate_binary_outcomes(
+        math_verify_outcomes,
+        category="math_verify",
+        wandb_namespace="paper_anchor/math500/math_verify",
+        total_samples=total_samples,
+    )
+    upstream_metrics, upstream_rows, upstream_wandb = _aggregate_binary_outcomes(
+        upstream_rule_outcomes,
+        category="upstream_rule_judge",
+        wandb_namespace="paper_anchor/math500/upstream_rule_judge",
+        total_samples=total_samples,
+    )
+    metric_rows.extend(upstream_rows)
+    wandb_metrics.update(upstream_wandb)
 
     diagnostic_fields = (
         "response_length",
@@ -622,9 +814,76 @@ def aggregate(
         invalid_boundary_rate
     )
 
+    upstream_invalid_as_incorrect = {
+        example_id: tuple(
+            int(by_seed[seed]["upstream_rule_correct"])
+            * int(not (bool(by_seed[seed]["capped"]) or bool(by_seed[seed]["all_soft"])))
+            for seed in COMMON_GENERATION_SEEDS
+        )
+        for example_id, by_seed in grouped.items()
+    }
+    invalid_as_incorrect = bootstrap_mean(
+        example_level_metric(upstream_invalid_as_incorrect, "mean_at_32")
+    )
+    invalid_as_incorrect["estimator"] = (
+        "mean correctness over all 32 samples after assigning zero to capped/all-soft "
+        "responses"
+    )
+    valid_boundary_only: Dict[str, float] = {}
+    valid_boundary_sequence_count = 0
+    upstream_correct_invalid_count = 0
+    for example_id, by_seed in grouped.items():
+        valid_scores = []
+        for seed in COMMON_GENERATION_SEEDS:
+            row = by_seed[seed]
+            valid = not (bool(row["capped"]) or bool(row["all_soft"]))
+            correct = int(row["upstream_rule_correct"])
+            if valid:
+                valid_scores.append(correct)
+            elif correct:
+                upstream_correct_invalid_count += 1
+        valid_boundary_sequence_count += len(valid_scores)
+        if valid_scores:
+            valid_boundary_only[example_id] = float(np.mean(valid_scores))
+    if not valid_boundary_only:
+        raise ValueError("paper anchor has no valid-boundary responses")
+    valid_only = bootstrap_mean(valid_boundary_only)
+    valid_only["estimator"] = (
+        "mean of per-example correctness rates conditional on a valid soft-to-hard "
+        "boundary; examples with no valid response are excluded"
+    )
+    valid_only["included_example_count"] = len(valid_boundary_only)
+    valid_only["observed_sequence_count"] = valid_boundary_sequence_count
+    upstream_boundary_sensitivity = {
+        "invalid_as_incorrect_pass_at_1": invalid_as_incorrect,
+        "valid_boundary_only_sample_accuracy": valid_only,
+        "correct_invalid_response_count": upstream_correct_invalid_count,
+    }
+    for name, result in (
+        ("invalid_as_incorrect_pass_at_1", invalid_as_incorrect),
+        ("valid_boundary_only_sample_accuracy", valid_only),
+    ):
+        metric_rows.append(
+            {
+                "category": "upstream_rule_judge_boundary",
+                "metric": name,
+                **result,
+                "observed_sequence_count": result.get(
+                    "observed_sequence_count", total_samples
+                ),
+            }
+        )
+        wandb_metrics[
+            "paper_anchor/math500/upstream_rule_judge/%s" % name
+        ] = float(result["estimate"])
+    wandb_metrics[
+        "paper_anchor/math500/upstream_rule_judge/correct_invalid_response_count"
+    ] = float(upstream_correct_invalid_count)
+
     summary = {
         "schema_version": PAPER_ANCHOR_SCHEMA_VERSION,
         "protocol": PAPER_ANCHOR_PROTOCOL,
+        "report_variant": PAPER_ANCHOR_REPORT_VARIANT,
         "model": {
             "label": PAPER_ANCHOR_MODEL_LABEL,
             "id": MODEL_ID,
@@ -639,8 +898,14 @@ def aggregate(
         "total_sample_count": total_samples,
         "math_verify": {
             "version": MATH_VERIFY_VERSION,
-            "correct_sample_count": total_correct,
+            "correct_sample_count": math_verify_total_correct,
             "metrics": metrics,
+        },
+        "upstream_rule_judge": {
+            "provenance": upstream_math500_grader_provenance(),
+            "correct_sample_count": upstream_rule_total_correct,
+            "metrics": upstream_metrics,
+            "boundary_sensitivity": upstream_boundary_sensitivity,
         },
         "bootstrap": {
             "resamples": BOOTSTRAP_RESAMPLES,
@@ -672,9 +937,14 @@ def _csv_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
-def stable_wandb_run_id(input_manifest: Mapping[str, Any]) -> str:
+def stable_wandb_run_id(
+    input_manifest: Mapping[str, Any],
+    regrader_source: Mapping[str, str],
+    upstream_grader: Mapping[str, Any],
+) -> str:
     identity = {
         "protocol": PAPER_ANCHOR_PROTOCOL,
+        "report_variant": PAPER_ANCHOR_REPORT_VARIANT,
         "model_tree_sha256": input_manifest["model"]["tree_sha256"],
         "data_manifest_content_sha256": input_manifest[
             "data_manifest_content_sha256"
@@ -683,9 +953,11 @@ def stable_wandb_run_id(input_manifest: Mapping[str, Any]) -> str:
             "sha256"
         ],
         "shard_sha256": [row["sha256"] for row in input_manifest["shards"]],
+        "upstream_grader": dict(upstream_grader),
+        "regrader_source": dict(regrader_source),
     }
     digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
-    return "paper-anchor-base-" + digest[:16]
+    return "paper-anchor-base-upstream-rule-" + digest[:16]
 
 
 def _publish_wandb(
@@ -711,7 +983,13 @@ def _publish_wandb(
         id=run_id,
         resume="allow",
         job_type="paper-anchor-evaluation",
-        tags=["paper-anchor", "base", "math500", "native-soft"],
+        tags=[
+            "paper-anchor",
+            "base",
+            "math500",
+            "native-soft",
+            "upstream-rule-judge",
+        ],
         config=dict(report_manifest),
     )
     run.log(dict(metrics))
@@ -722,7 +1000,10 @@ def _publish_wandb(
     artifact = wandb.Artifact(
         name=run_id + "-report",
         type="evaluation-report",
-        metadata={"protocol": PAPER_ANCHOR_PROTOCOL},
+        metadata={
+            "protocol": PAPER_ANCHOR_PROTOCOL,
+            "report_variant": PAPER_ANCHOR_REPORT_VARIANT,
+        },
     )
     for path in output_paths:
         artifact.add_file(str(path), name=path.name)
@@ -741,23 +1022,34 @@ def write_report(
 ) -> Dict[str, Any]:
     destination = output_dir.expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    summary_path = destination / "paper_anchor_summary.json"
-    metrics_path = destination / "paper_anchor_metrics.csv"
-    _atomic_write(summary_path, _canonical_json(summary))
+    regrader_source = required_regrader_source_identity()
+    upstream_grader = upstream_math500_grader_provenance()
+    summary_path = destination / (PAPER_ANCHOR_REPORT_PREFIX + "_summary.json")
+    metrics_path = destination / (PAPER_ANCHOR_REPORT_PREFIX + "_metrics.csv")
+    summary_with_provenance = {
+        **dict(summary),
+        "regrader_source": regrader_source,
+    }
+    _atomic_write(summary_path, _canonical_json(summary_with_provenance))
     _atomic_write(metrics_path, _csv_bytes(metric_rows))
     report_manifest = {
         "schema_version": PAPER_ANCHOR_SCHEMA_VERSION,
         "protocol": PAPER_ANCHOR_PROTOCOL,
+        "report_variant": PAPER_ANCHOR_REPORT_VARIANT,
         "input": dict(input_manifest),
+        "regrader_source": regrader_source,
+        "upstream_rule_judge": upstream_grader,
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
         "bootstrap_seed": BOOTSTRAP_SEED,
         "files": {
             path.name: {"size": path.stat().st_size, "sha256": file_sha256(path)}
             for path in (summary_path, metrics_path)
         },
-        "wandb_run_id": stable_wandb_run_id(input_manifest),
+        "wandb_run_id": stable_wandb_run_id(
+            input_manifest, regrader_source, upstream_grader
+        ),
     }
-    manifest_path = destination / "paper_anchor_manifest.json"
+    manifest_path = destination / (PAPER_ANCHOR_REPORT_PREFIX + "_manifest.json")
     _atomic_write(manifest_path, _canonical_json(report_manifest))
     observed_run_id = _publish_wandb(
         report_manifest=report_manifest,
@@ -780,6 +1072,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    # Fail before the expensive 16,000-response scoring pass unless the exact
+    # regrader checkout and parser environment can be sealed into the result.
+    required_regrader_source_identity()
+    upstream_math500_grader_provenance()
     input_manifest = authenticate_input(args.input_dir)
     grouped = score_input(
         input_manifest, workers=args.workers, chunk_size=args.chunk_size
