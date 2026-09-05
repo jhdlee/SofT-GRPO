@@ -3321,7 +3321,7 @@ def _load_throughput_observation(
     if manifest.get("parallelism") != expected_parallelism:
         raise ValueError("throughput benchmark topology differs from its DP label")
     if (
-        manifest.get("chunk_size") != 66
+        manifest.get("chunk_size") != 11
         or float(manifest.get("gpu_memory_utilization", -1.0)) != 0.8
         or manifest.get("request_queue_size") != expected_queue
         or manifest.get("max_running_requests_per_replica") != 16
