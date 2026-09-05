@@ -288,11 +288,82 @@ def _validate_cell_provenance(cell: Mapping[str, Any], objective: str, gpus: int
         raise ValueError("timing validation must contain exactly 128 examples")
 
 
+def _read_submission(path: Path) -> dict[str, Any]:
+    """Validate the four-job registry, without claiming its source ran yet."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("submission.json must be a regular file")
+    encoded = path.read_bytes()
+    record = json.loads(encoded, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"nonfinite submission JSON number {value}")))
+    if not isinstance(record, Mapping) or type(record.get("schema_version")) is not int or record["schema_version"] != 1:
+        raise ValueError("submission schema must be version 1")
+    if record.get("profile") != "qwen3-training-benchmark-v1" or record.get("state") != "submitted":
+        raise ValueError("submission must identify the submitted Qwen3 training benchmark")
+    if not isinstance(record.get("submission_id"), str) or not record["submission_id"]:
+        raise ValueError("submission_id is missing")
+    snapshot = record.get("source_snapshot")
+    if not isinstance(snapshot, str) or not snapshot or not Path(snapshot).is_absolute():
+        raise ValueError("submission source_snapshot must be an absolute path")
+    for key in ("parent_commit", "fork_commit"):
+        if not isinstance(record.get(key), str) or re.fullmatch(r"[0-9a-f]{40}", record[key]) is None:
+            raise ValueError(f"submission {key} must be a full 40-character Git SHA")
+    seconds = record.get("job_limit_seconds")
+    if type(seconds) is not int or not 0 < seconds <= JOB_LIMIT_HOURS * 3600:
+        raise ValueError("submission job_limit_seconds must be a positive integer at most 7200")
+    gpu_hours = _number(record.get("maximum_allocated_gpu_hours"), "submission maximum_allocated_gpu_hours", positive=True)
+    if gpu_hours > MAX_ALLOCATED_GPU_HOURS:
+        raise ValueError("submission maximum_allocated_gpu_hours exceeds 12")
+    jobs = record.get("jobs")
+    if not isinstance(jobs, list) or len(jobs) != 4:
+        raise ValueError("submission must contain exactly four jobs")
+    identities, job_ids = set(), set()
+    for row in jobs:
+        if not isinstance(row, Mapping) or row.get("objective") not in OBJECTIVES:
+            raise ValueError("submission job objective must be standalone or hybrid")
+        identity = (row["objective"], _gpu_count(row.get("gpus")))
+        job_id = row.get("job_id")
+        if type(job_id) is not int or job_id <= 0:
+            raise ValueError("submission job_id must be a positive integer")
+        if identity in identities or job_id in job_ids:
+            raise ValueError("submission contains duplicate cell identities or job IDs")
+        identities.add(identity)
+        job_ids.add(job_id)
+    if identities != {(objective, gpus) for objective in OBJECTIVES for gpus in (1, 2)}:
+        raise ValueError("submission job identities differ from the four benchmark cells")
+    if seconds / 3600 * sum(row["gpus"] for row in jobs) > gpu_hours:
+        raise ValueError("submission job allocations exceed its declared GPU-hour cap")
+    return {**record, "input_path": str(path), "file_sha256": hashlib.sha256(encoded).hexdigest(),
+            "validation_note": "Validated submission metadata only; job execution and source checkout integrity require cell measurements."}
+
+
+def _match_submission_identity(cell: Mapping[str, Any], submission: Mapping[str, Any], job: Mapping[str, Any]) -> None:
+    source = cell.get("source")
+    if not isinstance(source, Mapping) or any(source.get(key) != submission[key] for key in ("parent_commit", "fork_commit")):
+        raise ValueError("cell source commits differ from submission identity")
+    if "source_snapshot" in source and source["source_snapshot"] != submission["source_snapshot"]:
+        raise ValueError("cell source snapshot differs from submission identity")
+    jobs = cell.get("jobs")
+    job_id = jobs.get("slurm_job_id") if isinstance(jobs, Mapping) else None
+    if isinstance(job_id, str) and re.fullmatch(r"[1-9][0-9]*", job_id):
+        job_id = int(job_id)
+    if type(job_id) is not int or job_id != job["job_id"]:
+        raise ValueError("cell Slurm job ID differs from submission identity")
+
+
 def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
     """Read all expected cells; absent or invalid measurements stay explicit."""
     input_root = Path(input_root)
     found: dict[tuple[str, int], list[tuple[Path, dict[str, Any]]]] = {}
     errors = []
+    submission_path = input_root / "submission.json"
+    submission = None
+    submission_error = None
+    if submission_path.exists() or submission_path.is_symlink():
+        try:
+            submission = _read_submission(submission_path)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            submission_error = str(error)
+            errors.append({"path": str(submission_path), "error": submission_error})
+    submitted_jobs = {(row["objective"], row["gpus"]): row for row in submission["jobs"]} if submission else {}
     for path in sorted(input_root.rglob("cell.json")):
         try:
             value = json.loads(path.read_text(encoding="utf-8"), parse_constant=lambda text: (_ for _ in ()).throw(ValueError(f"nonfinite JSON number {text}")))
@@ -305,16 +376,35 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
         for gpus in (1, 2):
             matches = found.get((objective, gpus), [])
             cell: dict[str, Any] = {"objective": objective, "gpus": gpus, "status": "incomplete", "estimate": None}
+            submitted_job = submitted_jobs.get((objective, gpus))
+            if submitted_job is not None:
+                cell["submission_job"] = dict(submitted_job)
             if len(matches) != 1:
                 cell["reason"] = "missing cell.json" if not matches else "duplicate cell.json files for this objective/GPU count"
+                if submitted_job is not None:
+                    cell["jobs"] = {"slurm_job_id": str(submitted_job["job_id"])}
+                    cell["source"] = {key: submission[key] for key in ("parent_commit", "fork_commit", "source_snapshot")}
+                    cell["source"]["identity_origin"] = "submission_manifest"
+                    if not matches:
+                        cell["reason"] = "job submitted; no cell measurement yet"
+                if submission_error is not None:
+                    cell["reason"] = "submission identity invalid: " + submission_error
                 cell["input_paths"] = [str(path) for path, _ in matches]
                 cells.append(cell)
                 continue
             path, raw = matches[0]
             cell.update(raw)
+            if submitted_job is not None:
+                cell["submission_job"] = dict(submitted_job)
             cell.update({"objective": objective, "gpus": gpus, "status": "incomplete", "estimate": None, "input_path": str(path), "measurement_status": raw.get("status")})
             cell["dispatch_selection"] = select_dispatch(raw.get("screen_rows", []), raw.get("confirm_rows", []))
             try:
+                if submission_error is not None:
+                    raise ValueError("submission identity invalid: " + submission_error)
+                if submission is not None:
+                    cell["submission_identity_matches"] = False
+                    _match_submission_identity(raw, submission, submitted_job)
+                    cell["submission_identity_matches"] = True
                 if raw.get("status") not in ("complete", "completed"):
                     raise ValueError(raw.get("reason") or f"benchmark status is {raw.get('status', 'missing')}")
                 _validate_cell_provenance(raw, objective, gpus)
@@ -326,6 +416,7 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL,
         "preliminary": True,
+        "submission": submission,
         "recipe": {"model": MODEL_ID, "model_revision": MODEL_REVISION, "train_examples": TRAIN_EXAMPLES, "train_batch_size": TRAIN_BATCH_SIZE, "rollout_iterations": ROLLOUT_ITERATIONS, "optimizer_steps": OPTIMIZER_STEPS, "max_response_tokens": MAX_RESPONSE_TOKENS, "hybrid_warmup_iterations": 11, "validation_examples": VALIDATION_EXAMPLES, "timing_validation_examples": TIMING_VALIDATION_EXAMPLES, "validation_events": VALIDATION_EVENTS, "checkpoint_saves": CHECKPOINT_SAVES},
         "budget": {"jobs": 4, "hours_per_job": JOB_LIMIT_HOURS, "maximum_allocated_gpu_hours": MAX_ALLOCATED_GPU_HOURS},
         "cells": cells,
@@ -433,6 +524,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "| Objective | H100s | Status | Dispatch | Central hours | 1.5× hours | 2× hours | Central GPU-hours |",
         "| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |",
     ]
+    submission = report.get("submission")
+    if submission:
+        lines[6:6] = [f"Submission `{_markdown_value(submission['submission_id'])}`: four submitted jobs; registry SHA-256 `{submission['file_sha256']}`. Submission metadata identifies scheduled jobs; execution and source checkout integrity still require cell measurements.", ""]
     for cell in report["cells"]:
         estimate = cell.get("estimate")
         times = [f"{estimate['scenarios'][key]['hours']:.2f}" for key in ("1.0", "1.5", "2.0")] if estimate else ["—"] * 3

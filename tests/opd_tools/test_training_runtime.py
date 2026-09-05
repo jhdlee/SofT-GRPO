@@ -340,3 +340,136 @@ def test_teacher_diagnostics_show_max_rank_wall_without_changing_runtime(tmp_pat
     assert "| Active mean (iterations 1–2) | 70.00 | 25.00 | 5.00 | 2.00 | 20.00 | unavailable | 10.00 |" in markdown
     assert "CUDA synchronization cost is included" in markdown
     assert "never added to actor time or the runtime estimate" in markdown
+
+
+def submission_record():
+    return {
+        "schema_version": 1,
+        "submission_id": "qwen-training-test",
+        "source_snapshot": "/remote/snapshots/qwen-training",
+        "parent_commit": "a" * 40,
+        "fork_commit": "b" * 40,
+        "profile": "qwen3-training-benchmark-v1",
+        "job_limit_seconds": 7200,
+        "maximum_allocated_gpu_hours": 12,
+        "jobs": [
+            {"objective": objective, "gpus": gpus, "job_id": 100 + index}
+            for index, (objective, gpus) in enumerate(
+                (("standalone", 1), ("standalone", 2), ("hybrid", 1), ("hybrid", 2))
+            )
+        ],
+        "state": "submitted",
+    }
+
+
+def test_pending_submission_retains_job_source_and_registry_identity_without_measurements(tmp_path):
+    submission = submission_record()
+    path = tmp_path / "submission.json"
+    atomic_write_json(path, submission)
+    report = aggregate_cells(tmp_path)
+    assert report["submission"]["file_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    for cell, job in zip(report["cells"], submission["jobs"]):
+        assert cell["status"] == "incomplete"
+        assert cell["estimate"] is None
+        assert cell["reason"] == "job submitted; no cell measurement yet"
+        assert cell["jobs"] == {"slurm_job_id": str(job["job_id"])}
+        assert cell["source"]["parent_commit"] == submission["parent_commit"]
+        assert cell["source"]["fork_commit"] == submission["fork_commit"]
+        assert cell["source"]["source_snapshot"] == submission["source_snapshot"]
+        assert "snapshot_verified" not in cell["source"]
+        assert cell["source"]["identity_origin"] == "submission_manifest"
+    assert all(row["gpus"] is None for row in report["recommendations"])
+    markdown = render_markdown(report)
+    assert "Submission `qwen-training-test`" in markdown
+    assert "registry SHA-256" in markdown
+    assert "job submitted; no cell measurement yet" in markdown
+    assert '"slurm_job_id": "103"' in markdown
+    assert "| hybrid | 2 | incomplete | unmeasured |" in markdown
+
+
+@pytest.mark.parametrize("change", [
+    "duplicate_cell", "duplicate_job", "missing_job", "unknown_objective",
+    "string_gpu", "bool_gpu", "string_job", "bool_job", "negative_job",
+    "short_parent", "uppercase_fork", "string_time", "bool_time", "over_time",
+    "over_gpu_hours", "underdeclared_gpu_hours", "string_gpu_hours", "nan_gpu_hours",
+    "wrong_profile", "partial_submission", "relative_snapshot", "bool_schema",
+])
+def test_invalid_submission_metadata_is_rejected_before_any_estimate(tmp_path, change):
+    submission = submission_record()
+    if change == "duplicate_cell":
+        submission["jobs"][1]["gpus"] = 1
+    elif change == "duplicate_job":
+        submission["jobs"][1]["job_id"] = submission["jobs"][0]["job_id"]
+    elif change == "missing_job":
+        submission["jobs"].pop()
+    elif change == "unknown_objective":
+        submission["jobs"][0]["objective"] = "standalone_opd"
+    elif change in ("string_gpu", "bool_gpu"):
+        submission["jobs"][0]["gpus"] = "1" if change == "string_gpu" else True
+    elif change in ("string_job", "bool_job", "negative_job"):
+        submission["jobs"][0]["job_id"] = {"string_job": "100", "bool_job": True, "negative_job": -1}[change]
+    elif change == "short_parent":
+        submission["parent_commit"] = "abcdef"
+    elif change == "uppercase_fork":
+        submission["fork_commit"] = "B" * 40
+    elif change in ("string_time", "bool_time", "over_time"):
+        submission["job_limit_seconds"] = {"string_time": "7200", "bool_time": True, "over_time": 7201}[change]
+    elif change in ("over_gpu_hours", "underdeclared_gpu_hours", "string_gpu_hours", "nan_gpu_hours"):
+        submission["maximum_allocated_gpu_hours"] = {"over_gpu_hours": 12.1, "underdeclared_gpu_hours": 10, "string_gpu_hours": "12", "nan_gpu_hours": float("nan")}[change]
+    elif change == "wrong_profile":
+        submission["profile"] = "other"
+    elif change == "partial_submission":
+        submission["state"] = "submitting"
+    elif change == "relative_snapshot":
+        submission["source_snapshot"] = "snapshot"
+    else:
+        submission["schema_version"] = True
+    (tmp_path / "submission.json").write_text(json.dumps(submission), encoding="utf-8")
+    atomic_write_json(tmp_path / "standalone-gpu1" / "cell.json", complete_cell())
+    report = aggregate_cells(tmp_path)
+    assert report["submission"] is None
+    assert any(error["path"].endswith("submission.json") for error in report["input_errors"])
+    assert all(cell["status"] == "incomplete" and cell["estimate"] is None for cell in report["cells"])
+    assert "submission identity invalid" in report["cells"][0]["reason"]
+
+
+@pytest.mark.parametrize("change", [None, "job", "parent", "fork", "snapshot", "missing_source"])
+def test_measured_cell_must_match_submission_source_and_job(tmp_path, change):
+    submission = submission_record()
+    cell = complete_cell()
+    cell["jobs"] = {"slurm_job_id": str(submission["jobs"][0]["job_id"])}
+    if change == "job":
+        cell["jobs"]["slurm_job_id"] = "999"
+    elif change in ("parent", "fork"):
+        cell["source"][change + "_commit"] = "c" * 40
+    elif change == "snapshot":
+        cell["source"]["source_snapshot"] = "/wrong/snapshot"
+    elif change == "missing_source":
+        del cell["source"]
+    atomic_write_json(tmp_path / "submission.json", submission)
+    atomic_write_json(tmp_path / "standalone-gpu1" / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    measured = report["cells"][0]
+    assert measured["submission_job"] == submission["jobs"][0]
+    assert measured["submission_identity_matches"] is (change is None)
+    if change is None:
+        assert measured["status"] == "complete"
+        assert measured["estimate"] is not None
+    else:
+        assert measured["status"] == "incomplete"
+        assert measured["estimate"] is None
+        assert "submission identity" in measured["reason"]
+
+
+def test_submission_may_use_a_smaller_consistent_budget_and_rejects_symlinks(tmp_path):
+    submission = submission_record()
+    submission.update(job_limit_seconds=3600, maximum_allocated_gpu_hours=6)
+    original = tmp_path / "registry.json"
+    atomic_write_json(original, submission)
+    (tmp_path / "submission.json").symlink_to(original)
+    rejected = aggregate_cells(tmp_path)
+    assert rejected["submission"] is None
+    assert "regular file" in rejected["input_errors"][0]["error"]
+    (tmp_path / "submission.json").unlink()
+    atomic_write_json(tmp_path / "submission.json", submission)
+    assert aggregate_cells(tmp_path)["submission"]["job_limit_seconds"] == 3600
