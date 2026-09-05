@@ -291,8 +291,8 @@ def _render(
         )
     # This no-specials pass only validates that the rendered template is
     # tokenizable. Generation itself intentionally follows the released
-    # SGLang text API, whose TokenizerManager encodes the string again with
-    # tokenizer defaults (and therefore adds the checkpoint's second BOS).
+    # SGLang text API, whose TokenizerManager encodes the complete string
+    # again using the checkpoint's tokenizer defaults.
     ids = tokenizer.encode(rendered, add_special_tokens=False)
     if not ids:
         raise RuntimeError("rendered chat prompt tokenized to empty")
