@@ -6,13 +6,23 @@ from dataclasses import replace
 import pytest
 
 import opd_tools.icl_eval as cli
-from opd_tools.icl import CORE_CONDITIONS, ICLEvaluationExample, ICLMatrixCell, request_seed
+from opd_tools.icl import (
+    CORE_CONDITIONS,
+    QWEN3_STUDY_ID,
+    ICLEvaluationExample,
+    ICLMatrixCell,
+    request_seed,
+)
 from opd_tools.icl_eval import (
     _finish_generation_resources,
     _generation_chunk_identity,
     _grade,
     _primary_grade,
+    _run_symmetric_throughput_warmup,
+    _cell_metric_rows,
+    _comparison_rows,
     _render,
+    _throughput_warmup_contract,
     _validate_completion_records,
     _validate_generation_binding,
     _validate_replay_records,
@@ -37,6 +47,19 @@ class _Tokenizer:
     def apply_chat_template(self, messages, tokenize, add_generation_prompt):
         self.calls.append((messages, tokenize, add_generation_prompt))
         return "native-chat-prefix" + self.suffix
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        return [1, 2]
+
+
+class _Qwen3Tokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        return "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n<think>\n"
 
     def encode(self, text, add_special_tokens=False):
         assert add_special_tokens is False
@@ -174,6 +197,126 @@ def test_render_uses_native_template_once_without_added_specials():
     ]
     with pytest.raises(RuntimeError, match="native assistant"):
         _render(_Tokenizer(suffix="assistant>"), "Question")
+
+
+def test_qwen3_render_enables_native_thinking_and_seals_one_fixed_opener():
+    tokenizer = _Qwen3Tokenizer()
+    rendered = _render(tokenizer, "Question", study=QWEN3_STUDY_ID)
+    assert rendered.endswith("<|im_start|>assistant\n<think>\n")
+    assert rendered.count("<think>\n") == 1
+    assert tokenizer.calls == [
+        (
+            [{"role": "user", "content": "Question"}],
+            {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": True,
+            },
+        )
+    ]
+
+
+def test_throughput_warmup_is_dedicated_and_symmetric_per_replica():
+    tokenizer = _Qwen3Tokenizer()
+
+    class Engine:
+        def __init__(self):
+            self.calls = []
+
+        def warmup(self, prompt, seed, *, max_new_tokens):
+            self.calls.append((prompt, seed, max_new_tokens))
+
+    engine = Engine()
+    _run_symmetric_throughput_warmup(
+        engine,
+        tokenizer,
+        study=QWEN3_STUDY_ID,
+        data_parallel_size=2,
+    )
+    assert len(engine.calls) == 2
+    assert engine.calls[0] == engine.calls[1]
+    assert engine.calls[0][2] == 32
+    assert tokenizer.calls[0][0][0]["content"].startswith("Warm-up request only")
+    dp1 = _throughput_warmup_contract(1)
+    dp2 = _throughput_warmup_contract(2)
+    assert dp1["request_count"] == 1
+    assert dp2["request_count"] == 2
+    assert {key: value for key, value in dp1.items() if key != "request_count"} == {
+        key: value for key, value in dp2.items() if key != "request_count"
+    }
+
+
+def _qwen_states(*, capped_math=False):
+    states = {}
+    value = {0: True}
+    for model in ("qwen3_0p6b", "qwen3_1p7b"):
+        for mode in ("native_soft", "hard_token"):
+            for benchmark in ("math500", "aime2024"):
+                outcomes = {
+                    grader: {benchmark + "-0": dict(value)}
+                    for grader in ("math_verify", "released_last_boxed")
+                }
+                for condition in CORE_CONDITIONS:
+                    states[(model, mode, benchmark, condition)] = {
+                        "sample_count": 1,
+                        "outcomes": outcomes,
+                        "count": 1,
+                        "capped_or_all_soft": int(
+                            capped_math
+                            and mode == "native_soft"
+                            and benchmark == "math500"
+                        ),
+                    }
+    return states
+
+
+def test_qwen3_pass1_rows_have_no_pass8_fields():
+    rows = _cell_metric_rows(
+        _qwen_states(), smoke=False, study=QWEN3_STUDY_ID
+    )
+    assert rows
+    assert all(row["samples_per_example"] == 1 for row in rows)
+    assert all("pass_at_8" not in row for row in rows)
+    assert all("pass_at_8_ci_low" not in row for row in rows)
+    flattened = cli._flatten_wandb(rows, [], [], [])
+    assert not any("pass_at_8" in key for key in flattened)
+
+
+def test_qwen3_comparisons_have_registered_directions_and_math_only_gate():
+    rows = _comparison_rows(
+        _qwen_states(capped_math=True),
+        smoke=False,
+        study=QWEN3_STUDY_ID,
+    )
+    assert rows
+    assert {row["estimand"] for row in rows} == {"pass_at_1"}
+    assert "sdpg_matched_minus_sdft_matched" in {
+        row["comparison"] for row in rows
+    }
+    assert "soft_thinking_minus_discrete_token_cot" in {
+        row["comparison"] for row in rows
+    }
+    assert "qwen3_1p7b_minus_qwen3_0p6b" in {
+        row["comparison"] for row in rows
+    }
+    math_soft = [
+        row
+        for row in rows
+        if row["benchmark"] == "math500"
+        and row["treatment_inference_mode"] == "native_soft"
+    ]
+    assert math_soft and all(
+        row["treatment_boundary_gate_applied"]
+        and row["treatment_boundary_gate_valid"] is False
+        for row in math_soft
+    )
+    aime = [row for row in rows if row["benchmark"] == "aime2024"]
+    assert aime and all(
+        not row["treatment_boundary_gate_applied"]
+        and row["treatment_boundary_gate_valid"] is None
+        and row["comparison_boundary_gate_valid"] is None
+        for row in aime
+    )
 
 
 def test_aime_graders_compare_integer_value_not_prompt_padding(monkeypatch):
@@ -641,6 +784,44 @@ def test_public_cli_exposes_all_four_commands_and_output_overrides():
     assert aggregate.smoke and aggregate.output_dir.endswith("reports")
 
 
+def test_qwen3_cli_selects_both_models_and_modes_and_disables_replay(monkeypatch):
+    parser = build_parser()
+    for model in ("qwen3_0p6b", "qwen3_1p7b"):
+        for mode in ("native_soft", "hard_token"):
+            args = parser.parse_args(
+                [
+                    "generate",
+                    "--study",
+                    QWEN3_STUDY_ID,
+                    "--root",
+                    "/scratch/root",
+                    "--model",
+                    model,
+                    "--mode",
+                    mode,
+                    "--smoke",
+                ]
+            )
+            cells = cli._selected_cells(args)
+            assert len(cells) == 6
+            assert {cell.sample_count for cell in cells} == {1}
+            assert {cell.example_count for cell in cells} == {16}
+
+    monkeypatch.delenv("SLURM_GPUS_ON_NODE", raising=False)
+    with pytest.raises(ValueError, match="does not schedule latent replay"):
+        cli.main(
+            [
+                "replay",
+                "--study",
+                QWEN3_STUDY_ID,
+                "--root",
+                "/scratch/root",
+                "--model",
+                "qwen3_0p6b",
+            ]
+        )
+
+
 def test_generate_cli_binds_tp_times_dp_to_slurm_allocation(monkeypatch):
     observed = []
     monkeypatch.setattr(cli, "run_generate", lambda args: observed.append(args))
@@ -700,6 +881,92 @@ def test_generate_cli_binds_tp_times_dp_to_slurm_allocation(monkeypatch):
             ]
         )
 
+
+def test_qwen3_throughput_benchmark_cli_is_distinct_and_step_scoped(monkeypatch):
+    observed = []
+    monkeypatch.setattr(cli, "run_generate", lambda args: observed.append(args))
+    monkeypatch.setenv("SLURM_GPUS_ON_NODE", "2")
+    monkeypatch.setenv("OPD_EXPECTED_VISIBLE_GPUS", "1")
+    cli.main(
+        [
+            "generate",
+            "--study",
+            "qwen3_icl_pass1_v1",
+            "--root",
+            "/scratch/root",
+            "--model",
+            "qwen3_0p6b",
+            "--mode",
+            "native_soft",
+            "--data-parallel-size",
+            "1",
+            "--max-running-requests",
+            "16",
+            "--queue-size",
+            "32",
+            "--throughput-benchmark",
+        ]
+    )
+    assert len(observed) == 1
+    assert observed[0].throughput_benchmark is True
+    assert observed[0].smoke is False
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cli.main(
+            [
+                "generate",
+                "--study",
+                "qwen3_icl_pass1_v1",
+                "--root",
+                "/scratch/root",
+                "--model",
+                "qwen3_0p6b",
+                "--mode",
+                "native_soft",
+                "--smoke",
+                "--throughput-benchmark",
+            ]
+        )
+    with pytest.raises(ValueError, match="all registered"):
+        cli.main(
+            [
+                "generate",
+                "--study",
+                "qwen3_icl_pass1_v1",
+                "--root",
+                "/scratch/root",
+                "--model",
+                "qwen3_0p6b",
+                "--mode",
+                "native_soft",
+                "--benchmarks",
+                "math500",
+                "--throughput-benchmark",
+            ]
+        )
+
+
+def test_benchmark_report_cli_routes_required_evidence(monkeypatch):
+    observed = []
+    monkeypatch.setattr(cli, "run_benchmark_report", lambda args: observed.append(args))
+    cli.main(
+        [
+            "benchmark-report",
+            "--study",
+            "qwen3_icl_pass1_v1",
+            "--root",
+            "/scratch/assets",
+            "--dp1-generation-dir",
+            "/scratch/dp1",
+            "--dp2-generation-dir",
+            "/scratch/dp2",
+            "--output-dir",
+            "/scratch/report",
+        ]
+    )
+    assert len(observed) == 1
+    assert observed[0].dp1_generation_dir == "/scratch/dp1"
+    assert observed[0].dp2_generation_dir == "/scratch/dp2"
 
 def test_generate_cli_rejects_removed_benchmark_and_shuffled_condition():
     parser = build_parser()

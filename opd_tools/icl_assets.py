@@ -11,11 +11,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .icl import (
+    LEGACY_STUDY_ID,
+    MODEL_SOURCES,
     SOFTGRPO_MODEL_ID,
     SOFTGRPO_MODEL_REVISION,
     SOFTGRPO_MODEL_SUBFOLDER,
     STARTING_MODEL_ID,
     STARTING_MODEL_REVISION,
+    get_study_profile,
     prepare_icl_dataset,
     verify_icl_dataset,
 )
@@ -25,18 +28,33 @@ from .icl_runtime import canonical_json_bytes, sha256_file
 ASSET_SCHEMA_VERSION = 1
 ASSET_PROTOCOL = "opd-softgrpo-icl-assets-v1"
 
+# Historical public constants remain byte-for-byte compatible with existing
+# manifests and callers. New studies resolve their own isolated specifications
+# through ``model_specs_for_study``.
 MODEL_SPECS = {
-    "starting": {
-        "repo_id": STARTING_MODEL_ID,
-        "revision": STARTING_MODEL_REVISION,
-        "subfolder": None,
-    },
-    "softgrpo": {
-        "repo_id": SOFTGRPO_MODEL_ID,
-        "revision": SOFTGRPO_MODEL_REVISION,
-        "subfolder": SOFTGRPO_MODEL_SUBFOLDER,
-    },
+    label: dict(spec) for label, spec in MODEL_SOURCES.items()
 }
+
+
+def model_specs_for_study(study: str | None = None) -> dict[str, dict[str, Any]]:
+    profile = get_study_profile(study)
+    return {
+        label: dict(profile.model_sources[label])
+        for label in profile.model_labels
+    }
+
+
+def _manifest_study(manifest: Mapping[str, Any], requested: str | None) -> str:
+    declared = manifest.get("study_id", LEGACY_STUDY_ID)
+    if not isinstance(declared, str):
+        raise ValueError("ICL asset manifest study_id is invalid")
+    get_study_profile(declared)
+    if requested is not None and declared != requested:
+        raise ValueError(
+            "ICL asset manifest belongs to study %s, not %s"
+            % (declared, requested)
+        )
+    return declared
 
 
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -125,7 +143,9 @@ def _stage_one(destination: Path, spec: Mapping[str, Any], cache_dir: Path) -> N
         shutil.rmtree(temporary, ignore_errors=True)
 
 
-def verify_icl_assets(root: Path | str) -> dict[str, Any]:
+def verify_icl_assets(
+    root: Path | str, *, study: str | None = None
+) -> dict[str, Any]:
     asset_root = Path(root).expanduser().resolve()
     manifest_path = asset_root / "asset_manifest.json"
     if not manifest_path.is_file():
@@ -136,26 +156,55 @@ def verify_icl_assets(root: Path | str) -> dict[str, Any]:
     unsigned.pop("content_sha256", None)
     if claimed != hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest():
         raise ValueError("ICL asset manifest content hash changed")
+    study_id = _manifest_study(manifest, study)
+    profile = get_study_profile(study_id)
+    model_specs = model_specs_for_study(study_id)
     if (
         manifest.get("schema_version") != ASSET_SCHEMA_VERSION
-        or manifest.get("protocol") != ASSET_PROTOCOL
-        or manifest.get("model_specs") != MODEL_SPECS
+        or manifest.get("protocol") != profile.asset_protocol
+        or manifest.get("model_specs") != model_specs
     ):
         raise ValueError("ICL asset protocol or pins changed")
+    if study_id != LEGACY_STUDY_ID and manifest.get("study_id") != study_id:
+        raise ValueError("non-legacy ICL assets must declare their study_id")
     verify_icl_dataset(asset_root / "data")
     observed = {
         label: model_inventory(asset_root / "models" / label)
-        for label in MODEL_SPECS
+        for label in model_specs
     }
     expected = manifest.get("models")
-    for label in MODEL_SPECS:
+    if not isinstance(expected, Mapping) or set(expected) != set(model_specs):
+        raise ValueError("ICL asset model inventory is missing")
+    expected_paths = {
+        "data": str(asset_root / "data"),
+        **{
+            label: str(asset_root / "models" / label)
+            for label in model_specs
+        },
+    }
+    if manifest.get("paths") != expected_paths:
+        raise ValueError("ICL asset paths differ from the isolated root")
+    models_root = asset_root / "models"
+    staged_labels = {
+        path.name
+        for path in models_root.iterdir()
+        if not path.name.startswith(".")
+    }
+    if staged_labels != set(model_specs):
+        raise ValueError("ICL asset root mixes models from different studies")
+    for label in model_specs:
         if observed[label]["tree_sha256"] != expected.get(label, {}).get("tree_sha256"):
             raise ValueError("%s model tree changed" % label)
     return manifest
 
 
-def prepare_icl_assets(root: Path | str, cache_dir: Path | str) -> dict[str, Any]:
-    """Stage both exact checkpoints and all data under one scratch root."""
+def prepare_icl_assets(
+    root: Path | str,
+    cache_dir: Path | str,
+    *,
+    study: str | None = None,
+) -> dict[str, Any]:
+    """Stage one study's exact checkpoints and data under an isolated root."""
 
     try:
         from filelock import FileLock
@@ -163,33 +212,53 @@ def prepare_icl_assets(root: Path | str, cache_dir: Path | str) -> dict[str, Any
         raise RuntimeError("race-safe preparation requires filelock") from error
     asset_root = Path(root).expanduser().resolve()
     cache = Path(cache_dir).expanduser().resolve()
+    profile = get_study_profile(study)
+    study_id = profile.study_id
+    model_specs = model_specs_for_study(study_id)
     asset_root.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
     with FileLock(str(asset_root / ".prepare.lock")):
         manifest_path = asset_root / "asset_manifest.json"
         if manifest_path.exists():
-            return verify_icl_assets(asset_root)
-        for label, spec in MODEL_SPECS.items():
+            return verify_icl_assets(asset_root, study=study_id)
+        models_root = asset_root / "models"
+        if models_root.exists():
+            staged_labels = {
+                path.name
+                for path in models_root.iterdir()
+                if not path.name.startswith(".")
+            }
+            unexpected = staged_labels - set(model_specs)
+            if unexpected:
+                raise ValueError(
+                    "ICL asset root already contains models from another study: %s"
+                    % sorted(unexpected)
+                )
+        for label, spec in model_specs.items():
             _stage_one(asset_root / "models" / label, spec, cache / "huggingface")
         data_manifest = prepare_icl_dataset(asset_root / "data", cache / "datasets")
         models = {
             label: model_inventory(asset_root / "models" / label)
-            for label in MODEL_SPECS
+            for label in model_specs
         }
         manifest = {
             "schema_version": ASSET_SCHEMA_VERSION,
-            "protocol": ASSET_PROTOCOL,
-            "model_specs": MODEL_SPECS,
+            "protocol": profile.asset_protocol,
+            "model_specs": model_specs,
             "models": models,
             "data_content_sha256": data_manifest["content_sha256"],
-            "paths": {
-                "data": str(asset_root / "data"),
-                "starting": str(asset_root / "models" / "starting"),
-                "softgrpo": str(asset_root / "models" / "softgrpo"),
-            },
+            "paths": {"data": str(asset_root / "data")},
         }
+        if study_id != LEGACY_STUDY_ID:
+            manifest["study_id"] = study_id
+        manifest["paths"].update(
+            {
+                label: str(asset_root / "models" / label)
+                for label in model_specs
+            }
+        )
         manifest["content_sha256"] = hashlib.sha256(
             canonical_json_bytes(manifest)
         ).hexdigest()
         _atomic_write(manifest_path, manifest)
-        return verify_icl_assets(asset_root)
+        return verify_icl_assets(asset_root, study=study_id)

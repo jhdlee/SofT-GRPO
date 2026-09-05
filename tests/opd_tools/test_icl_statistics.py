@@ -38,6 +38,26 @@ class ICLStatisticsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pass_at_k(8, 1, 9)
 
+    def test_single_sample_profile_emits_pass_at_1_only(self):
+        outcomes = {"a": (True,), "b": (False,)}
+        by_example = pass_metrics_by_example(outcomes, expected_samples=1)
+        self.assertEqual(by_example["a"], {"pass_at_1": 1.0})
+        self.assertEqual(by_example["b"], {"pass_at_1": 0.0})
+        summary = summarize_pass_metrics(outcomes, expected_samples=1)
+        self.assertEqual(
+            summary,
+            {
+                "pass_at_1": 0.5,
+                "example_count": 2,
+                "samples_per_example": 1,
+            },
+        )
+        self.assertNotIn("pass_at_8", summary)
+        with self.assertRaisesRegex(ValueError, "one boolean"):
+            pass_metrics_by_example({"a": (True, False)}, expected_samples=1)
+        with self.assertRaisesRegex(ValueError, "one or eight"):
+            pass_metrics_by_example({"a": (True, False)}, expected_samples=2)
+
     def test_bootstrap_is_paired_deterministic_and_exactly_10000(self):
         treatment = {"a": 1.0, "b": 1.0, "c": 0.0, "d": 1.0}
         control = {"a": 0.0, "b": 1.0, "c": 0.0, "d": 0.0}

@@ -35,6 +35,10 @@ import numpy as np
 from .icl import (
     ICL_PROTOCOL,
     INFERENCE_MODES,
+    LEGACY_STUDY_ID,
+    QWEN3_STUDY_ID,
+    STUDY_PROFILES,
+    get_study_profile,
     request_seed,
     validate_matrix_cell,
 )
@@ -70,7 +74,9 @@ ICL_IMPLEMENTATION_FILES = (
     "opd_tools/icl_assets.py",
     "opd_tools/icl_runtime.py",
     "opd_tools/icl_replay.py",
+    "opd_tools/icl_resource_monitor.py",
     "opd_tools/icl_eval.py",
+    "opd_tools/icl_throughput.py",
 )
 
 
@@ -191,14 +197,34 @@ def source_provenance() -> dict[str, Any]:
     }
 
 
+def _study_for_model(model_label: str) -> str:
+    """Resolve an unambiguous study for persisted records without schema churn."""
+
+    matches = tuple(
+        study_id
+        for study_id, profile in STUDY_PROFILES.items()
+        if model_label in profile.model_labels
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            "model label %r does not identify exactly one ICL study" % model_label
+        )
+    return matches[0]
+
+
 def stable_request_seed(
-    *, benchmark: str, example_id: str, sample_index: int, study_seed: int = 11
+    *,
+    benchmark: str,
+    example_id: str,
+    sample_index: int,
+    study_seed: int = 11,
+    study: str | None = None,
 ) -> int:
     """Delegate to the CPU contract's sole common-random-number derivation."""
 
     if study_seed != 11:
         raise ValueError("the registered evaluation uses study seed 11")
-    return request_seed(benchmark, example_id, sample_index)
+    return request_seed(benchmark, example_id, sample_index, study=study)
 
 
 def validate_generation_cell(
@@ -206,8 +232,13 @@ def validate_generation_cell(
     mode: str,
     condition: str,
     benchmark: str = "math500",
+    *,
+    study: str | None = None,
 ) -> None:
-    validate_matrix_cell(model_label, mode, condition, benchmark)
+    resolved_study = _study_for_model(model_label) if study is None else study
+    validate_matrix_cell(
+        model_label, mode, condition, benchmark, study=resolved_study
+    )
 
 
 @dataclass(frozen=True)
@@ -220,6 +251,11 @@ class SamplingSettings:
     gumbel_temperature: float = 0.1
     max_new_tokens: int = 32_768
     think_end: str = "</think>"
+
+    @classmethod
+    def for_study(cls, study: str | None = None) -> "SamplingSettings":
+        profile = get_study_profile(study)
+        return cls(max_new_tokens=profile.max_response_tokens)
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.top_p) <= 1.0:
@@ -306,10 +342,17 @@ class CompletionRecord:
             raise ValueError("benchmark and example_id must be nonempty")
         if not 0 <= self.sample_index < 8:
             raise ValueError("sample_index must be in [0, 8)")
+        study = _study_for_model(self.model_label)
+        profile = get_study_profile(study)
+        if self.sample_index >= profile.production_sample_count:
+            raise ValueError(
+                "sample_index exceeds the registered study sample count"
+            )
         if self.request_seed != stable_request_seed(
             benchmark=self.benchmark,
             example_id=self.example_id,
             sample_index=self.sample_index,
+            study=study,
         ):
             raise ValueError("request_seed does not match the common-seed derivation")
         if not isinstance(self.response, str):
@@ -489,11 +532,15 @@ def parse_sglang_completion(
     replay_row: int,
     settings: SamplingSettings,
     think_end_id: int,
+    study: str | None = None,
     probability_tolerance: float = 5e-3,
 ) -> tuple[CompletionRecord, TrajectoryMetadata]:
     """Validate one exact upstream result and retain only sufficient replay state."""
 
-    validate_generation_cell(model_label, mode, condition, benchmark)
+    resolved_study = _study_for_model(model_label) if study is None else study
+    validate_generation_cell(
+        model_label, mode, condition, benchmark, study=resolved_study
+    )
     if not isinstance(output, Mapping):
         raise TypeError("SGLang output must be a mapping")
     meta = output.get("meta_info")
@@ -508,7 +555,10 @@ def parse_sglang_completion(
     final_box_span = _balanced_nonempty_final_box_span(response)
     boxed = final_box_span is not None
     request_seed = stable_request_seed(
-        benchmark=benchmark, example_id=example_id, sample_index=sample_index
+        benchmark=benchmark,
+        example_id=example_id,
+        sample_index=sample_index,
+        study=resolved_study,
     )
 
     if mode == "hard_token":
@@ -894,11 +944,18 @@ class AtomicChunkStore:
         trajectories: Sequence[TrajectoryMetadata],
         *,
         identity: Mapping[str, Any],
+        commit_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not records or len(records) != len(trajectories):
             raise ValueError("a chunk needs aligned, nonempty records and trajectories")
         if [record.replay_row for record in records] != list(range(len(records))):
             raise ValueError("replay_row must be the zero-based row within its chunk")
+        if commit_metadata is not None:
+            if not isinstance(commit_metadata, Mapping):
+                raise TypeError("commit_metadata must be a mapping")
+            # Validate JSON safety before writing either payload file. The
+            # final manifest remains the one atomic completion marker.
+            canonical_json_bytes(dict(commit_metadata))
         records_path, replay_path, manifest_path = self.paths(chunk_key)
         if any(path.exists() for path in (records_path, replay_path, manifest_path)):
             return self.verify(chunk_key, expected_identity=identity)
@@ -923,6 +980,8 @@ class AtomicChunkStore:
                 },
             },
         }
+        if commit_metadata is not None:
+            manifest["commit_metadata"] = dict(commit_metadata)
         _atomic_bytes(manifest_path, canonical_json_bytes(manifest))
         return self.verify(chunk_key, expected_identity=identity)
 
@@ -938,7 +997,9 @@ class AtomicChunkStore:
         return records, arrays
 
 
-def validate_atomic_reasoning_tokens(tokenizer: Any) -> tuple[int, int]:
+def validate_atomic_reasoning_tokens(
+    tokenizer: Any, *, study: str | None = None
+) -> tuple[int, int]:
     result = []
     for tag in ("<think>", "</think>"):
         ids = tokenizer.encode(tag, add_special_tokens=False)
@@ -950,6 +1011,13 @@ def validate_atomic_reasoning_tokens(tokenizer: Any) -> tuple[int, int]:
         result.append(int(ids[0]))
     if result[0] == result[1]:
         raise RuntimeError("<think> and </think> share a token ID")
+    profile = get_study_profile(study)
+    expected = (profile.think_token_id, profile.close_think_token_id)
+    if any(value is not None for value in expected) and tuple(result) != expected:
+        raise RuntimeError(
+            "reasoning token IDs differ from the sealed %s contract: got %r, expected %r"
+            % (profile.study_id, tuple(result), expected)
+        )
     return result[0], result[1]
 
 
@@ -986,6 +1054,9 @@ class ReleasedSofTGRPOEngine:
         max_running_requests: int = 32,
         gpu_memory_utilization: float = 0.8,
     ) -> None:
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._active_async_iterator: Any | None = None
+        self._shutdown_complete = False
         if mode not in INFERENCE_MODES:
             raise ValueError("unsupported inference mode")
         if (
@@ -1045,7 +1116,41 @@ class ReleasedSofTGRPOEngine:
             self.engine.shutdown()
             raise RuntimeError("SGLang did not preserve the requested TP/DP topology")
 
+    def _require_open(self) -> None:
+        if getattr(self, "_shutdown_complete", False):
+            raise RuntimeError("SGLang engine has already been shut down")
+
+    def _private_event_loop(self) -> asyncio.AbstractEventLoop:
+        self._require_open()
+        loop = getattr(self, "_event_loop", None)
+        if loop is None:
+            loop = asyncio.new_event_loop()
+            self._event_loop = loop
+        elif loop.is_closed():
+            raise RuntimeError("SGLang engine's private event loop is closed")
+        if loop.is_running():
+            raise RuntimeError(
+                "synchronous ICL generation requires a non-running event loop"
+            )
+        return loop
+
+    @staticmethod
+    async def _cancel_pending_loop_tasks() -> None:
+        current = asyncio.current_task()
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     def generate(self, prompts: Sequence[str], seeds: Sequence[int]) -> list[Mapping[str, Any]]:
+        self._require_open()
+        if getattr(self, "_active_async_iterator", None) is not None:
+            raise RuntimeError("an asynchronous generation iterator is still active")
         if not prompts or len(prompts) != len(seeds):
             raise ValueError("prompts and seeds must be aligned and nonempty")
         params = [self.settings.request_params(int(seed)) for seed in seeds]
@@ -1057,6 +1162,39 @@ class ReleasedSofTGRPOEngine:
         if len(outputs) != len(prompts):
             raise RuntimeError("SGLang changed the request/output cardinality")
         return list(outputs)
+
+    def warmup(
+        self,
+        prompt: str,
+        seed: int,
+        *,
+        max_new_tokens: int = 32,
+    ) -> Mapping[str, Any]:
+        """Run one bounded asynchronous request outside benchmark timing."""
+
+        self._require_open()
+        if getattr(self, "_active_async_iterator", None) is not None:
+            raise RuntimeError("an asynchronous generation iterator is still active")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("warmup prompt must be nonempty text")
+        if (
+            isinstance(max_new_tokens, bool)
+            or not isinstance(max_new_tokens, int)
+            or max_new_tokens <= 0
+        ):
+            raise ValueError("warmup max_new_tokens must be a positive integer")
+        params = self.settings.request_params(int(seed))
+        params["max_new_tokens"] = max_new_tokens
+        result = self._private_event_loop().run_until_complete(
+            self.engine.async_generate(
+                prompt=prompt,
+                sampling_params=params,
+                return_logprob=True,
+            )
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError("SGLang returned a non-mapping warmup completion")
+        return result
 
     def generate_as_completed(
         self,
@@ -1083,10 +1221,15 @@ class ReleasedSofTGRPOEngine:
             or queue_size <= 0
         ):
             raise ValueError("queue_size must be a positive integer")
+        self._require_open()
+        if getattr(self, "_active_async_iterator", None) is not None:
+            raise RuntimeError("another asynchronous generation iterator is active")
         params = [self.settings.request_params(int(seed)) for seed in seeds]
+        request_count = len(prompts)
 
         async def iter_completed():
             pending: dict[asyncio.Task[Any], tuple[int, float]] = {}
+            completed_indices: set[int] = set()
             next_index = 0
 
             def submit(index: int) -> None:
@@ -1113,45 +1256,104 @@ class ReleasedSofTGRPOEngine:
                     # requests deterministic without constraining scheduling.
                     for task in sorted(done, key=lambda item: pending[item][0]):
                         index, submitted_at = pending.pop(task)
+                        if not isinstance(index, int) or isinstance(index, bool):
+                            raise RuntimeError(
+                                "SGLang completion index must be an integer"
+                            )
+                        if index < 0 or index >= request_count:
+                            raise RuntimeError(
+                                "SGLang completion index is outside the request range"
+                            )
+                        if index in completed_indices:
+                            raise RuntimeError(
+                                "SGLang completed one queued request more than once"
+                            )
                         output = task.result()
                         completed_at = time.perf_counter()
+                        if not isinstance(output, Mapping):
+                            raise RuntimeError(
+                                "SGLang returned a non-mapping completion"
+                            )
+                        completed_indices.add(index)
                         if next_index < len(prompts):
                             submit(next_index)
                             next_index += 1
                             # Start tokenization/submission before yielding to
                             # synchronous parsing and durable persistence.
                             await asyncio.sleep(0)
-                        if not isinstance(output, Mapping):
-                            raise RuntimeError(
-                                "SGLang returned a non-mapping completion"
-                            )
                         yield index, output, submitted_at, completed_at
+                if completed_indices != set(range(request_count)):
+                    missing = sorted(set(range(request_count)) - completed_indices)
+                    raise RuntimeError(
+                        "SGLang queue ended without exactly one completion per request: "
+                        f"missing indices {missing}"
+                    )
             finally:
                 if pending:
                     for task in pending:
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
 
-        loop = getattr(self, "_event_loop", None)
-        if loop is None or loop.is_closed():
-            loop = asyncio.new_event_loop()
-            self._event_loop = loop
-        if loop.is_running():
-            raise RuntimeError(
-                "synchronous ICL generation requires a non-running event loop"
-            )
+        loop = self._private_event_loop()
         iterator = iter_completed()
+        self._active_async_iterator = iterator
         try:
             while True:
+                self._require_open()
                 try:
                     yield loop.run_until_complete(iterator.__anext__())
                 except StopAsyncIteration:
                     break
         finally:
-            loop.run_until_complete(iterator.aclose())
+            if not loop.is_closed():
+                loop.run_until_complete(iterator.aclose())
+            if getattr(self, "_active_async_iterator", None) is iterator:
+                self._active_async_iterator = None
 
     def shutdown(self) -> None:
-        self.engine.shutdown()
+        if getattr(self, "_shutdown_complete", False):
+            return
+        loop = getattr(self, "_event_loop", None)
+        if loop is not None and loop.is_running():
+            raise RuntimeError("cannot shut down while the private event loop is running")
+
+        # Mark the owner closed before invoking backend cleanup so a failed
+        # shutdown can never admit new requests into a half-closed engine.
+        self._shutdown_complete = True
+        errors: list[BaseException] = []
+        try:
+            active = getattr(self, "_active_async_iterator", None)
+            if active is not None and loop is not None and not loop.is_closed():
+                try:
+                    loop.run_until_complete(active.aclose())
+                except BaseException as error:  # pragma: no cover - defensive
+                    errors.append(error)
+                finally:
+                    self._active_async_iterator = None
+            try:
+                self.engine.shutdown()
+            except BaseException as error:  # pragma: no cover - backend failure
+                errors.append(error)
+        finally:
+            if loop is not None and not loop.is_closed():
+                try:
+                    loop.run_until_complete(self._cancel_pending_loop_tasks())
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    remaining = [
+                        task
+                        for task in asyncio.all_tasks(loop)
+                        if not task.done()
+                    ]
+                    if remaining:
+                        raise RuntimeError(
+                            "private event loop still has pending tasks at shutdown"
+                        )
+                except BaseException as error:  # pragma: no cover - defensive
+                    errors.append(error)
+                finally:
+                    loop.close()
+        if errors:
+            raise errors[0]
 
 
 def generation_chunk_metrics(
@@ -1243,9 +1445,15 @@ def init_online_wandb(*, run_id: str, config: Mapping[str, Any], job_type: str):
         import wandb
     except ImportError as error:
         raise RuntimeError("ICL evaluation requires wandb") from error
+    study = config.get("study_id", config.get("study", LEGACY_STUDY_ID))
+    default_group = (
+        "qwen3-icl-pass1-seed11"
+        if study == QWEN3_STUDY_ID
+        else "native-soft-icl-seed11"
+    )
     return wandb.init(
         project=os.environ.get("WANDB_PROJECT", "opd-softgrpo-icl"),
-        group=os.environ.get("WANDB_GROUP", "native-soft-icl-seed11"),
+        group=os.environ.get("WANDB_GROUP", default_group),
         id=run_id,
         resume="allow",
         job_type=job_type,

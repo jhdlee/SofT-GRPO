@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from opd_tools.icl import request_seed
+from opd_tools.icl import QWEN3_STUDY_ID, request_seed
 import opd_tools.icl_runtime as icl_runtime
 from opd_tools.icl_runtime import (
     AtomicChunkStore,
@@ -22,6 +22,7 @@ from opd_tools.icl_runtime import (
     source_provenance,
     stable_request_seed,
     validate_generation_cell,
+    validate_atomic_reasoning_tokens,
 )
 
 
@@ -74,6 +75,7 @@ def test_engine_continuously_refills_bounded_async_request_queue():
             self.active = 0
             self.max_active = 0
             self.calls = []
+            self.shutdown_count = 0
 
         async def async_generate(
             self, *, prompt, sampling_params, return_logprob
@@ -84,6 +86,9 @@ def test_engine_continuously_refills_bounded_async_request_queue():
             await asyncio.sleep(0.01 if prompt == "slow" else 0)
             self.active -= 1
             return {"text": prompt, "meta_info": {}}
+
+        def shutdown(self):
+            self.shutdown_count += 1
 
     backend = _AsyncEngine()
     engine = object.__new__(ReleasedSofTGRPOEngine)
@@ -112,6 +117,183 @@ def test_engine_continuously_refills_bounded_async_request_queue():
         ("fast-3", 13, True),
         ("slow", 10, True),
     ]
+    loop = engine._event_loop
+    engine.shutdown()
+    assert loop.is_closed()
+    assert backend.shutdown_count == 1
+
+
+def test_engine_warmup_is_bounded_and_reuses_private_loop():
+    class _AsyncEngine:
+        def __init__(self):
+            self.calls = []
+            self.shutdown_count = 0
+
+        async def async_generate(self, *, prompt, sampling_params, return_logprob):
+            self.calls.append((prompt, sampling_params, return_logprob))
+            return {"text": "warm", "meta_info": {}}
+
+        def shutdown(self):
+            self.shutdown_count += 1
+
+    backend = _AsyncEngine()
+    engine = object.__new__(ReleasedSofTGRPOEngine)
+    engine.settings = SamplingSettings(max_new_tokens=32_768)
+    engine.engine = backend
+    output = engine.warmup("prompt", 17, max_new_tokens=32)
+    assert output["text"] == "warm"
+    assert backend.calls[0][0] == "prompt"
+    assert backend.calls[0][1]["seed"] == 17
+    assert backend.calls[0][1]["max_new_tokens"] == 32
+    assert backend.calls[0][2] is True
+    loop = engine._event_loop
+    assert not loop.is_closed()
+    engine.shutdown()
+    assert loop.is_closed()
+    assert backend.shutdown_count == 1
+
+
+def test_engine_cancels_async_requests_when_iterator_is_closed_early():
+    class _AsyncEngine:
+        def __init__(self):
+            self.active = 0
+            self.cancelled = []
+            self.shutdown_count = 0
+
+        async def async_generate(
+            self, *, prompt, sampling_params, return_logprob
+        ):
+            del sampling_params, return_logprob
+            self.active += 1
+            try:
+                if prompt == "fast":
+                    await asyncio.sleep(0)
+                    return {"text": prompt, "meta_info": {}}
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(prompt)
+                raise
+            finally:
+                self.active -= 1
+
+        def shutdown(self):
+            self.shutdown_count += 1
+
+    backend = _AsyncEngine()
+    engine = object.__new__(ReleasedSofTGRPOEngine)
+    engine.settings = SamplingSettings(max_new_tokens=7)
+    engine.engine = backend
+    completions = engine.generate_as_completed(
+        ["fast", "blocked-1", "blocked-2"], [1, 2, 3], queue_size=2
+    )
+
+    assert next(completions)[0] == 0
+    completions.close()
+    assert backend.active == 0
+    assert sorted(backend.cancelled) == ["blocked-1", "blocked-2"]
+
+    loop = engine._event_loop
+    engine.shutdown()
+    assert loop.is_closed()
+    assert backend.shutdown_count == 1
+
+
+def test_engine_cancels_peers_after_request_error_and_reuses_private_loop():
+    class _AsyncEngine:
+        def __init__(self):
+            self.fail = True
+            self.active = 0
+            self.cancelled = []
+            self.shutdown_count = 0
+
+        async def async_generate(
+            self, *, prompt, sampling_params, return_logprob
+        ):
+            del sampling_params, return_logprob
+            self.active += 1
+            try:
+                if prompt == "bad" and self.fail:
+                    await asyncio.sleep(0)
+                    raise ValueError("request failed")
+                if prompt == "blocked":
+                    await asyncio.Event().wait()
+                await asyncio.sleep(0)
+                return {"text": prompt, "meta_info": {}}
+            except asyncio.CancelledError:
+                self.cancelled.append(prompt)
+                raise
+            finally:
+                self.active -= 1
+
+        def shutdown(self):
+            self.shutdown_count += 1
+
+    backend = _AsyncEngine()
+    engine = object.__new__(ReleasedSofTGRPOEngine)
+    engine.settings = SamplingSettings(max_new_tokens=7)
+    engine.engine = backend
+
+    with pytest.raises(ValueError, match="request failed"):
+        list(
+            engine.generate_as_completed(
+                ["bad", "blocked"], [1, 2], queue_size=2
+            )
+        )
+    assert backend.active == 0
+    assert backend.cancelled == ["blocked"]
+    loop = engine._event_loop
+
+    backend.fail = False
+    results = list(
+        engine.generate_as_completed(["good"], [3], queue_size=1)
+    )
+    assert results[0][0] == 0
+    assert results[0][1]["text"] == "good"
+    assert engine._event_loop is loop
+
+    engine.shutdown()
+    engine.shutdown()
+    assert loop.is_closed()
+    assert backend.shutdown_count == 1
+    with pytest.raises(RuntimeError, match="shut down"):
+        list(engine.generate_as_completed(["late"], [4], queue_size=1))
+
+
+def test_shutdown_cancels_background_tasks_before_closing_private_loop():
+    class _AsyncEngine:
+        def __init__(self):
+            self.background = None
+            self.shutdown_count = 0
+
+        async def async_generate(
+            self, *, prompt, sampling_params, return_logprob
+        ):
+            del sampling_params, return_logprob
+            if self.background is None:
+                self.background = asyncio.create_task(asyncio.Event().wait())
+            return {"text": prompt, "meta_info": {}}
+
+        def shutdown(self):
+            self.shutdown_count += 1
+
+    backend = _AsyncEngine()
+    engine = object.__new__(ReleasedSofTGRPOEngine)
+    engine.settings = SamplingSettings(max_new_tokens=7)
+    engine.engine = backend
+
+    results = list(
+        engine.generate_as_completed(["one"], [1], queue_size=1)
+    )
+    assert results[0][0] == 0
+    assert backend.background is not None
+    assert not backend.background.done()
+
+    loop = engine._event_loop
+    engine.shutdown()
+    assert backend.background.cancelled()
+    assert not [task for task in asyncio.all_tasks(loop) if not task.done()]
+    assert loop.is_closed()
+    assert backend.shutdown_count == 1
 
 
 class _ReleasedTextTokenizer:
@@ -199,6 +381,36 @@ def test_runtime_delegates_to_cpu_request_seed_contract():
     assert stable_request_seed(
         benchmark="math500", example_id="math500-0", sample_index=0
     ) == expected
+
+
+def test_qwen3_reasoning_token_ids_are_sealed_and_request_seed_is_common():
+    class Tokenizer:
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return {"<think>": [151667], "</think>": [151668]}[text]
+
+        def decode(self, ids, skip_special_tokens=False):
+            assert not skip_special_tokens
+            return {151667: "<think>", 151668: "</think>"}[ids[0]]
+
+    assert validate_atomic_reasoning_tokens(
+        Tokenizer(), study=QWEN3_STUDY_ID
+    ) == (151667, 151668)
+    assert request_seed(
+        "math500", "math500-0", 0, study=QWEN3_STUDY_ID
+    ) == request_seed("math500", "math500-0", 0)
+
+    class WrongTokenizer(Tokenizer):
+        def encode(self, text, add_special_tokens=False):
+            return {"<think>": [1], "</think>": [2]}[text]
+
+        def decode(self, ids, skip_special_tokens=False):
+            return {1: "<think>", 2: "</think>"}[ids[0]]
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        validate_atomic_reasoning_tokens(
+            WrongTokenizer(), study=QWEN3_STUDY_ID
+        )
 
 
 def test_runtime_canonical_json_rejects_nonfinite_numbers():

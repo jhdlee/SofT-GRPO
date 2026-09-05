@@ -20,6 +20,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -44,12 +45,21 @@ from .manifest import file_sha256
 ICL_SCHEMA_VERSION = 1
 ICL_PROTOCOL = "opd-softgrpo-native-soft-icl-v1"
 ICL_MATERIALIZATION_PROTOCOL = "opd-softgrpo-native-soft-icl-data-v1"
+LEGACY_STUDY_ID = "softgrpo_icl_v1"
+QWEN3_STUDY_ID = "qwen3_icl_pass1_v1"
+LEGACY_ASSET_PROTOCOL = "opd-softgrpo-icl-assets-v1"
+QWEN3_ASSET_PROTOCOL = "opd-qwen3-icl-pass1-assets-v1"
+QWEN3_ICL_PROTOCOL = "opd-qwen3-icl-pass1-v1"
 
 STARTING_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 STARTING_MODEL_REVISION = "c46dac620b4e4f12c5662a2133376a2823458d0e"
 SOFTGRPO_MODEL_ID = "zz1358m/SofT-GRPO-master"
 SOFTGRPO_MODEL_REVISION = "f3a0db41614abdda549e24896f1a9c131e95823f"
 SOFTGRPO_MODEL_SUBFOLDER = "saved_weight/Deepeeek-Qwen-1.5B+SofT-GRPO"
+QWEN3_0P6B_MODEL_ID = "Qwen/Qwen3-0.6B"
+QWEN3_0P6B_MODEL_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+QWEN3_1P7B_MODEL_ID = "Qwen/Qwen3-1.7B"
+QWEN3_1P7B_MODEL_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 MODEL_SOURCES = {
     "starting": {
         "repo_id": STARTING_MODEL_ID,
@@ -60,6 +70,18 @@ MODEL_SOURCES = {
         "repo_id": SOFTGRPO_MODEL_ID,
         "revision": SOFTGRPO_MODEL_REVISION,
         "subfolder": SOFTGRPO_MODEL_SUBFOLDER,
+    },
+}
+QWEN3_MODEL_SOURCES = {
+    "qwen3_0p6b": {
+        "repo_id": QWEN3_0P6B_MODEL_ID,
+        "revision": QWEN3_0P6B_MODEL_REVISION,
+        "subfolder": None,
+    },
+    "qwen3_1p7b": {
+        "repo_id": QWEN3_1P7B_MODEL_ID,
+        "revision": QWEN3_1P7B_MODEL_REVISION,
+        "subfolder": None,
     },
 }
 
@@ -144,6 +166,208 @@ PINNED_DATA_FILE_SHA256 = {
     "mechanism_subset_ids.json": "58163576d553ed279d70f7460a51442ef03da5c0bd00bf66f3fc625e24168b40",
 }
 
+
+def _immutable_model_sources(
+    sources: Mapping[str, Mapping[str, Optional[str]]],
+) -> Mapping[str, Mapping[str, Optional[str]]]:
+    return MappingProxyType(
+        {
+            label: MappingProxyType(dict(spec))
+            for label, spec in sources.items()
+        }
+    )
+
+
+@dataclass(frozen=True)
+class ICLStudyProfile:
+    """Immutable model/matrix contract for one ICL evaluation study."""
+
+    study_id: str
+    protocol: str
+    asset_protocol: str
+    model_labels: Tuple[str, ...]
+    model_sources: Mapping[str, Mapping[str, Optional[str]]]
+    inference_modes: Tuple[str, ...]
+    core_conditions: Tuple[str, ...]
+    benchmarks: Tuple[str, ...]
+    production_sample_count: int
+    smoke_sample_count: int
+    allowed_model_modes: Tuple[Tuple[str, str], ...]
+    pass_ks: Tuple[int, ...]
+    max_response_tokens: int
+    max_positions: int
+    fixed_think_opener: str
+    think_token_id: Optional[int]
+    close_think_token_id: Optional[int]
+    boundary_gate_benchmarks: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("study_id", "protocol", "asset_protocol"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError("profile %s must be a non-empty string" % name)
+        if tuple(self.model_sources) != self.model_labels:
+            raise ValueError("profile model sources must follow model_labels exactly")
+        if not self.model_labels or len(set(self.model_labels)) != len(self.model_labels):
+            raise ValueError("profile model labels must be unique and nonempty")
+        for label, source in self.model_sources.items():
+            if set(source) != {"repo_id", "revision", "subfolder"}:
+                raise ValueError("profile model source fields differ for %s" % label)
+            repo_id = source["repo_id"]
+            revision = source["revision"]
+            subfolder = source["subfolder"]
+            if not isinstance(repo_id, str) or not repo_id.strip():
+                raise ValueError("profile model repo_id is invalid for %s" % label)
+            if not isinstance(revision, str) or not re.fullmatch(
+                r"[0-9a-f]{40}", revision
+            ):
+                raise ValueError("profile model revision is not a commit for %s" % label)
+            if subfolder is not None and (
+                not isinstance(subfolder, str)
+                or not subfolder.strip()
+                or subfolder.startswith("/")
+                or ".." in Path(subfolder).parts
+            ):
+                raise ValueError("profile model subfolder is invalid for %s" % label)
+        if not self.inference_modes or not set(self.inference_modes).issubset(INFERENCE_MODES):
+            raise ValueError("profile has unsupported inference modes")
+        if not self.core_conditions or not set(self.core_conditions).issubset(CORE_CONDITIONS):
+            raise ValueError("profile has unsupported core conditions")
+        if not self.benchmarks or not set(self.benchmarks).issubset(STUDY_BENCHMARKS):
+            raise ValueError("profile has unsupported benchmarks")
+        if self.production_sample_count not in (1, PRODUCTION_SAMPLE_COUNT):
+            raise ValueError("profile production samples must be one or eight")
+        if not 1 <= self.smoke_sample_count <= self.production_sample_count:
+            raise ValueError("profile smoke sample count is invalid")
+        allowed = set(self.allowed_model_modes)
+        possible = {
+            (model, mode)
+            for model in self.model_labels
+            for mode in self.inference_modes
+        }
+        if not allowed or not allowed.issubset(possible):
+            raise ValueError("profile allowed model/mode pairs are invalid")
+        if self.pass_ks not in ((1,), (1, 8)):
+            raise ValueError("profile pass estimands must be pass@1 or pass@1/pass@8")
+        if max(self.pass_ks) > self.production_sample_count:
+            raise ValueError("profile requests pass@k above its sample count")
+        if self.max_response_tokens <= 0 or self.max_positions <= self.max_response_tokens:
+            raise ValueError("profile context limits are invalid")
+        if not self.fixed_think_opener.startswith("<think>"):
+            raise ValueError("profile fixed opener must begin with <think>")
+        if not set(self.boundary_gate_benchmarks).issubset(self.benchmarks):
+            raise ValueError("profile boundary gates must name registered benchmarks")
+
+    def source(self, model_label: str) -> Dict[str, Optional[str]]:
+        if model_label not in self.model_sources:
+            raise ValueError("unsupported ICL model label: %r" % model_label)
+        return dict(self.model_sources[model_label])
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a canonical-JSON-safe copy for immutable manifests."""
+
+        return {
+            "study_id": self.study_id,
+            "protocol": self.protocol,
+            "asset_protocol": self.asset_protocol,
+            "model_labels": list(self.model_labels),
+            "model_sources": {
+                label: dict(self.model_sources[label])
+                for label in self.model_labels
+            },
+            "inference_modes": list(self.inference_modes),
+            "core_conditions": list(self.core_conditions),
+            "benchmarks": list(self.benchmarks),
+            "production_sample_count": self.production_sample_count,
+            "smoke_sample_count": self.smoke_sample_count,
+            "allowed_model_modes": [list(value) for value in self.allowed_model_modes],
+            "pass_ks": list(self.pass_ks),
+            "max_response_tokens": self.max_response_tokens,
+            "max_positions": self.max_positions,
+            "fixed_think_opener": self.fixed_think_opener,
+            "think_token_id": self.think_token_id,
+            "close_think_token_id": self.close_think_token_id,
+            "boundary_gate_benchmarks": list(self.boundary_gate_benchmarks),
+        }
+
+
+STUDY_PROFILES = MappingProxyType(
+    {
+        LEGACY_STUDY_ID: ICLStudyProfile(
+            study_id=LEGACY_STUDY_ID,
+            protocol=ICL_PROTOCOL,
+            asset_protocol=LEGACY_ASSET_PROTOCOL,
+            model_labels=MODEL_LABELS,
+            model_sources=_immutable_model_sources(MODEL_SOURCES),
+            inference_modes=INFERENCE_MODES,
+            core_conditions=CORE_CONDITIONS,
+            benchmarks=STUDY_BENCHMARKS,
+            production_sample_count=PRODUCTION_SAMPLE_COUNT,
+            smoke_sample_count=SMOKE_SAMPLE_COUNT,
+            allowed_model_modes=(
+                ("starting", "native_soft"),
+                ("starting", "hard_token"),
+                ("softgrpo", "native_soft"),
+            ),
+            pass_ks=(1, 8),
+            max_response_tokens=32_768,
+            max_positions=40_960,
+            fixed_think_opener="<think>\n",
+            think_token_id=None,
+            close_think_token_id=None,
+            boundary_gate_benchmarks=("math500",),
+        ),
+        QWEN3_STUDY_ID: ICLStudyProfile(
+            study_id=QWEN3_STUDY_ID,
+            protocol=QWEN3_ICL_PROTOCOL,
+            asset_protocol=QWEN3_ASSET_PROTOCOL,
+            model_labels=("qwen3_0p6b", "qwen3_1p7b"),
+            model_sources=_immutable_model_sources(QWEN3_MODEL_SOURCES),
+            inference_modes=INFERENCE_MODES,
+            core_conditions=CORE_CONDITIONS,
+            benchmarks=STUDY_BENCHMARKS,
+            production_sample_count=1,
+            smoke_sample_count=1,
+            allowed_model_modes=(
+                ("qwen3_0p6b", "native_soft"),
+                ("qwen3_0p6b", "hard_token"),
+                ("qwen3_1p7b", "native_soft"),
+                ("qwen3_1p7b", "hard_token"),
+            ),
+            pass_ks=(1,),
+            max_response_tokens=32_768,
+            max_positions=40_960,
+            fixed_think_opener="<think>\n",
+            think_token_id=151667,
+            close_think_token_id=151668,
+            boundary_gate_benchmarks=("math500",),
+        ),
+    }
+)
+
+
+def get_study_profile(study: Optional[str] = None) -> ICLStudyProfile:
+    """Resolve a study, defaulting to the historical SofT-GRPO evaluation."""
+
+    study_id = LEGACY_STUDY_ID if study is None else study
+    if study_id not in STUDY_PROFILES:
+        raise ValueError("unsupported ICL study: %r" % study_id)
+    return STUDY_PROFILES[study_id]
+
+
+def _profile_for_model(model_label: str, study: Optional[str]) -> ICLStudyProfile:
+    if study is not None:
+        return get_study_profile(study)
+    matches = [
+        profile for profile in STUDY_PROFILES.values()
+        if model_label in profile.model_labels
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError("unsupported ICL model label: %r" % model_label)
+    raise ValueError("model label is ambiguous; specify an ICL study")
+
 _DATA_FILENAMES = (
     "examples.jsonl",
     "shuffled_pairs.json",
@@ -181,27 +405,47 @@ def _ordered_ids_sha256(namespace: str, values: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
-def request_seed(benchmark: str, example_id: str, sample_index: int) -> int:
+def request_seed(
+    benchmark: str,
+    example_id: str,
+    sample_index: int,
+    *,
+    study: Optional[str] = None,
+) -> int:
     """Derive a request seed shared across models and prompt conditions."""
 
-    if benchmark not in BENCHMARKS:
+    profile = get_study_profile(study)
+    allowed_benchmarks = BENCHMARKS if study is None else profile.benchmarks
+    if benchmark not in allowed_benchmarks:
         raise ValueError("unsupported benchmark: %r" % benchmark)
     _require_text(example_id, "example_id")
-    if type(sample_index) is not int or not 0 <= sample_index < PRODUCTION_SAMPLE_COUNT:
-        raise ValueError("sample_index must be in [0, 8)")
+    if (
+        type(sample_index) is not int
+        or not 0 <= sample_index < profile.production_sample_count
+    ):
+        raise ValueError(
+            "sample_index must be in [0, %d) for study %s"
+            % (profile.production_sample_count, profile.study_id)
+        )
     value = int.from_bytes(
-        _stable_digest("request-seed", EXPERIMENT_SEED, benchmark, example_id, sample_index)[:8],
+        _stable_digest(
+            "request-seed",
+            EXPERIMENT_SEED,
+            benchmark,
+            example_id,
+            sample_index,
+        )[:8],
         "big",
     )
     return value & ((1 << 63) - 1)
 
 
-def model_source(model_label: str) -> Dict[str, Optional[str]]:
+def model_source(
+    model_label: str, *, study: Optional[str] = None
+) -> Dict[str, Optional[str]]:
     """Return a defensive copy of the one pinned source for a model arm."""
 
-    if model_label not in MODEL_SOURCES:
-        raise ValueError("unsupported ICL model label: %r" % model_label)
-    return dict(MODEL_SOURCES[model_label])
+    return _profile_for_model(model_label, study).source(model_label)
 
 
 @dataclass(frozen=True)
@@ -317,37 +561,51 @@ def validate_matrix_cell(
     inference_mode: str,
     condition: str,
     benchmark: str,
+    *,
+    study: Optional[str] = None,
 ) -> None:
-    if model_label not in MODEL_LABELS:
+    profile = _profile_for_model(model_label, study)
+    if model_label not in profile.model_labels:
         raise ValueError("unsupported ICL model label: %r" % model_label)
-    if inference_mode not in INFERENCE_MODES:
+    if inference_mode not in profile.inference_modes:
         raise ValueError("unsupported ICL inference mode: %r" % inference_mode)
-    if condition not in CORE_CONDITIONS:
+    if condition not in profile.core_conditions:
         raise ValueError("unregistered ICL prompt condition: %r" % condition)
-    if benchmark not in STUDY_BENCHMARKS:
+    if benchmark not in profile.benchmarks:
         raise ValueError("unregistered ICL benchmark: %r" % benchmark)
-    if model_label == "softgrpo" and inference_mode == "hard_token":
-        raise ValueError("the post-trained checkpoint has no hard-token evaluation arm")
+    if (model_label, inference_mode) not in profile.allowed_model_modes:
+        if (
+            profile.study_id == LEGACY_STUDY_ID
+            and model_label == "softgrpo"
+            and inference_mode == "hard_token"
+        ):
+            raise ValueError(
+                "the post-trained checkpoint has no hard-token evaluation arm"
+            )
+        raise ValueError(
+            "inference mode %r is not registered for model %r in study %s"
+            % (inference_mode, model_label, profile.study_id)
+        )
 
 
-def build_icl_matrix(*, smoke: bool = False) -> Tuple[ICLMatrixCell, ...]:
+def build_icl_matrix(
+    *, smoke: bool = False, study: Optional[str] = None
+) -> Tuple[ICLMatrixCell, ...]:
     """Construct the complete allowed production or smoke matrix."""
 
-    sample_count = SMOKE_SAMPLE_COUNT if smoke else PRODUCTION_SAMPLE_COUNT
+    profile = get_study_profile(study)
+    sample_count = (
+        profile.smoke_sample_count if smoke else profile.production_sample_count
+    )
     cells = []
-    for model_label in MODEL_LABELS:
-        for inference_mode in INFERENCE_MODES:
-            if model_label == "softgrpo" and inference_mode == "hard_token":
+    for model_label in profile.model_labels:
+        for inference_mode in profile.inference_modes:
+            if (model_label, inference_mode) not in profile.allowed_model_modes:
                 continue
-            conditions = CORE_CONDITIONS
-            for condition in conditions:
-                for benchmark in STUDY_BENCHMARKS:
+            for condition in profile.core_conditions:
+                for benchmark in profile.benchmarks:
                     subset = "full"
-                    expected = (
-                        EXPECTED_EXAMPLE_COUNTS[benchmark]
-                        if subset == "full"
-                        else EXPECTED_MECHANISM_COUNTS[benchmark]
-                    )
+                    expected = EXPECTED_EXAMPLE_COUNTS[benchmark]
                     count = min(SMOKE_EXAMPLE_COUNT, expected) if smoke else expected
                     cells.append(
                         ICLMatrixCell(
@@ -1551,35 +1809,48 @@ def pass_at_k(n: int, correct: int, k: int) -> float:
 def pass_metrics_by_example(
     outcomes: Mapping[str, Sequence[bool]], *, expected_samples: int = PRODUCTION_SAMPLE_COUNT
 ) -> Dict[str, Dict[str, float]]:
-    """Return explicit pass@1/pass@8 estimands for each example."""
+    """Return the registered pass estimands for one- or eight-sample cells."""
 
-    if expected_samples != PRODUCTION_SAMPLE_COUNT:
-        raise ValueError("production pass metrics require exactly eight samples")
+    if expected_samples not in (1, PRODUCTION_SAMPLE_COUNT):
+        raise ValueError("pass metrics require exactly one or eight samples")
     if not outcomes:
         raise ValueError("outcomes cannot be empty")
     result: Dict[str, Dict[str, float]] = {}
     for example_id, values in outcomes.items():
         vector = tuple(values)
         if len(vector) != expected_samples or any(type(value) is not bool for value in vector):
-            raise ValueError("each example must have exactly eight boolean outcomes")
+            count_name = "one" if expected_samples == 1 else "eight"
+            raise ValueError(
+                "each example must have exactly %s boolean outcomes" % count_name
+            )
         correct = sum(vector)
-        result[example_id] = {
-            "pass_at_1": pass_at_k(expected_samples, correct, 1),
-            "pass_at_8": pass_at_k(expected_samples, correct, 8),
-        }
+        metrics = {"pass_at_1": pass_at_k(expected_samples, correct, 1)}
+        if expected_samples == PRODUCTION_SAMPLE_COUNT:
+            metrics["pass_at_8"] = pass_at_k(expected_samples, correct, 8)
+        result[example_id] = metrics
     return result
 
 
 def summarize_pass_metrics(
     outcomes: Mapping[str, Sequence[bool]],
+    *,
+    expected_samples: int = PRODUCTION_SAMPLE_COUNT,
 ) -> Dict[str, float | int]:
-    per_example = pass_metrics_by_example(outcomes)
-    return {
-        "pass_at_1": float(np.mean([value["pass_at_1"] for value in per_example.values()])),
-        "pass_at_8": float(np.mean([value["pass_at_8"] for value in per_example.values()])),
+    per_example = pass_metrics_by_example(
+        outcomes, expected_samples=expected_samples
+    )
+    summary: Dict[str, float | int] = {
+        "pass_at_1": float(
+            np.mean([value["pass_at_1"] for value in per_example.values()])
+        ),
         "example_count": len(per_example),
-        "samples_per_example": PRODUCTION_SAMPLE_COUNT,
+        "samples_per_example": expected_samples,
     }
+    if expected_samples == PRODUCTION_SAMPLE_COUNT:
+        summary["pass_at_8"] = float(
+            np.mean([value["pass_at_8"] for value in per_example.values()])
+        )
+    return summary
 
 
 def paired_bootstrap_difference(
@@ -1728,6 +1999,9 @@ __all__ = [
     "ICLEvaluationExample",
     "ICLMatrixCell",
     "ICLPrompt",
+    "ICLStudyProfile",
+    "LEGACY_ASSET_PROTOCOL",
+    "LEGACY_STUDY_ID",
     "MECHANISM_CONDITIONS",
     "MODEL_SOURCES",
     "MODEL_LABELS",
@@ -1735,6 +2009,14 @@ __all__ = [
     "PINNED_DATA_FILE_SHA256",
     "PINNED_MECHANISM_IDS_SHA256",
     "PINNED_ORDERED_EXAMPLE_IDS_SHA256",
+    "QWEN3_0P6B_MODEL_ID",
+    "QWEN3_0P6B_MODEL_REVISION",
+    "QWEN3_1P7B_MODEL_ID",
+    "QWEN3_1P7B_MODEL_REVISION",
+    "QWEN3_ASSET_PROTOCOL",
+    "QWEN3_ICL_PROTOCOL",
+    "QWEN3_MODEL_SOURCES",
+    "QWEN3_STUDY_ID",
     "SOFTGRPO_MODEL_ID",
     "SOFTGRPO_MODEL_REVISION",
     "SOFTGRPO_MODEL_SUBFOLDER",
@@ -1749,6 +2031,7 @@ __all__ = [
     "build_math500_icl_examples",
     "build_shuffled_donor_map",
     "canonicalize_problem_for_join",
+    "get_study_profile",
     "join_aime2024_icl_examples",
     "join_aime2024_with_report",
     "load_icl_dataset",

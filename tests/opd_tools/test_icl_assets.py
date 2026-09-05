@@ -6,6 +6,13 @@ import pytest
 
 import opd_tools.icl_assets as assets
 from opd_tools.icl import (
+    LEGACY_STUDY_ID,
+    QWEN3_0P6B_MODEL_ID,
+    QWEN3_0P6B_MODEL_REVISION,
+    QWEN3_1P7B_MODEL_ID,
+    QWEN3_1P7B_MODEL_REVISION,
+    QWEN3_ASSET_PROTOCOL,
+    QWEN3_STUDY_ID,
     SOFTGRPO_MODEL_ID,
     SOFTGRPO_MODEL_REVISION,
     SOFTGRPO_MODEL_SUBFOLDER,
@@ -94,3 +101,77 @@ def test_existing_model_without_pinned_source_marker_is_rejected(tmp_path):
             assets.MODEL_SPECS["starting"],
             tmp_path / "cache",
         )
+
+
+def test_qwen3_assets_use_exact_pins_and_an_isolated_manifest(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    def fake_snapshot_download(**kwargs):
+        calls.append(kwargs)
+        destination = Path(kwargs["local_dir"])
+        _write_checkpoint(destination)
+        return str(destination)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    data_digest = "e" * 64
+
+    def fake_prepare(path, cache):
+        Path(path).mkdir(parents=True)
+        return {"content_sha256": data_digest}
+
+    def fake_verify(path):
+        assert Path(path).is_dir()
+        return {"content_sha256": data_digest}
+
+    monkeypatch.setattr(assets, "prepare_icl_dataset", fake_prepare)
+    monkeypatch.setattr(assets, "verify_icl_dataset", fake_verify)
+
+    expected_specs = {
+        "qwen3_0p6b": {
+            "repo_id": QWEN3_0P6B_MODEL_ID,
+            "revision": QWEN3_0P6B_MODEL_REVISION,
+            "subfolder": None,
+        },
+        "qwen3_1p7b": {
+            "repo_id": QWEN3_1P7B_MODEL_ID,
+            "revision": QWEN3_1P7B_MODEL_REVISION,
+            "subfolder": None,
+        },
+    }
+    assert assets.model_specs_for_study(QWEN3_STUDY_ID) == expected_specs
+
+    root = tmp_path / "qwen3-assets"
+    manifest = assets.prepare_icl_assets(
+        root, tmp_path / "cache", study=QWEN3_STUDY_ID
+    )
+    assert len(calls) == 2
+    assert {call["repo_id"] for call in calls} == {
+        QWEN3_0P6B_MODEL_ID,
+        QWEN3_1P7B_MODEL_ID,
+    }
+    assert all(call["allow_patterns"] is None for call in calls)
+    assert manifest["study_id"] == QWEN3_STUDY_ID
+    assert manifest["protocol"] == QWEN3_ASSET_PROTOCOL
+    assert manifest["model_specs"] == expected_specs
+    assert set(manifest["models"]) == {"qwen3_0p6b", "qwen3_1p7b"}
+    assert set(manifest["paths"]) == {
+        "data",
+        "qwen3_0p6b",
+        "qwen3_1p7b",
+    }
+    assert assets.verify_icl_assets(root) == manifest
+    assert assets.verify_icl_assets(root, study=QWEN3_STUDY_ID) == manifest
+    assert (
+        assets.prepare_icl_assets(
+            root, tmp_path / "cache", study=QWEN3_STUDY_ID
+        )
+        == manifest
+    )
+    assert len(calls) == 2
+    with pytest.raises(ValueError, match="belongs to study"):
+        assets.verify_icl_assets(root, study=LEGACY_STUDY_ID)
+    (root / "models" / "starting").mkdir()
+    with pytest.raises(ValueError, match="mixes models"):
+        assets.verify_icl_assets(root, study=QWEN3_STUDY_ID)

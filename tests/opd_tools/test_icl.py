@@ -12,8 +12,12 @@ from opd_tools.icl import (
     CORE_CONDITIONS,
     EXPECTED_EXAMPLE_COUNTS,
     ICLEvaluationExample,
+    LEGACY_STUDY_ID,
     MECHANISM_CONDITIONS,
     MODEL_LABELS,
+    QWEN3_0P6B_MODEL_REVISION,
+    QWEN3_1P7B_MODEL_REVISION,
+    QWEN3_STUDY_ID,
     STUDY_BENCHMARKS,
     SOFTGRPO_MODEL_REVISION,
     STARTING_MODEL_REVISION,
@@ -21,6 +25,7 @@ from opd_tools.icl import (
     build_icl_matrix,
     build_shuffled_donor_map,
     canonicalize_problem_for_join,
+    get_study_profile,
     join_aime2024_icl_examples,
     join_aime2024_with_report,
     materialize_icl_dataset_from_rows,
@@ -423,6 +428,85 @@ class ICLMatrixTests(unittest.TestCase):
         self.assertTrue(all(cell.example_count <= 16 for cell in matrix))
         self.assertTrue(all(cell.sample_count == 2 for cell in matrix))
 
+    def test_qwen3_profile_is_exactly_pinned_and_has_6360_pass1_completions(self):
+        profile = get_study_profile(QWEN3_STUDY_ID)
+        self.assertEqual(profile.model_labels, ("qwen3_0p6b", "qwen3_1p7b"))
+        self.assertEqual(profile.core_conditions, CORE_CONDITIONS)
+        self.assertEqual(profile.benchmarks, STUDY_BENCHMARKS)
+        self.assertEqual(profile.pass_ks, (1,))
+        self.assertEqual(profile.production_sample_count, 1)
+        self.assertEqual(profile.smoke_sample_count, 1)
+        self.assertEqual(profile.max_response_tokens, 32_768)
+        self.assertEqual(profile.max_positions, 40_960)
+        self.assertEqual(profile.fixed_think_opener, "<think>\n")
+        self.assertEqual(
+            (profile.think_token_id, profile.close_think_token_id),
+            (151667, 151668),
+        )
+        self.assertEqual(profile.boundary_gate_benchmarks, ("math500",))
+        json.dumps(profile.to_dict(), sort_keys=True)
+        with self.assertRaises(TypeError):
+            profile.model_sources["qwen3_0p6b"]["revision"] = "changed"
+        for revision in (
+            QWEN3_0P6B_MODEL_REVISION,
+            QWEN3_1P7B_MODEL_REVISION,
+        ):
+            self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
+        matrix = build_icl_matrix(study=QWEN3_STUDY_ID)
+        self.assertEqual(len(matrix), 24)
+        self.assertEqual(
+            sum(cell.example_count * cell.sample_count for cell in matrix),
+            6_360,
+        )
+        self.assertTrue(all(cell.sample_count == 1 for cell in matrix))
+        self.assertEqual(
+            {(cell.model_label, cell.inference_mode) for cell in matrix},
+            {
+                ("qwen3_0p6b", "native_soft"),
+                ("qwen3_0p6b", "hard_token"),
+                ("qwen3_1p7b", "native_soft"),
+                ("qwen3_1p7b", "hard_token"),
+            },
+        )
+        self.assertEqual({cell.condition for cell in matrix}, set(CORE_CONDITIONS))
+        self.assertEqual({cell.benchmark for cell in matrix}, set(STUDY_BENCHMARKS))
+
+        smoke = build_icl_matrix(smoke=True, study=QWEN3_STUDY_ID)
+        self.assertEqual(len(smoke), 24)
+        self.assertTrue(all(cell.example_count <= 16 for cell in smoke))
+        self.assertTrue(all(cell.sample_count == 1 for cell in smoke))
+
+    def test_profile_lookup_is_defensive_and_study_validation_isolated(self):
+        self.assertEqual(get_study_profile().study_id, LEGACY_STUDY_ID)
+        source = model_source("qwen3_0p6b", study=QWEN3_STUDY_ID)
+        self.assertEqual(source["revision"], QWEN3_0P6B_MODEL_REVISION)
+        source["revision"] = "changed"
+        self.assertEqual(
+            model_source("qwen3_0p6b")["revision"],
+            QWEN3_0P6B_MODEL_REVISION,
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported ICL model label"):
+            model_source("starting", study=QWEN3_STUDY_ID)
+        with self.assertRaisesRegex(ValueError, "unsupported ICL study"):
+            get_study_profile("unknown")
+
+        validate_matrix_cell(
+            "qwen3_0p6b",
+            "hard_token",
+            "sdpg_matched",
+            "aime2024",
+            study=QWEN3_STUDY_ID,
+        )
+        with self.assertRaisesRegex(ValueError, "unregistered ICL benchmark"):
+            validate_matrix_cell(
+                "qwen3_0p6b",
+                "native_soft",
+                "no_demo",
+                "gsm8k_test",
+                study=QWEN3_STUDY_ID,
+            )
+
     def test_matrix_validator_rejects_prohibited_hard_token_cells(self):
         with self.assertRaisesRegex(ValueError, "post-trained"):
             validate_matrix_cell("softgrpo", "hard_token", "no_demo", "math500")
@@ -444,6 +528,12 @@ class ICLMatrixTests(unittest.TestCase):
         self.assertEqual(len(set(seeds)), 8)
         self.assertEqual(COMMON_SAMPLE_SEEDS, tuple(range(11, 19)))
         self.assertEqual(request_seed("math500", "one", 0), seeds[0])
+        qwen_seed = request_seed(
+            "math500", "one", 0, study=QWEN3_STUDY_ID
+        )
+        self.assertEqual(qwen_seed, seeds[0])
+        with self.assertRaisesRegex(ValueError, r"\[0, 1\)"):
+            request_seed("math500", "one", 1, study=QWEN3_STUDY_ID)
 
 
 if __name__ == "__main__":
