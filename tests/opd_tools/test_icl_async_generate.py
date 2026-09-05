@@ -35,7 +35,7 @@ class _Tokenizer:
         return (
             "<|im_start|>user\n"
             + user_content
-            + "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            + "<|im_end|>\n<|im_start|>assistant\n"
         )
 
     def encode(self, text, add_special_tokens=True):

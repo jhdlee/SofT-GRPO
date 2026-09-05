@@ -59,7 +59,7 @@ class _Qwen3Tokenizer:
 
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
-        return "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        return "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n"
 
     def encode(self, text, add_special_tokens=False):
         assert add_special_tokens is False
@@ -214,6 +214,15 @@ def test_qwen3_render_enables_native_thinking_and_seals_one_fixed_opener():
             },
         )
     ]
+
+
+def test_qwen3_render_rejects_template_that_already_inserts_thinking_opener():
+    class Tokenizer(_Qwen3Tokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            return super().apply_chat_template(messages, **kwargs) + "<think>\n"
+
+    with pytest.raises(RuntimeError, match="native assistant header"):
+        _render(Tokenizer(), "Question", study=QWEN3_STUDY_ID)
 
 
 def test_throughput_warmup_is_dedicated_and_symmetric_per_replica():

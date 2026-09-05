@@ -236,7 +236,7 @@ def _publish_resource_metrics(
 
 
 LEGACY_RENDER_PROTOCOL = "checkpoint-native-assistant-fixed-think-newline-v1"
-QWEN3_RENDER_PROTOCOL = "qwen3-enable-thinking-fixed-think-newline-v1"
+QWEN3_RENDER_PROTOCOL = "qwen3-enable-thinking-append-fixed-think-newline-v2"
 QWEN3_MODEL_DISPLAY_NAMES = {
     "qwen3_0p6b": "Qwen3-0.6B",
     "qwen3_1p7b": "Qwen3-1.7B",
@@ -276,19 +276,19 @@ def _render(
         [{"role": "user", "content": user_content}], **kwargs
     )
     opener = profile.fixed_think_opener
-    if not isinstance(rendered, str) or not rendered.endswith(opener):
+    if profile.study_id == QWEN3_STUDY_ID:
+        assistant_header = "<|im_start|>assistant\n"
+        if not isinstance(rendered, str) or not rendered.endswith(assistant_header):
+            raise RuntimeError(
+                "Qwen3 template must end in its native assistant header before "
+                "the registered fixed thinking opener is appended"
+            )
+        rendered += opener
+    elif not isinstance(rendered, str) or not rendered.endswith(opener):
         raise RuntimeError(
             "checkpoint chat template must end in its registered native assistant %r opening"
             % opener
         )
-    if profile.study_id == QWEN3_STUDY_ID:
-        assistant_suffix = "<|im_start|>assistant\n" + opener
-        if not rendered.endswith(assistant_suffix):
-            raise RuntimeError(
-                "Qwen3 template must end in the native assistant header and one fixed opener"
-            )
-        if rendered.endswith(opener + opener):
-            raise RuntimeError("Qwen3 template duplicated the fixed thinking opener")
     # This no-specials pass only validates that the rendered template is
     # tokenizable. Generation itself intentionally follows the released
     # SGLang text API, whose TokenizerManager encodes the string again with
