@@ -9,6 +9,7 @@ makes the smoke/production integrity gate independent of worker log messages.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -378,6 +379,112 @@ def replay_ratio_abs_error_max(
     log_ratio = actor_log_probs[valid].float() - rollout_log_probs[valid].float()
     errors = (log_ratio.exp() - 1.0).abs()
     return errors.max().item()
+
+
+def build_replay_failure_diagnostics(
+    *, rollout_log_probs: torch.Tensor, actor_log_probs: torch.Tensor,
+    response_mask: torch.Tensor, comparison_mask: torch.Tensor,
+    responses: torch.Tensor, close_tag_token_id: int | None,
+    prompt_indices: Sequence[Any] | None = None,
+    rollout_ranks: torch.Tensor | None = None,
+    rollout_sampling_seeds: torch.Tensor | None = None,
+    rollout_topk_ids: torch.Tensor | None = None,
+    rollout_topk_gumbels: torch.Tensor | None = None,
+    rollout_topk_gumbel_noise: torch.Tensor | None = None,
+    rollout_topk_retained_mask: torch.Tensor | None = None,
+    rollout_topk_probs: torch.Tensor | None = None,
+    max_records: int = 8,
+) -> dict[str, Any]:
+    """Summarize a rejected replay without serializing prompts, gold, or traces.
+
+    Ratio errors use the gate's float32 equation. Nonfinite values become null
+    with explicit counters, so even overflow failures remain strict JSON.
+    Boundary positions remain excluded exactly as specified by comparison_mask.
+    """
+    if type(max_records) is not int or not 1 <= max_records <= 8:
+        raise ValueError("replay diagnostics retain between one and eight positions")
+    shape = responses.shape
+    if responses.ndim != 2 or any(tensor.shape != shape for tensor in (rollout_log_probs, actor_log_probs, response_mask, comparison_mask)):
+        raise ValueError("replay diagnostics require aligned response tensors")
+    rows, length = shape
+    if prompt_indices is not None and len(prompt_indices) != rows:
+        raise ValueError("replay diagnostics prompt identity count differs")
+    for tensor in (rollout_ranks, rollout_sampling_seeds):
+        if tensor is not None and tensor.numel() != rows:
+            raise ValueError("replay diagnostics rank/seed identity count differs")
+    for tensor in (rollout_topk_ids, rollout_topk_gumbels, rollout_topk_gumbel_noise, rollout_topk_retained_mask, rollout_topk_probs):
+        if tensor is not None and (tensor.ndim != 3 or tensor.shape[:2] != shape or tensor.shape[-1] > 8):
+            raise ValueError("replay diagnostics require bounded aligned support metadata")
+    def number(value):
+        value = float(value)
+        return value if math.isfinite(value) else None
+    valid = response_mask.detach().bool().cpu()
+    compared = comparison_mask.detach().bool().cpu() & valid
+    response_ids = responses.detach().cpu()
+    rollout = rollout_log_probs.detach().float().cpu()
+    actor = actor_log_probs.detach().float().cpu()
+    log_ratio = actor - rollout
+    # Match the integrity gate's exp(...)-1 rounding, including overflow.
+    errors = (log_ratio.exp() - 1.0).abs()
+    close = (response_ids == close_tag_token_id) & valid if close_tag_token_id is not None else torch.zeros_like(valid)
+    seen_close = close.long().cumsum(dim=-1)
+    boundary = close & seen_close.eq(1)
+    before_close = valid & seen_close.eq(0)
+    after_close = valid & ~before_close & ~boundary
+    segments = {"soft_prefix": before_close, "boundary": boundary, "hard_answer": after_close}
+    finite = torch.isfinite(rollout) & torch.isfinite(actor) & torch.isfinite(errors)
+    summaries = {}
+    for name, segment in segments.items():
+        selected = segment & compared
+        finite_selected = selected & finite
+        values = errors[finite_selected]
+        summaries[name] = {
+            "valid_positions": int(segment.sum()), "compared_positions": int(selected.sum()),
+            "excluded_positions": int((segment & ~compared).sum()),
+            "nonfinite_positions": int((selected & ~finite).sum()),
+            "ratio_abs_error_max": number(values.max()) if values.numel() else None,
+            "ratio_abs_error_mean": number(values.double().mean()) if values.numel() else None,
+            "log_density_abs_difference_max": number(log_ratio[finite_selected].abs().max()) if values.numel() else None,
+        }
+    positions = compared.nonzero(as_tuple=False)
+    scores = errors[compared].clone()
+    scores[~torch.isfinite(scores)] = float("inf")
+    ranked = torch.argsort(scores, descending=True, stable=True)[:max_records]
+    worst = []
+    for index in ranked.tolist():
+        row, position = positions[index].tolist()
+        identity = prompt_indices[row] if prompt_indices is not None else None
+        # Dataset source indices are integers. Never serialize arbitrary prompt
+        # metadata strings if a caller accidentally supplies the wrong field.
+        prompt_index = int(identity) if isinstance(identity, (int, np.integer)) and not isinstance(identity, bool) else None
+        item = {
+            "batch_row": row, "prompt_index": prompt_index,
+            "rollout_rank": int(rollout_ranks.reshape(-1)[row]) if rollout_ranks is not None else None,
+            "rank_kind": "rollout_origin",
+            "request_seed": int(rollout_sampling_seeds.reshape(-1)[row]) if rollout_sampling_seeds is not None else None,
+            "response_position": position,
+            "segment": next(name for name, segment in segments.items() if segment[row, position]),
+            "rollout_log_density": number(rollout[row, position]),
+            "actor_log_density": number(actor[row, position]),
+            "ratio_abs_error": number(errors[row, position]),
+            "nonfinite": not bool(finite[row, position]),
+        }
+        for key, tensor in (("support_ids", rollout_topk_ids), ("perturbed_logits", rollout_topk_gumbels), ("raw_gumbel_noise", rollout_topk_gumbel_noise), ("retained_mask", rollout_topk_retained_mask), ("stored_probabilities", rollout_topk_probs)):
+            if tensor is not None:
+                values = tensor[row, position].detach().cpu().tolist()
+                item[key] = [bool(value) for value in values] if key == "retained_mask" else [int(value) for value in values] if key == "support_ids" else [number(value) for value in values]
+        worst.append(item)
+    return {
+        "schema_version": 1, "ratio_equation": "abs(exp(actor_log_density - rollout_log_density) - 1)",
+        "density_note": "Both density fields are log densities: continuous-action density for soft positions and token log probability for categorical positions. Stored support probabilities describe the next embedding, not the action density.",
+        "response_count": rows, "response_capacity": length,
+        "compared_positions": int(compared.sum()), "excluded_positions": int((valid & ~compared).sum()),
+        "nonfinite_positions": int((compared & ~finite).sum()),
+        "capped_response_count": int(valid.all(dim=-1).sum()),
+        "close_tag_response_count": int(close.any(dim=-1).sum()),
+        "segments": summaries, "worst_positions": worst,
+        "positions_retained": len(worst), "position_limit": max_records,
+    }
 
 
 def replay_integrity_mask(

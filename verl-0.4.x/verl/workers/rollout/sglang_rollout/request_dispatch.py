@@ -68,6 +68,14 @@ def require_healthy_engine(engine: Any) -> None:
         raise RuntimeError(f"SGLang engine is poisoned and cannot be reused: {reason}")
 
 
+def require_idle_engine(engine: Any) -> None:
+    """Forbid policy/cache/memory transitions until the whole batch completes."""
+
+    require_healthy_engine(engine)
+    if getattr(engine, "_opd_batch_outstanding", False):
+        raise RuntimeError("SGLang rollout requests remain outstanding")
+
+
 def check_collective_error(engine: Any, distributed: Any, error: BaseException | None, stage: str) -> None:
     """Make every rollout rank fail before any following collective/transition."""
 
@@ -75,7 +83,11 @@ def check_collective_error(engine: Any, distributed: Any, error: BaseException |
     errors = [message]
     if distributed.is_initialized():
         errors = [None] * distributed.get_world_size()
-        distributed.all_gather_object(errors, message)
+        try:
+            distributed.all_gather_object(errors, message)
+        except BaseException as collective_error:
+            poison_engine(engine, f"collective {stage} communication failed: {collective_error}")
+            raise
     failures = [f"rank {rank}: {item}" for rank, item in enumerate(errors) if item is not None]
     if failures:
         reason = f"SGLang collective {stage} failed: " + "; ".join(failures)
@@ -158,7 +170,7 @@ async def dispatch_generation(
     """Finish the entire frozen-policy batch, retaining canonical row order."""
 
     validate_dispatch_options(mode, queue_size, None)
-    require_healthy_engine(engine)
+    require_idle_engine(engine)
     _, counts = _prompt_sampling_params(input_ids, image_data, sampling_params)
     request_count = sum(counts)
     # The compatibility path passes the original engine parameters unchanged,
@@ -170,6 +182,7 @@ async def dispatch_generation(
     started = time.perf_counter()
     peak_pending = 0
     pending: dict[asyncio.Task[Any], int] = {}
+    engine._opd_batch_outstanding = True
     try:
         if mode == "legacy_batch":
             outputs = await engine.async_generate(
@@ -234,3 +247,4 @@ async def dispatch_generation(
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        engine._opd_batch_outstanding = False

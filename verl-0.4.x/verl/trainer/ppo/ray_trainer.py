@@ -25,6 +25,7 @@ import random
 import re
 import shutil
 import stat
+import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -66,6 +67,7 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.opd_driver import (
     RolloutIntegrityConfig,
     add_canonical_metric_aliases,
+    build_replay_failure_diagnostics,
     compute_categorical_rollout_diagnostics,
     compute_rollout_diagnostics,
     mask_invalid_native_boundary_scores,
@@ -2233,6 +2235,54 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _validate_benchmark_before_update(
+        self, *, batch, diagnostics, replay_error, actor_log_probs,
+        comparison_mask, iteration, timing, metrics, started_at,
+    ):
+        """Persist rejected benchmark replay before any worker update starts."""
+        if not hasattr(self, "record_benchmark_failure") or not self.rollout_integrity_config.enabled:
+            return
+        try:
+            if diagnostics is None:
+                raise RuntimeError("rollout diagnostics were not constructed")
+            if self.continuous_replay:
+                validate_rollout_integrity(diagnostics, replay_error, self.rollout_integrity_config, iteration)
+            else:
+                validate_categorical_rollout_integrity(replay_error, self.rollout_integrity_config)
+        except Exception as error:
+            details = {}
+            try:
+                length = batch.batch["responses"].shape[-1]
+                support = {
+                    key: batch.batch[key][:, -length:]
+                    for key in ("rollout_topk_ids", "rollout_topk_gumbels", "rollout_topk_gumbel_noise", "rollout_topk_retained_mask", "rollout_topk_probs")
+                    if key in batch.batch
+                }
+                details = build_replay_failure_diagnostics(
+                    rollout_log_probs=batch.batch["rollout_log_probs"],
+                    actor_log_probs=actor_log_probs,
+                    response_mask=batch.batch["response_mask"], comparison_mask=comparison_mask,
+                    responses=batch.batch["responses"], close_tag_token_id=self.close_tag_token_id,
+                    prompt_indices=batch.non_tensor_batch.get("index"),
+                    rollout_ranks=batch.batch.get("rollout_rank"),
+                    rollout_sampling_seeds=batch.batch.get("rollout_sampling_seed"),
+                    **support,
+                )
+            except Exception as diagnostic_error:
+                # A malformed tensor must not obscure the original gate error.
+                details = {"diagnostic_error": f"{type(diagnostic_error).__name__}: {diagnostic_error}"[:2048]}
+            if diagnostics is not None:
+                details["rollout_metrics"] = dict(diagnostics.metrics)
+                details["all_soft_rate"] = diagnostics.all_soft_rate
+                details["categorical_boxed_answer_rate"] = diagnostics.categorical_boxed_answer_rate
+                details["valid_boundary_count"] = sum(diagnostics.boundary_valid_mask)
+            self.record_benchmark_failure(
+                iteration, "pre_update_rollout_integrity", error,
+                {**timing, "step_partial": time.perf_counter() - started_at},
+                metrics, batch.meta_info, details,
+            )
+            raise
+
     def fit(self):
         """
         The training loop of PPO.
@@ -2331,6 +2381,7 @@ class RayPPOTrainer:
                 timing_raw = {}
                 rollout_diagnostics = None
                 replay_error = float("nan")
+                density_comparison_mask = None
                 checkpoint_committed = False
                 val_metrics_this_iteration = None
                 requeue_requested = False
@@ -2360,6 +2411,7 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
+                iteration_started_at = time.perf_counter()
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
@@ -2423,8 +2475,20 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
+                    replay_started_at = time.perf_counter()
                     with _timer("old_log_prob", timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        try:
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        except Exception as error:
+                            if hasattr(self, "record_benchmark_failure"):
+                                self.record_benchmark_failure(
+                                    rollout_iteration, "old_log_prob", error,
+                                    {**timing_raw, "old_log_prob": time.perf_counter() - replay_started_at,
+                                     "step_partial": time.perf_counter() - iteration_started_at},
+                                    metrics, batch.meta_info,
+                                    {"diagnostics_unavailable": "actor replay forward did not return log densities"},
+                                )
+                            raise
                         actor_old_log_probs = old_log_prob.batch["old_log_probs"]
                         if not self.standalone_opd:
                             entropys = old_log_prob.batch["entropys"]
@@ -2520,10 +2584,24 @@ class RayPPOTrainer:
                         metrics.update(rollout_diagnostics.metrics)
                     elif self.rollout_integrity_config.enabled:
                         missing = sorted(replay_keys - set(batch.batch.keys()))
-                        raise RuntimeError(
+                        error = RuntimeError(
                             "continuous rollout metadata is unavailable before actor update; "
                             f"missing={missing}, atomic_close_tag={self.close_tag_token_id is not None}"
                         )
+                        if hasattr(self, "record_benchmark_failure"):
+                            self.record_benchmark_failure(
+                                rollout_iteration, "pre_update_rollout_metadata", error,
+                                {**timing_raw, "step_partial": time.perf_counter() - iteration_started_at},
+                                metrics, batch.meta_info, {"missing_fields": missing},
+                            )
+                        raise error
+
+                    self._validate_benchmark_before_update(
+                        batch=batch, diagnostics=rollout_diagnostics,
+                        replay_error=replay_error, actor_log_probs=actor_old_log_probs,
+                        comparison_mask=density_comparison_mask, iteration=rollout_iteration,
+                        timing=timing_raw, metrics=metrics, started_at=iteration_started_at,
+                    )
 
                     if self.use_reference_policy:
                         # compute reference log_prob

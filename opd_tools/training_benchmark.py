@@ -64,6 +64,15 @@ def compare_fingerprints(baseline, candidate):
         raise ValueError("dispatch comparison repeats a prompt/sample identity")
     if left_identities != right_identities:
         raise ValueError("dispatch changed prompt/sample seed identity or order")
+    optional = {}
+    for field in ("probabilities_sha256", "retained_mask_sha256", "raw_noise_sha256"):
+        paired = [(a[field], b[field]) for a, b in zip(left, right) if field in a and field in b]
+        optional[field] = {
+            "paired_requests": len(paired),
+            "different_requests": sum(a != b for a, b in paired) if paired else None,
+            "baseline_missing": sum(field not in row for row in left),
+            "candidate_missing": sum(field not in row for row in right),
+        }
     return {
         "paired_requests": len(left),
         "matching_request_seeds": len(left),
@@ -72,6 +81,7 @@ def compare_fingerprints(baseline, candidate):
             for field in ("token_count", "tokens_sha256", "support_sha256", "perturbations_sha256", "log_probs_sha256")
         },
         "interpretation": "fixed-seed scheduling comparison; not a bitwise-equivalence acceptance gate",
+        "optional_replay_metadata": optional,
     }
 
 

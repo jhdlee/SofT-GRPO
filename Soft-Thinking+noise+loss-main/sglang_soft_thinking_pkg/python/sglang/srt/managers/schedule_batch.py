@@ -584,6 +584,7 @@ class Req:
             self.topk_prob = None
             self.topk_gumbel = None
             self.topk_gumbel_noise = None
+            self.topk_retained_mask = None
             self.topk_idx = None
             # self.topk_prob = torch.empty(
             #     max_topk,  # 注意：直接传尺寸数字，不要用元组
@@ -600,10 +601,12 @@ class Req:
             # NOTE: 输入的部分暂时不进行保留。 shape: [output_len, K]
             self.output_topk_gumbel_list = []
             self.output_topk_gumbel_noise_list = []
+            self.output_topk_retained_mask_list = []
             self.output_topk_prob_list = []
             self.output_topk_idx_list = []
             self.output_topk_gumbel_list_tmp = []
             self.output_topk_gumbel_noise_list_tmp = []
+            self.output_topk_retained_mask_list_tmp = []
             self.output_topk_prob_list_tmp = []
             self.output_topk_idx_list_tmp = []
             # track consecutive low entropy steps for early stopping
@@ -738,6 +741,7 @@ class Req:
         # 更新 topk 信息
         self.topk_gumbel = logits_output.topk_gumbels[index]
         self.topk_gumbel_noise = logits_output.topk_gumbel_noise[index]
+        self.topk_retained_mask = logits_output.topk_retained_mask[index]
         self.topk_prob = logits_output.topk_probs[index]
         self.topk_idx = logits_output.topk_indices[index]
         self.entropy = logits_output.entropy[index]
@@ -786,11 +790,19 @@ class Req:
             self.topk_idx[1:].fill_(0)
             self.topk_prob[0] = 1.0
 
+        # A rewritten close token and every categorical action use the same
+        # one-hot sentinel as their stored support, regardless of the draw that
+        # preceded a mode switch. This changes metadata only.
+        if not self.sampling_params.soft_thinking_mode:
+            self.topk_retained_mask[1:].fill_(False)
+            self.topk_retained_mask[0] = True
+
         # 仅在未完成时记录 topk 信息
         # if not self.finished():
         self.output_topk_prob_list_tmp.append(self.topk_prob)
         self.output_topk_gumbel_list_tmp.append(self.topk_gumbel)
         self.output_topk_gumbel_noise_list_tmp.append(self.topk_gumbel_noise)
+        self.output_topk_retained_mask_list_tmp.append(self.topk_retained_mask)
         self.output_topk_idx_list_tmp.append(self.topk_idx)
 
     def get_output_topk_prob_list(self):
@@ -820,6 +832,14 @@ class Req:
             )
             self.output_topk_gumbel_noise_list_tmp = []
         return self.output_topk_gumbel_noise_list
+
+    def get_output_topk_retained_mask_list(self):
+        if self.output_topk_retained_mask_list_tmp:
+            self.output_topk_retained_mask_list.extend(
+                torch.stack(self.output_topk_retained_mask_list_tmp, dim=0).cpu().tolist()
+            )
+            self.output_topk_retained_mask_list_tmp = []
+        return self.output_topk_retained_mask_list
 
     # ==========
     # end of soft thinking

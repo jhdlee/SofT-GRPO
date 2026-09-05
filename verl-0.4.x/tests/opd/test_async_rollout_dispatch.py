@@ -51,6 +51,9 @@ def native_output(seed):
             "output_token_logprobs": [(-0.25, token_id, None) for token_id in tokens],
             "output_topk_idx_list": [[token, 8, 9, 10, 11]] + [[token_id, 0, 0, 0, 0] for token_id in tokens[1:]],
             "output_topk_gumbel_list": [[0.5, 0.2, -0.3, 0.1, -0.1]] + [[0.0] * 5 for _ in tokens[1:]],
+            "output_topk_gumbel_noise_list": [[0.8, -0.4, 0.1, 0.3, -0.2]] + [[0.0] * 5 for _ in tokens[1:]],
+            "output_topk_retained_mask_list": [[True, False, True, True, False]] + [[True, False, False, False, False] for _ in tokens[1:]],
+            "output_topk_prob_list": [[0.8, 0.01, 0.1, 0.08, 0.01]] + [[1.0, 0.0, 0.0, 0.0, 0.0] for _ in tokens[1:]],
         },
     }
 
@@ -382,12 +385,18 @@ def test_real_adapter_preserves_every_replay_tensor_and_validation_expansion(val
         assert set(reference.batch) == {
             "prompts", "responses", "input_ids", "rollout_log_probs", "rollout_topk_ids",
             "rollout_topk_gumbels", "attention_mask", "position_ids", "gumbel_temperature", "rollout_sampling_seed",
+            "rollout_topk_retained_mask", "rollout_topk_gumbel_noise", "rollout_topk_probs", "rollout_rank",
         }
         for other in (result["expanded_batch"], result["bounded_async"]):
             for key, value in reference.batch.items():
                 assert torch.equal(value, other.batch[key]), key
             for key, value in reference.non_tensor_batch.items():
                 assert np.array_equal(value, other.non_tensor_batch[key]), key
+        assert reference.batch["rollout_topk_retained_mask"].dtype == torch.bool
+        assert reference.batch["rollout_topk_retained_mask"][0, 2].tolist() == [True, False, True, True, False]
+        assert reference.batch["rollout_topk_retained_mask"][0, :2, 0].all()
+        assert reference.batch["rollout_topk_gumbel_noise"][0, 2].tolist() == pytest.approx([0.8, -0.4, 0.1, 0.3, -0.2])
+        assert reference.batch["rollout_topk_probs"][0, 2].tolist() == pytest.approx([0.8, 0.01, 0.1, 0.08, 0.01])
     finally:
         loop.close()
         asyncio.set_event_loop(None)
@@ -412,6 +421,124 @@ def test_adapter_malformed_replay_is_collective_failure_without_cache_flush():
     finally:
         loop.close()
         asyncio.set_event_loop(None)
+
+
+@pytest.mark.parametrize("field", ["output_topk_retained_mask_list", "output_topk_gumbel_noise_list", "output_topk_prob_list"])
+def test_required_filter_metadata_failure_retires_entire_rollout(field):
+    class MissingFilter(Engine):
+        async def async_generate(self, **kwargs):
+            outputs = await super().async_generate(**kwargs)
+            for output in outputs:
+                output["meta_info"].pop(field)
+            return outputs
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        adapter = load_adapter()
+        adapter.config.require_retained_support = True
+        adapter._engine = MissingFilter()
+        with pytest.raises(RuntimeError, match="collective tensor assembly"):
+            adapter._batch_level_generate_sequences(prompts())
+        assert adapter._engine.shutdown_calls == 1
+        assert adapter._engine.flush_calls == 0
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+@pytest.mark.parametrize("mode", dispatch.DISPATCH_MODES)
+def test_actual_engine_transitions_reject_outstanding_dispatch(mode):
+    tree = ast.parse((ROLLOUT / "sglang_rollout.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AsyncEngine")
+    methods = [node for node in cls.body if isinstance(node, ast.AsyncFunctionDef)]
+    module = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
+        name="Transitions", bases=[], keywords=[], body=methods, decorator_list=[],
+    )], type_ignores=[]))
+    namespace = {"require_idle_engine": dispatch.require_idle_engine}
+    exec(compile(module, "actual_engine_transitions", "exec", flags=__future__.annotations.compiler_flag), namespace)
+
+    class BlockingEngine(namespace["Transitions"], Engine):
+        async def async_generate(self, **kwargs):
+            self.started.set()
+            await self.finish.wait()
+            return await Engine.async_generate(self, **kwargs)
+
+    async def run():
+        engine = BlockingEngine()
+        engine.started, engine.finish = asyncio.Event(), asyncio.Event()
+        kwargs = request_arguments(group_size=1)
+        task = asyncio.create_task(dispatch.dispatch_generation(engine, mode=mode, **kwargs))
+        await engine.started.wait()
+        try:
+            for transition in (engine.release_memory_occupation, engine.resume_memory_occupation,
+                               engine.flush_cache, lambda: engine.update_weights_from_tensor([])):
+                with pytest.raises(RuntimeError, match="requests remain outstanding"):
+                    await transition()
+            with pytest.raises(RuntimeError, match="requests remain outstanding"):
+                await dispatch.dispatch_generation(engine, mode=mode, **kwargs)
+        finally:
+            engine.finish.set()
+            await task
+        dispatch.require_idle_engine(engine)
+        assert engine.shutdown_calls == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("result", [(False, "invalid tensor"), None, (True, "updated")])
+def test_engine_rejected_weight_acknowledgment_cannot_be_ignored(result):
+    tree = ast.parse((ROLLOUT / "sglang_rollout.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AsyncEngine")
+    method = next(node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "update_weights_from_tensor")
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    namespace = {
+        "require_idle_engine": dispatch.require_idle_engine,
+        "UpdateWeightsFromTensorReqInput": lambda **kwargs: SimpleNamespace(**kwargs),
+        "MultiprocessingSerializer": SimpleNamespace(serialize=lambda value: value),
+    }
+    exec(compile(module, "actual_weight_transfer", "exec", flags=__future__.annotations.compiler_flag), namespace)
+
+    async def update(*args):
+        return result
+
+    engine = SimpleNamespace(server_args=SimpleNamespace(tp_size=1),
+                             tokenizer_manager=SimpleNamespace(update_weights_from_tensor=update))
+    if result and result[0] is True:
+        assert asyncio.run(namespace["update_weights_from_tensor"](engine, [])) == result
+    else:
+        with pytest.raises(RuntimeError, match="rejected weight transfer"):
+            asyncio.run(namespace["update_weights_from_tensor"](engine, []))
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_native_scheduler_busy_ack_prevents_memory_pause(success):
+    tree = ast.parse((ROLLOUT / "sglang_rollout.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AsyncEngine")
+    methods = [node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name in {"flush_cache", "release_memory_occupation"}]
+    module = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+    namespace = {"require_idle_engine": dispatch.require_idle_engine,
+                 "ReleaseMemoryOccupationReqInput": lambda: None}
+    exec(compile(module, "actual_memory_transition", "exec", flags=__future__.annotations.compiler_flag), namespace)
+    released = []
+
+    async def flush():
+        return SimpleNamespace(success=success)
+
+    async def release(*args):
+        released.append(True)
+
+    engine = SimpleNamespace(tokenizer_manager=SimpleNamespace(
+        flush_cache=flush, release_memory_occupation=release,
+    ))
+    engine.flush_cache = lambda: namespace["flush_cache"](engine)
+    if success:
+        asyncio.run(namespace["release_memory_occupation"](engine))
+        assert released == [True]
+    else:
+        with pytest.raises(RuntimeError, match="scheduler requests may remain outstanding"):
+            asyncio.run(namespace["release_memory_occupation"](engine))
+        assert not released
 
 
 @pytest.mark.parametrize("failing_rank", [0, 1])
@@ -524,7 +651,9 @@ def test_sharding_failure_skips_release_and_poison_prevents_next_enter():
     path = VERL_ROOT / "verl/workers/sharding_manager/fsdp_sglang.py"
     tree = ast.parse(path.read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FSDPSGLangShardingManager")
-    methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in {"__enter__", "__exit__"}]
+    methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in {
+        "__enter__", "__exit__", "_guard_stage", "_finish_stage", "_require_idle", "_prepare_weights",
+    }]
     for node in methods:
         node.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
@@ -534,6 +663,7 @@ def test_sharding_failure_skips_release_and_poison_prevents_next_enter():
         "poison_engine": dispatch.poison_engine,
         "check_collective_error": dispatch.check_collective_error,
         "dist": LocalDist,
+        "time": time, "asyncio": asyncio, "require_idle_engine": dispatch.require_idle_engine,
     }
     exec(compile(module, "sharding_under_test", "exec", flags=__future__.annotations.compiler_flag), namespace)
     manager = namespace["Manager"]()

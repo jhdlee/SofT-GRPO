@@ -158,6 +158,10 @@ class Sampler(nn.Module):
                 # logits_output.topk_probs[:, 0] = torch.gather(probs, 1, batch_next_token_ids.unsqueeze(1)).squeeze(1)
                 logits_output.topk_probs[:, 0] = 1
                 logits_output.topk_indices[:, 0] = batch_next_token_ids
+                logits_output.topk_retained_mask = torch.zeros_like(
+                    logits_output.topk_probs, dtype=torch.bool
+                )
+                logits_output.topk_retained_mask[:, 0] = True
             # ==========
             # end of soft thinking
             # ==========
@@ -207,6 +211,9 @@ class Sampler(nn.Module):
                     # max top k
                     topk_probs, topk_indices = torch.topk(probs, k=sampling_info.max_topk, dim=-1)  # slow
                     topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True))
+                    # Capture exact truncation support before epsilon smoothing
+                    # or noise makes a discarded slot positive again.
+                    topk_retained_mask = topk_probs > 0
                     # Always define a sentinel for non-Gumbel and categorical
                     # rows.  This is observational metadata and is not read by
                     # the sampling path.
@@ -284,6 +291,12 @@ class Sampler(nn.Module):
                         topk_gumbels = torch.gather(topk_gumbels, dim=1, index=sorted_idx)
                         logits_output.topk_gumbels = topk_gumbels
 
+                    # Every noise branch sorts the same action fields. Preserve
+                    # that permutation for this observational support mask too.
+                    logits_output.topk_retained_mask = torch.gather(
+                        topk_retained_mask, dim=1, index=sorted_idx
+                    )
+
                     # after thinking sampling
                     non_soft_mask = ~soft_mask
                     if any(non_soft_mask):
@@ -295,6 +308,8 @@ class Sampler(nn.Module):
                         topk_probs[non_soft_mask] = 0.0
                         topk_indices[non_soft_mask] = 0
                         logits_output.topk_gumbel_noise[non_soft_mask] = 0.0
+                        logits_output.topk_retained_mask[non_soft_mask] = False
+                        logits_output.topk_retained_mask[non_soft_mask, 0] = True
 
                         # Assign the first element of each row to sampled_token_ids and set it to 1.0 in topk_probs
                         topk_probs[non_soft_mask, 0] = 1.0

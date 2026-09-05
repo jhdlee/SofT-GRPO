@@ -87,6 +87,7 @@ from verl.workers.rollout.sglang_rollout.request_dispatch import (
     dispatch_generation,
     positive_integer,
     require_healthy_engine,
+    require_idle_engine,
     validate_dispatch_options,
 )
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
@@ -153,13 +154,17 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
 
     async def release_memory_occupation(self):
         """Release GPU occupation temporarily."""
-        require_healthy_engine(self)
+        require_idle_engine(self)
+        # Frontend completion alone does not prove the scheduler is idle.
+        # Confirm cache flush before native memory pause, which otherwise
+        # ignores a busy scheduler's failed flush acknowledgment.
+        await self.flush_cache()
         obj = ReleaseMemoryOccupationReqInput()
         return await self.tokenizer_manager.release_memory_occupation(obj, None)
 
     async def resume_memory_occupation(self):
         """Resume GPU occupation."""
-        require_healthy_engine(self)
+        require_idle_engine(self)
 
         # because __init__ is a sync method, it can not call the async release_memory_occupation
         # have to move release_memory_occupation from __init__ to here
@@ -178,18 +183,26 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        require_healthy_engine(self)
+        require_idle_engine(self)
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in
                                       range(self.server_args.tp_size)],
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+        result = await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+        # The pinned manager reports engine rejection as (False, message),
+        # rather than raising. Never proceed with a partially transferred actor.
+        if not isinstance(result, (tuple, list)) or len(result) != 2 or result[0] is not True:
+            raise RuntimeError(f"SGLang rejected weight transfer: {str(result)[:1000]}")
+        return result
 
     async def flush_cache(self):
-        require_healthy_engine(self)
-        return await self.tokenizer_manager.flush_cache()
+        require_idle_engine(self)
+        result = await self.tokenizer_manager.flush_cache()
+        if getattr(result, "success", None) is not True:
+            raise RuntimeError("SGLang cache flush rejected; scheduler requests may remain outstanding")
+        return result
 
 
 # NOTE(sgm): add for verl. We can optimize it by making
@@ -205,7 +218,15 @@ def _pre_process_inputs(
 
 
 # NOTE(linjunrong): adhoc
-def _post_process_outputs(tokenizer, output):
+def _post_process_outputs(tokenizer, output, *, require_retained_support=False):
+    if not output:
+        raise RuntimeError("rollout returned no responses")
+    metadata_fields = ("output_topk_gumbel_noise_list", "output_topk_retained_mask_list", "output_topk_prob_list")
+    present = {field: [field in row["meta_info"] for row in output] for field in metadata_fields}
+    for field, flags in present.items():
+        if any(flags) != all(flags) or (require_retained_support and not all(flags)):
+            raise RuntimeError(f"continuous replay is missing aligned {field}")
+
     def _map_each_response(resp):
         output_token_logprobs = resp["meta_info"]["output_token_logprobs"]
         output_topk_gumbel_list = resp["meta_info"]["output_topk_gumbel_list"]
@@ -232,7 +253,30 @@ def _post_process_outputs(tokenizer, output):
         batched_output_topk_gumbels = pad_sequence(batched_output_topk_gumbels, batch_first=True,
                                                    padding_value=pad_token_id)
         batched_output_topk_ids = pad_sequence(batched_output_topk_ids, batch_first=True, padding_value=pad_token_id)
-    return batched_output_token_ids, batched_logprobs, batched_output_topk_ids, batched_output_topk_gumbels
+    extras = []
+    for field in metadata_fields:
+        if not all(present[field]):
+            extras.append(None)
+            continue
+        tensors = []
+        for row in output:
+            tensor = torch.tensor(row["meta_info"][field])
+            expected = torch.tensor(row["meta_info"]["output_topk_idx_list"]).shape
+            if tensor.shape != expected or tensor.ndim != 2:
+                raise RuntimeError(f"{field} does not align with response support")
+            if field.endswith("retained_mask_list"):
+                if tensor.dtype != torch.bool or not bool(tensor.any(-1).all()):
+                    raise RuntimeError("retained support must be Boolean and nonempty for every action")
+            elif not bool(torch.isfinite(tensor).all()):
+                raise RuntimeError(f"stored {field} must be finite")
+            elif field == "output_topk_prob_list" and (
+                bool((tensor < 0).any()) or not bool((tensor.sum(-1) > 0).all())
+            ):
+                raise RuntimeError("stored mixture probabilities must be nonnegative and nonempty")
+            tensors.append(tensor)
+        extras.append(pad_sequence(tensors, batch_first=True, padding_value=0))
+    return (batched_output_token_ids, batched_logprobs, batched_output_topk_ids,
+            batched_output_topk_gumbels, *extras)
 
 
 def get_tool_call_parser_type(tokenizer: PreTrainedTokenizer) -> str:
@@ -828,7 +872,10 @@ class SGLangRollout(BaseRollout):
     ) -> DataProto:
         """Keep the released tensor/replay representation for every dispatcher."""
         batch_size = idx.size(0)
-        out = _post_process_outputs(self.tokenizer, output)
+        out = _post_process_outputs(
+            self.tokenizer, output,
+            require_retained_support=self.config.get("require_retained_support", False),
+        )
 
         response = out[0].to(idx.device)
         rollout_log_probs = out[1].to(idx.device)
@@ -836,6 +883,11 @@ class SGLangRollout(BaseRollout):
 
         rollout_topk_ids = out[2].to(idx.device)
         rollout_topk_gumbels = out[3].to(idx.device)
+        replay_metadata = {
+            key: value.to(idx.device) for key, value in zip(
+                ("rollout_topk_gumbel_noise", "rollout_topk_retained_mask", "rollout_topk_probs"), out[4:]
+            ) if value is not None
+        }
         # print("previous", end=' ')
         # print(response.size(), rollout_log_probs.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
         K = rollout_topk_ids.size(-1)
@@ -849,6 +901,10 @@ class SGLangRollout(BaseRollout):
                                                         self.pad_token_id)
             rollout_topk_gumbels = pad_sequence_to_length_1(rollout_topk_gumbels, self.config.response_length,
                                                             self.pad_token_id)
+            replay_metadata = {
+                key: pad_sequence_to_length_1(value, self.config.response_length, 0)
+                for key, value in replay_metadata.items()
+            }
         # print(f"end {self.config.response_length}", end=' ')
         # print(response.size(), rollout_log_probs.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
 
@@ -882,6 +938,11 @@ class SGLangRollout(BaseRollout):
         rollout_topk_ids = torch.cat([idx_topk, rollout_topk_ids], dim=1)
         rollout_topk_gumbels = torch.cat(
             [torch.zeros_like(idx_topk, dtype=rollout_topk_gumbels.dtype), rollout_topk_gumbels], dim=1)
+        for key, value in replay_metadata.items():
+            prefix = torch.zeros_like(idx_topk, dtype=value.dtype)
+            if key in ("rollout_topk_retained_mask", "rollout_topk_probs"):
+                prefix[..., 0] = 1
+            replay_metadata[key] = torch.cat([prefix, value], dim=1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
@@ -915,6 +976,8 @@ class SGLangRollout(BaseRollout):
                     device=rollout_topk_gumbels.device
                 ),
                 "rollout_sampling_seed": rollout_sampling_seed,
+                "rollout_rank": torch.full((batch_size,), self._rank, dtype=torch.int64, device=idx.device),
+                **replay_metadata,
             },
             batch_size=batch_size,
         )

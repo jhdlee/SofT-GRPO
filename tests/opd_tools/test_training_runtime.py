@@ -473,3 +473,49 @@ def test_submission_may_use_a_smaller_consistent_budget_and_rejects_symlinks(tmp
     (tmp_path / "submission.json").unlink()
     atomic_write_json(tmp_path / "submission.json", submission)
     assert aggregate_cells(tmp_path)["submission"]["job_limit_seconds"] == 3600
+
+
+def test_report_surfaces_persisted_replay_failure_and_startup_without_fabricating_iterations(tmp_path):
+    cell = complete_cell()
+    cell.update(status="incomplete", reason="RuntimeError: pilot failed with exit code 1", iterations=[])
+    del cell["startup_seconds"]
+    failure = {
+        "rollout_iteration": 0, "status": "failed_before_update", "stage": "pre_update_rollout_integrity",
+        "error_type": "RuntimeError", "error": "RuntimeError: rollout/replay ratio error 0.125 exceeds 0.0001",
+        "optimizer_updates_completed": False,
+        "timing_s": {"step_partial": 35, "gen": 25, "old_log_prob": 8, "weight_sync": 1},
+        "diagnostics": {"rollout_metrics": {"latent/cap_rate": 0.25, "latent/soft_to_hard_rate": 0.75},
+                        "valid_boundary_count": 48, "worst_positions": [{"prompt_index": 123, "rollout_rank": 1, "response_position": 456, "segment": "soft_prefix", "rollout_log_density": -12, "actor_log_density": -11.88, "ratio_abs_error": 0.125}]},
+    }
+    cell["phases"].append({"phase": "pilot", "status": "incomplete", "measurement": {
+        "status": "failed", "error": failure["error"], "failure": failure, "failed_iterations": [failure], "startup_seconds": 17,
+    }})
+    atomic_write_json(tmp_path / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    measured = report["cells"][0]
+    assert measured["status"] == "incomplete"
+    assert measured["failure_status"] == "failed_before_update"
+    assert measured["failure"] == failure
+    assert measured["failed_iterations"] == [failure]
+    assert measured["iterations"] == []
+    assert measured["estimate"] is None
+    assert measured["startup_seconds"] == 17
+    assert "ratio error 0.125" in measured["reason"]
+    assert "exit code 1" not in measured["reason"]
+    markdown = render_markdown(report)
+    assert "completed no optimizer updates" in markdown
+    assert "prompt index 123, rollout rank 1, response position 456 (soft_prefix)" in markdown
+    assert "rollout log density -12, actor log density -11.88" in markdown
+    assert "| Startup | 17.00 |" in markdown
+    assert "| Failed iteration 0 (partial; no update) | 35.00 | 25.00 | 8.00 |" in markdown
+
+
+def test_old_failed_phases_surface_actual_error_without_new_diagnostic_fields(tmp_path):
+    cell = complete_cell()
+    cell.update(status="incomplete", reason="exit code 1", iterations=[])
+    cell["phases"].append({"phase": "pilot", "status": "incomplete", "measurement": {"status": "failed", "error": "RuntimeError: rollout/replay ratio error 35310 exceeds 0.0001"}})
+    atomic_write_json(tmp_path / "cell.json", cell)
+    measured = aggregate_cells(tmp_path)["cells"][0]
+    assert "ratio error 35310" in measured["reason"]
+    assert measured["failure_status"] == "failed"
+    assert measured["estimate"] is None

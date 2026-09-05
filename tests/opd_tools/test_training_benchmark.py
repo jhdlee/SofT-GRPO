@@ -29,6 +29,17 @@ def test_fingerprint_comparison_tracks_output_differences_separately_from_identi
     assert result["support_sha256_different_requests"] == 0
 
 
+def test_fingerprint_comparison_distinguishes_missing_new_metadata_from_equality():
+    baseline = {"requests": [fingerprint(), fingerprint(1, probabilities_sha256="a" * 64)]}
+    candidate = {"requests": [fingerprint(probabilities_sha256="a" * 64), fingerprint(1, probabilities_sha256="b" * 64)]}
+    optional = benchmark.compare_fingerprints(baseline, candidate)["optional_replay_metadata"]
+    assert optional["probabilities_sha256"] == {
+        "paired_requests": 1, "different_requests": 1, "baseline_missing": 1, "candidate_missing": 0,
+    }
+    assert optional["retained_mask_sha256"]["different_requests"] is None
+    assert optional["retained_mask_sha256"]["paired_requests"] == 0
+
+
 @pytest.mark.parametrize("mutation", ["seed", "prompt", "sample", "order", "missing", "duplicate"])
 def test_fingerprints_reject_wrong_or_incomplete_prompt_sample_identity(mutation):
     baseline = {"requests": [fingerprint(), fingerprint(1)]}

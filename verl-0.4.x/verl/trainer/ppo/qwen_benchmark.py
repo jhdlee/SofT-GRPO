@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 from omegaconf import OmegaConf
 
 from verl import DataProto
@@ -38,6 +39,39 @@ def _json_metrics(metrics):
     return result
 
 
+def _finite_failure_value(value, *, depth=0):
+    """Keep bounded diagnostic JSON writable even when the failure is NaN."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:2048]
+    if depth >= 8:
+        return None
+    if isinstance(value, dict):
+        return {str(key)[:128]: _finite_failure_value(item, depth=depth + 1) for key, item in list(value.items())[:128]}
+    if isinstance(value, (list, tuple)):
+        return [_finite_failure_value(item, depth=depth + 1) for item in value[:16]]
+    return None
+
+
+def _request_action_fingerprints(batch, row, valid):
+    length = valid.numel()
+    fields = {
+        "tokens": batch["responses"][row][valid],
+        "support": batch["rollout_topk_ids"][row, -length:][valid],
+        "perturbations": batch["rollout_topk_gumbels"][row, -length:][valid],
+        "log_probs": batch["rollout_log_probs"][row, -length:][valid],
+    }
+    for name, key in (("probabilities", "rollout_topk_probs"), ("retained_mask", "rollout_topk_retained_mask"), ("raw_noise", "rollout_topk_gumbel_noise")):
+        if key in batch:
+            fields[name] = batch[key][row, -length:][valid]
+    return {name + "_sha256": hashlib.sha256(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest() for name, tensor in fields.items()}
+
+
 class QwenTrainingBenchmarkTrainer(RayPPOTrainer):
     """A separate measurement mode; it never selects production checkpoints."""
 
@@ -55,6 +89,7 @@ class QwenTrainingBenchmarkTrainer(RayPPOTrainer):
             "phase": self.config.trainer.training_benchmark_mode,
             "variant": self.config.trainer.training_benchmark_variant,
             "iterations": [],
+            "failed_iterations": [],
             "rows": [],
             "configuration": OmegaConf.to_container(self.config, resolve=True),
             "checkpoint_provenance": self.checkpoint_provenance,
@@ -64,6 +99,27 @@ class QwenTrainingBenchmarkTrainer(RayPPOTrainer):
 
     def _persist(self):
         _write(self.measurement_path, self.measurement)
+
+    def record_benchmark_failure(self, iteration, stage, error, timing, metrics, meta_info, diagnostics):
+        timings = dict(timing)
+        ranks = meta_info.get("rollout_timing", {}).get("ranks", [])
+        synchronization = [float(rank["weight_sync_seconds"]) for rank in ranks if isinstance(rank.get("weight_sync_seconds"), (float, int)) and math.isfinite(float(rank["weight_sync_seconds"]))]
+        if synchronization:
+            timings["weight_sync"] = max(synchronization)
+        failure = _finite_failure_value({
+            "rollout_iteration": int(iteration), "status": "failed_before_update",
+            "stage": stage, "error_type": type(error).__name__,
+            "error": f"{type(error).__name__}: {error}",
+            "optimizer_updates_completed": False,
+            "timing_s": timings, "metrics": dict(metrics),
+            "nonfinite_metric_names": [name for name, value in metrics.items() if isinstance(value, (float, np.floating)) and not math.isfinite(float(value))],
+            "rollout_timing": meta_info.get("rollout_timing", {}),
+            "diagnostics": diagnostics,
+        })
+        previous = self.measurement.setdefault("failed_iterations", [])
+        previous[:] = [row for row in previous if row["rollout_iteration"] != int(iteration)][-2:] + [failure]
+        self.measurement.update(status="failed", error=failure["error"], failure=failure)
+        self._persist()
 
     def record_benchmark_iteration(self, iteration, timing, metrics, meta_info):
         from opd_tools.training_benchmark import validate_pilot_metrics
@@ -165,12 +221,6 @@ class QwenTrainingBenchmarkTrainer(RayPPOTrainer):
             fingerprints = []
             for row in range(response.shape[0]):
                 valid = mask[row]
-                fields = {
-                    "tokens": response[row][valid],
-                    "support": supports[row][valid],
-                    "perturbations": perturbations[row][valid],
-                    "log_probs": output.batch["rollout_log_probs"][row][valid],
-                }
                 fingerprints.append({
                     "example_id": self.selection["populations"]["train"][
                         self.selection["train_batches"][batch_index][row // group_size]
@@ -181,9 +231,7 @@ class QwenTrainingBenchmarkTrainer(RayPPOTrainer):
                     ).encode()).hexdigest(),
                     "request_seed": int(output.batch["rollout_sampling_seed"][row].item()),
                     "token_count": int(valid.sum().item()),
-                    **{name + "_sha256": hashlib.sha256(
-                        tensor.detach().cpu().contiguous().numpy().tobytes()
-                    ).hexdigest() for name, tensor in fields.items()},
+                    **_request_action_fingerprints(output.batch, row, valid),
                 })
             expected = 64 * int(self.config.actor_rollout_ref.rollout.n)
             if len(fingerprints) != expected:

@@ -70,6 +70,22 @@ def test_continuous_support_geometry_matches_policy_autograd_without_opd():
     assert dot.item() == 0.0
 
 
+def test_geometry_uses_recorded_filter_support_for_policy_gradient():
+    geometry = _load_geometry_function()
+    logits, stored, sensitivity = _tiny_inputs()
+    retained = torch.tensor([[True, False, True], [True, True, False]])
+    filtered = logits.masked_fill(~retained, -torch.inf)
+    expected = _direct_policy_gradient(filtered, stored, sensitivity, 0.25)
+    policy_sq, _, _ = geometry(
+        support_logits=logits, stored_perturbed_logits=stored,
+        policy_log_density_sensitivity=sensitivity, opd_support_gradient=None,
+        gumbel_temperature=0.1, policy_scale=0.25, opd_scale=0.0,
+        retained_support_mask=retained,
+    )
+    assert torch.equal(expected[~retained], torch.zeros_like(expected[~retained]))
+    torch.testing.assert_close(policy_sq, expected.square().sum(dtype=torch.float64))
+
+
 def test_continuous_support_geometry_matches_direct_policy_opd_norm_and_dot():
     geometry = _load_geometry_function()
     logits, stored, sensitivity = _tiny_inputs()

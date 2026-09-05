@@ -540,6 +540,7 @@ class SchedulerOutputProcessorMixin:
         output_topk_probs_list = []
         output_topk_gumbel_list = []
         output_topk_gumbel_noise_list = []
+        output_topk_retained_mask_list = []
         output_topk_indices_list = []
         # ==========
         # end of soft thinking
@@ -614,6 +615,9 @@ class SchedulerOutputProcessorMixin:
                     output_topk_gumbel_noise_list.append(
                         req.get_output_topk_gumbel_noise_list()
                     )
+                    output_topk_retained_mask_list.append(
+                        req.get_output_topk_retained_mask_list()
+                    )
                     output_topk_probs_list.append(req.get_output_topk_prob_list())
                     output_topk_indices_list.append(req.get_output_topk_idx_list())
                 # ==========
@@ -657,6 +661,7 @@ class SchedulerOutputProcessorMixin:
                     # ==========
                     output_topk_gumbel_list,
                     output_topk_gumbel_noise_list,
+                    output_topk_retained_mask_list,
                     output_topk_probs_list,
                     output_topk_indices_list,
                     # ==========

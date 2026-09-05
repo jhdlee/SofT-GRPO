@@ -234,6 +234,7 @@ class DetokenizerManager:
             # ==========
             output_topk_gumbel_list=recv_obj.output_topk_gumbel_list,
             output_topk_gumbel_noise_list=recv_obj.output_topk_gumbel_noise_list,
+            output_topk_retained_mask_list=recv_obj.output_topk_retained_mask_list,
             output_topk_probs_list=recv_obj.output_topk_probs_list,
             output_topk_indices_list=recv_obj.output_topk_indices_list,
             # ==========

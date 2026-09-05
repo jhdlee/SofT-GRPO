@@ -608,6 +608,7 @@ class BatchTokenIDOut:
     # Soft thinking
     output_topk_gumbel_list: List[List[List[float]]]
     output_topk_gumbel_noise_list: List[List[List[float]]]
+    output_topk_retained_mask_list: List[List[List[bool]]]
     output_topk_probs_list: List[List[List[float]]]
     output_topk_indices_list: List[List[List[int]]]
     # ==========
@@ -666,6 +667,7 @@ class BatchStrOut:
     # ==========
     output_topk_gumbel_list: List[List[List[float]]]
     output_topk_gumbel_noise_list: List[List[List[float]]]
+    output_topk_retained_mask_list: List[List[List[bool]]]
     output_topk_probs_list: List[List[List[float]]]
     output_topk_indices_list: List[List[List[int]]]
     # ==========

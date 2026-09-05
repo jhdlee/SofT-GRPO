@@ -37,7 +37,7 @@ from verl.utils.torch_functional import check_device_is_available
 from verl.workers.rollout.sglang_rollout.request_dispatch import (
     check_collective_error,
     poison_engine,
-    require_healthy_engine,
+    require_idle_engine,
 )
 
 from .base import BaseShardingManager
@@ -70,6 +70,7 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         self.device_mesh = device_mesh
         self.offload_param = offload_param
         self._opd_poisoned = None
+        self._opd_rng_switched = False
         self.last_rollout_timing = {}
 
         # Full params
@@ -99,35 +100,83 @@ class FSDPSGLangShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
     def __enter__(self):
-        if self._opd_poisoned:
-            raise RuntimeError(f"rollout sharding manager is poisoned: {self._opd_poisoned}")
-        require_healthy_engine(self.inference_engine)
         self.last_rollout_timing = {}
         entered_at = time.perf_counter()
-        torch.cuda.empty_cache()
-        log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
-        if self.offload_param:
-            load_fsdp_model_to_gpu(self.module)
-        params = self.module.state_dict()
-        log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
-        device = torch.cuda.current_device()  # used when fsdp2 set cpu_offload_policy
-        params = {k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()}
-        # Copy, not share memory
-        loop = asyncio.get_event_loop()
+        self._guard_stage("entry readiness", self._require_idle)
+        loop = self._guard_stage("entry event loop", asyncio.get_event_loop)
+        params = self._prepare_weights(readiness_checked=True)
         loop.run_until_complete(self.update_weights(params))
-        log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
-
         del params
-        if self.offload_param:
-            offload_fsdp_model_to_cpu(self.module)
-        torch.cuda.empty_cache()
-        log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
-
-        # important: need to manually set the random states of each tp to be identical.
-        if self.device_mesh is not None:
-            self.torch_random_states = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(self.gen_random_states)
+        self._finish_entry()
         self.last_rollout_timing["sharding_enter_seconds"] = time.perf_counter() - entered_at
+
+    def _require_idle(self):
+        if self._opd_poisoned:
+            raise RuntimeError(f"rollout sharding manager is poisoned: {self._opd_poisoned}")
+        require_idle_engine(self.inference_engine)
+
+    def _finish_stage(self, error, stage):
+        """Retire every manager at one matched phase boundary on any failure.
+
+        Callers must not wrap a sequence of these phases in another failure
+        collective: a rank catching an earlier failure could otherwise match
+        that outer collective with a peer's next inner phase.
+        """
+        try:
+            check_collective_error(self.inference_engine, dist, error, stage)
+        except BaseException as failure:
+            self._opd_poisoned = f"{type(failure).__name__}: {failure}"
+            poison_engine(self.inference_engine, self._opd_poisoned)
+            if getattr(self, "_opd_rng_switched", False):
+                self._opd_rng_switched = False
+                torch.cuda.set_rng_state(self.torch_random_states)
+            raise
+
+    def _guard_stage(self, stage, operation):
+        result, error = None, None
+        try:
+            result = operation()
+        except BaseException as failure:
+            error = failure
+        self._finish_stage(error, stage)
+        return result
+
+    def _prepare_weights(self, readiness_checked=False):
+        if not readiness_checked:
+            self._guard_stage("entry readiness", self._require_idle)
+
+        def prepare_local():
+            torch.cuda.empty_cache()
+            log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
+            if self.offload_param:
+                load_fsdp_model_to_gpu(self.module)
+
+        # Finish local readiness on every DP rank before FSDP state_dict can
+        # enter its own collectives. Fatal process/NCCL loss still requires the
+        # process supervisor; Python/RPC failures must never skip a phase.
+        self._guard_stage("entry local preparation", prepare_local)
+        params = self._guard_stage("state dict", self.module.state_dict)
+
+        def transfer_local():
+            log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
+            device = torch.cuda.current_device()
+            return {k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()}
+
+        return self._guard_stage("state dict transfer", transfer_local)
+
+    def _finish_entry(self):
+        def finish_local():
+            log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
+            if self.offload_param:
+                offload_fsdp_model_to_cpu(self.module)
+            torch.cuda.empty_cache()
+            log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
+            if self.device_mesh is not None:
+                self.torch_random_states = torch.cuda.get_rng_state()
+                self._opd_rng_switched = True
+                torch.cuda.set_rng_state(self.gen_random_states)
+
+        self._guard_stage("entry completion", finish_local)
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager exit", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
@@ -165,46 +214,70 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)
+        self._opd_rng_switched = False
 
     async def update_weights(self, params):
-        require_healthy_engine(self.inference_engine)
+        self._guard_stage("weight update readiness", self._require_idle)
         resumed_at = time.perf_counter()
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self.inference_engine.resume_memory_occupation()
+        resume_error = None
+        try:
+            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                await self.inference_engine.resume_memory_occupation()
+        except BaseException as error:
+            resume_error = error
         self.last_rollout_timing["memory_resume_seconds"] = time.perf_counter() - resumed_at
+        self._finish_stage(resume_error, "memory resume")
         synchronized_at = time.perf_counter()
 
-        # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
-        named_tensors = [(k, v) for k, v in params.items()]
+        named_tensors = self._guard_stage("weight inventory preparation", lambda: list(params.items()))
+
+        def validate_inventory():
+            names = [name for name, _ in named_tensors]
+            if dist.is_initialized():
+                inventories = [None] * dist.get_world_size()
+                dist.all_gather_object(inventories, names)
+                if any(inventory != names for inventory in inventories):
+                    raise RuntimeError("rollout ranks have different ordered weight inventories")
+
+        self._guard_stage("weight inventory", validate_inventory)
         load_format = None
         for tensor_index, (name, tensor) in enumerate(named_tensors):
-            serialized_tensor = MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor))
-
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                gathered_serialized_tensors = [None for _ in range(self.device_mesh["infer_tp"].mesh.size()[0])]
-            else:
-                gathered_serialized_tensors = None
-            dist.gather_object(
-                obj=serialized_tensor,
-                object_gather_list=gathered_serialized_tensors,
-                dst=self.device_mesh["infer_tp"].mesh.tolist()[0],
-                group=self.device_mesh["infer_tp"].get_group(),
+            materialized = self._guard_stage(
+                f"weight materialization {name}", lambda: _preprocess_tensor_for_update_weights(tensor),
             )
 
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                await self.inference_engine.update_weights_from_tensor(
-                    named_tensors=[
-                        (
-                            name,
-                            LocalSerializedTensor(values=gathered_serialized_tensors),
-                        )
-                    ],
-                    load_format=load_format,
-                    flush_cache=tensor_index == len(named_tensors) - 1,
-                )
+            def prepare_transfer():
+                tp_mesh = self.device_mesh["infer_tp"]
+                serialized = MultiprocessingSerializer.serialize(materialized)
+                gathered = [None] * tp_mesh.mesh.size()[0] if tp_mesh.get_local_rank() == 0 else None
+                return serialized, gathered, tp_mesh.mesh.tolist()[0], tp_mesh.get_group()
+
+            serialized_tensor, gathered_serialized_tensors, destination, group = self._guard_stage(
+                f"weight serialization {name}", prepare_transfer,
+            )
+            # The serialization guard completes globally before any TP group
+            # enters gather_object; the next guard completes before any RPC.
+            self._guard_stage(
+                f"weight gather {name}", lambda: dist.gather_object(
+                    obj=serialized_tensor, object_gather_list=gathered_serialized_tensors,
+                    dst=destination, group=group,
+                ),
+            )
+            update_error = None
+            try:
+                if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                    await self.inference_engine.update_weights_from_tensor(
+                        named_tensors=[(name, LocalSerializedTensor(values=gathered_serialized_tensors))],
+                        load_format=load_format,
+                        flush_cache=tensor_index == len(named_tensors) - 1,
+                    )
+            except BaseException as error:
+                update_error = error
+            self._finish_stage(update_error, f"weight update {name}")
         self.last_rollout_timing["weight_sync_seconds"] = time.perf_counter() - synchronized_at
 
     async def release_memory(self):
+        self._guard_stage("memory release readiness", self._require_idle)
         released_at = time.perf_counter()
         release_error = None
         try:
@@ -213,35 +286,17 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         except BaseException as error:
             release_error = error
         self.last_rollout_timing["memory_release_seconds"] = time.perf_counter() - released_at
-        check_collective_error(self.inference_engine, dist, release_error, "memory release")
+        self._finish_stage(release_error, "memory release")
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
     async def wake_up(self):
-        if self._opd_poisoned:
-            raise RuntimeError(f"rollout sharding manager is poisoned: {self._opd_poisoned}")
-        require_healthy_engine(self.inference_engine)
-        torch.cuda.empty_cache()
-        log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
-        if self.offload_param:
-            load_fsdp_model_to_gpu(self.module)
-        params = self.module.state_dict()
-        log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
-        device = torch.cuda.current_device()  # used when fsdp2 set cpu_offload_policy
-        params = {k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()}
-        # Copy, not share memory
+        self.last_rollout_timing = {}
+        entered_at = time.perf_counter()
+        params = self._prepare_weights()
         await self.update_weights(params)
-        log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
-
         del params
-        if self.offload_param:
-            offload_fsdp_model_to_cpu(self.module)
-        torch.cuda.empty_cache()
-        log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
-
-        # important: need to manually set the random states of each tp to be identical.
-        if self.device_mesh is not None:
-            self.torch_random_states = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(self.gen_random_states)
+        self._finish_entry()
+        self.last_rollout_timing["sharding_enter_seconds"] = time.perf_counter() - entered_at
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager exit", logger=logger)
     async def sleep(self):
@@ -258,6 +313,7 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)
+        self._opd_rng_switched = False
 
     def preprocess_data(self, data: DataProto) -> DataProto:
         """All gather across tp group to make each rank has identical input."""

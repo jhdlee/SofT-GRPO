@@ -138,7 +138,10 @@ def logprobs_from_logits_topk_dirichlet(logits, rollout_topk_ids, rollout_topk_g
     return output
 
 
-def logprobs_from_logits_topk_gumbel(logits, rollout_topk_ids, rollout_topk_gumbels, labels, inplace_backward=True):
+def logprobs_from_logits_topk_gumbel(
+    logits, rollout_topk_ids, rollout_topk_gumbels, labels, inplace_backward=True,
+    rollout_topk_retained_mask=None,
+):
     if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
         batch_dim = logits.shape[:-1]
         last_dim = logits.shape[-1]
@@ -147,13 +150,21 @@ def logprobs_from_logits_topk_gumbel(logits, rollout_topk_ids, rollout_topk_gumb
         labels = labels.reshape(-1)
         rollout_topk_ids = rollout_topk_ids.reshape(-1, k_num)
         rollout_topk_gumbels = rollout_topk_gumbels.reshape(-1, k_num)
-        # print(logits.max() - logits.gather(-1, rollout_topk_ids).max())
-        topk_log_probs = torch.softmax(logits.clone(), dim=-1).gather(-1, rollout_topk_ids)
-        topk_log_probs = (topk_log_probs / topk_log_probs.sum(-1, keepdim=True) + 1e-6).log()
-        gumbel_reparameter = (rollout_topk_gumbels - topk_log_probs).clamp(-1.5, 3)
-        output_gumbel = -gumbel_reparameter - (-gumbel_reparameter).exp()
-        float_top_p_mask = (topk_log_probs.clone() > -3).float()
-        output_gumbel = (output_gumbel * float_top_p_mask).sum(-1) / float_top_p_mask.sum(-1)
+        if rollout_topk_retained_mask is None:
+            # Preserve legacy launches that do not export behavior filtering.
+            topk_log_probs = torch.softmax(logits.clone(), dim=-1).gather(-1, rollout_topk_ids)
+            topk_log_probs = (topk_log_probs / topk_log_probs.sum(-1, keepdim=True) + 1e-6).log()
+            gumbel_reparameter = (rollout_topk_gumbels - topk_log_probs).clamp(-1.5, 3)
+            output_gumbel = -gumbel_reparameter - (-gumbel_reparameter).exp()
+            float_top_p_mask = (topk_log_probs.clone() > -3).float()
+            output_gumbel = (output_gumbel * float_top_p_mask).sum(-1) / float_top_p_mask.sum(-1)
+        else:
+            from verl.opd.density import fixed_support_gumbel_log_probs
+
+            output_gumbel = fixed_support_gumbel_log_probs(
+                logits, rollout_topk_ids, rollout_topk_gumbels,
+                rollout_topk_retained_mask.reshape(-1, k_num),
+            )
         ids_finish = (rollout_topk_ids[:, 1:] == 0).all(-1)
         output_answer = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
         output = torch.where(ids_finish, output_answer, output_gumbel)

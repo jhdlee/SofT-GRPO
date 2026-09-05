@@ -72,6 +72,7 @@ def _continuous_support_gradient_geometry(
     gumbel_temperature: float,
     policy_scale: float,
     opd_scale: float,
+    retained_support_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return squared norms and dot product in fixed-support logit space.
 
@@ -88,7 +89,14 @@ def _continuous_support_gradient_geometry(
     if not math.isfinite(float(gumbel_temperature)) or float(gumbel_temperature) <= 0.0:
         raise ValueError("Gumbel temperature must be finite and positive")
     diagnostic_logits = support_logits.detach().float().requires_grad_(True)
-    support_log_probs = (torch.softmax(diagnostic_logits, dim=-1) + 1e-6).log()
+    density_logits = diagnostic_logits
+    if retained_support_mask is not None:
+        if retained_support_mask.shape != support_logits.shape or retained_support_mask.dtype != torch.bool:
+            raise ValueError("retained support mask must be Boolean and align with support logits")
+        if not bool(retained_support_mask.any(-1).all()):
+            raise ValueError("retained support cannot be empty")
+        density_logits = diagnostic_logits.masked_fill(~retained_support_mask, -torch.inf)
+    support_log_probs = (torch.softmax(density_logits, dim=-1) + 1e-6).log()
     reparameterized = (stored_perturbed_logits.float() - support_log_probs).clamp(-1.5, 3.0)
     support_mask = (support_log_probs > -3.0).float()
     log_density = (-reparameterized - (-reparameterized).exp())
@@ -238,8 +246,16 @@ class DataParallelPPOActor(BasePPOActor):
             input_ids = micro_batch["input_ids"]
             rollout_topk_ids = micro_batch.get("rollout_topk_ids") if continuous_replay else None
             rollout_topk_gumbels = micro_batch.get("rollout_topk_gumbels") if continuous_replay else None
+            rollout_topk_retained_mask = micro_batch.get("rollout_topk_retained_mask") if continuous_replay else None
+            rollout_topk_probs = micro_batch.get("rollout_topk_probs") if continuous_replay else None
             if continuous_replay and (rollout_topk_ids is None or rollout_topk_gumbels is None):
                 raise RuntimeError("continuous replay requires stored top-k IDs and perturbations")
+            if (continuous_replay and self.opd_config.prompt_profile == "qwen3-training-benchmark-v1"
+                    and rollout_topk_retained_mask is None):
+                raise RuntimeError("Qwen3 continuous replay requires the recorded retained support mask")
+            if (continuous_replay and self.opd_config.prompt_profile == "qwen3-training-benchmark-v1"
+                    and rollout_topk_probs is None):
+                raise RuntimeError("Qwen3 continuous replay requires the recorded mixture probabilities")
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
@@ -266,6 +282,14 @@ class DataParallelPPOActor(BasePPOActor):
                                                         attention_mask)  # input_ids_rmpad (total_nnz, ...)
                     topk_gumbels_rmpad, _, *_ = unpad_input(rollout_topk_gumbels,
                                                             attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                    retained_mask_rmpad = (
+                        unpad_input(rollout_topk_retained_mask, attention_mask)[0]
+                        if rollout_topk_retained_mask is not None else None
+                    )
+                    topk_probs_rmpad = (
+                        unpad_input(rollout_topk_probs, attention_mask)[0].detach()
+                        if rollout_topk_probs is not None else None
+                    )
 
                 # print(input_ids_rmpad.size(), topk_ids_rmpad.size(), topk_gumbels_rmpad.size())
                 # unpad the position_ids to align the rotary
@@ -284,18 +308,24 @@ class DataParallelPPOActor(BasePPOActor):
                         self.actor_module,
                         topk_ids_rmpad,
                         target_device=topk_gumbels_rmpad.device,
-                        target_dtype=topk_gumbels_rmpad.dtype
+                        target_dtype=torch.bfloat16
                     )
                 # print(f"topk_gumbels_rmpad{topk_gumbels_rmpad.tolist()}")
                 # print(f"topk_ids_rmpad{topk_ids_rmpad.tolist()}")
                 # print(f"position_ids_rmpad{position_ids_rmpad.tolist()}")
 
-                    mask = (topk_ids_rmpad[:, 1:] == 0).all(dim=-1, keepdim=True)  # bool [B,1]
-                    masked = topk_gumbels_rmpad.clone()
-                    masked[:, 1:] = masked[:, 1:].masked_fill(mask, -torch.inf)
-                    gumbel_y = torch.softmax(masked / gumbel_temperature, dim=-1).to(topk_gumbels_rmpad.dtype)
-                    # print(gumbel_y)
-                    topk_embs = torch.sum(gumbel_y.unsqueeze(-1) * topk_embs, dim=1, dtype=torch.bfloat16)
+                    if topk_probs_rmpad is None:
+                        mask = (topk_ids_rmpad[:, 1:] == 0).all(dim=-1, keepdim=True)
+                        masked = topk_gumbels_rmpad.clone()
+                        masked[:, 1:] = masked[:, 1:].masked_fill(mask, -torch.inf)
+                        gumbel_y = torch.softmax(masked / gumbel_temperature, dim=-1)
+                    else:
+                        gumbel_y = topk_probs_rmpad
+                    # Match SGLang VocabParallelEmbedding.weighted_forward:
+                    # normalize the recorded, action-sorted weights again and
+                    # combine the BF16 inference table, with BF16 reduction.
+                    gumbel_y = gumbel_y / gumbel_y.sum(-1, keepdim=True)
+                    topk_embs = torch.sum(gumbel_y.unsqueeze(-1) * topk_embs, dim=1, dtype=topk_embs.dtype)
                 if continuous_replay and (compute_opd or collect_gradient_info):
                     response_mask = attention_mask[:, -response_length:].bool()
                     response_support = rollout_topk_ids[:, -response_length:]
@@ -362,6 +392,10 @@ class DataParallelPPOActor(BasePPOActor):
                 if continuous_replay:
                     topk_gumbels_rmpad_rolled = torch.roll(topk_gumbels_rmpad, shifts=-1, dims=0)  # (total_nnz, k)
                     topk_ids_rmpad_rolled = torch.roll(topk_ids_rmpad, shifts=-1, dims=0)  # (total_nnz, k)
+                    retained_mask_rmpad_rolled = (
+                        torch.roll(retained_mask_rmpad, shifts=-1, dims=0)
+                        if retained_mask_rmpad is not None else None
+                    )
                 # print(topk_gumbels_rmpad_rolled.tolist())
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
@@ -455,6 +489,10 @@ class DataParallelPPOActor(BasePPOActor):
                             "latent_mask": latent_mask,
                             "support_logits": selected_logits.gather(-1, latent_support_ids).detach(),
                             "support_gumbels": micro_batch["rollout_topk_gumbels"][:, -response_length:][latent_mask].detach(),
+                            "retained_support_mask": (
+                                rollout_topk_retained_mask[:, -response_length:][latent_mask].detach()
+                                if rollout_topk_retained_mask is not None else None
+                            ),
                         }
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -478,6 +516,7 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_topk_gumbels=topk_gumbels_rmpad_rolled,
                             labels=input_ids_rmpad_rolled,
                             inplace_backward=inplace_backward,
+                            rollout_topk_retained_mask=retained_mask_rmpad_rolled,
                         )
                     elif add_noise_dirichlet:
                         log_probs = logprobs_from_logits_topk_dirichlet(
@@ -620,6 +659,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.extend(
                 ["rollout_topk_ids", "rollout_topk_gumbels", "gumbel_temperature"]
             )
+            if "rollout_topk_retained_mask" in data.batch:
+                select_keys.append("rollout_topk_retained_mask")
+            if "rollout_topk_probs" in data.batch:
+                select_keys.append("rollout_topk_probs")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -696,6 +739,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.extend(
                 ["rollout_topk_ids", "rollout_topk_gumbels", "gumbel_temperature"]
             )
+            if "rollout_topk_retained_mask" in data.batch:
+                select_keys.append("rollout_topk_retained_mask")
+            if "rollout_topk_probs" in data.batch:
+                select_keys.append("rollout_topk_probs")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss and not standalone:
@@ -1006,6 +1053,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     0.0 if standalone else 1.0 / self.gradient_accumulation
                                 ),
                                 opd_scale=opd_gradient_scale,
+                                retained_support_mask=gradient_info.get("retained_support_mask"),
                             )
                         )
                         if support_grpo_grad_sq is None:

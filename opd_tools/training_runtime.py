@@ -349,6 +349,23 @@ def _match_submission_identity(cell: Mapping[str, Any], submission: Mapping[str,
         raise ValueError("cell Slurm job ID differs from submission identity")
 
 
+def _measurement_failure(cell: Mapping[str, Any]) -> tuple[dict[str, Any] | None, Mapping[str, Any]]:
+    """Prefer the worker's persisted failure to a generic subprocess exit."""
+    direct = cell.get("failure")
+    if isinstance(direct, Mapping) and direct.get("error"):
+        return dict(direct), cell
+    for phase in reversed(cell.get("phases", [])):
+        measured = phase.get("measurement", {})
+        if not isinstance(measured, Mapping):
+            continue
+        failure = measured.get("failure")
+        if isinstance(failure, Mapping) and failure.get("error"):
+            return dict(failure), measured
+        if measured.get("status") == "failed" and isinstance(measured.get("error"), str):
+            return {"status": "failed", "stage": phase.get("phase", "unknown"), "error": measured["error"]}, measured
+    return None, {}
+
+
 def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
     """Read all expected cells; absent or invalid measurements stay explicit."""
     input_root = Path(input_root)
@@ -398,6 +415,16 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
                 cell["submission_job"] = dict(submitted_job)
             cell.update({"objective": objective, "gpus": gpus, "status": "incomplete", "estimate": None, "input_path": str(path), "measurement_status": raw.get("status")})
             cell["dispatch_selection"] = select_dispatch(raw.get("screen_rows", []), raw.get("confirm_rows", []))
+            failure, failed_measurement = _measurement_failure(raw)
+            if failure is not None:
+                cell["failure"] = failure
+                cell["failure_status"] = failure.get("status", "failed")
+                # Startup remains an observed measurement even if replay fails
+                # before the first completed training iteration is recorded.
+                if cell.get("startup_seconds") is None and "startup_seconds" in failed_measurement:
+                    cell["startup_seconds"] = failed_measurement["startup_seconds"]
+                if "failed_iterations" in failed_measurement:
+                    cell["failed_iterations"] = failed_measurement["failed_iterations"]
             try:
                 if submission_error is not None:
                     raise ValueError("submission identity invalid: " + submission_error)
@@ -405,6 +432,8 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
                     cell["submission_identity_matches"] = False
                     _match_submission_identity(raw, submission, submitted_job)
                     cell["submission_identity_matches"] = True
+                if failure is not None:
+                    raise ValueError(f"{failure.get('status', 'failed')} at {failure.get('stage', 'unknown')}: {failure['error']}")
                 if raw.get("status") not in ("complete", "completed"):
                     raise ValueError(raw.get("reason") or f"benchmark status is {raw.get('status', 'missing')}")
                 _validate_cell_provenance(raw, objective, gpus)
@@ -504,6 +533,11 @@ def _stage_measurement_lines(cell: Mapping[str, Any]) -> list[str]:
             values.append("unavailable")
         return values
     lines.append(f"| Startup | {_display_number(cell.get('startup_seconds'))} | — | — | — | — | — | — |")
+    failure = cell.get("failure", {})
+    failed_timing = failure.get("timing_s", {})
+    if failed_timing:
+        values = [_display_number(failed_timing.get(key)) for key in ("step_partial", "gen", "old_log_prob", "ref", "update_actor", "weight_sync")]
+        lines.append(f"| Failed iteration {failure.get('rollout_iteration', '?')} (partial; no update) | {' | '.join(values)} | — |")
     zero_label = "Iteration 0 (zero dose)" if cell.get("objective") == "hybrid" else "Iteration 0"
     lines.append(f"| {zero_label} | {' | '.join(iteration_summary([0]))} |")
     lines.append(f"| Active mean (iterations 1–2) | {' | '.join(iteration_summary([1, 2]))} |")
@@ -511,6 +545,26 @@ def _stage_measurement_lines(cell: Mapping[str, Any]) -> list[str]:
     lines.append(f"| One authenticated checkpoint | {_display_number(cell.get('checkpoint_seconds'))} | — | — | — | — | — | — |")
     lines.extend(["", "Iteration wall times exclude nested validation and checkpoint saves. Actor time includes teacher work; weight synchronization is already inside generation. Teacher diagnostics use the maximum per-rank wall time, averaged across iterations 1–2 for the active mean. Qwen benchmark CUDA synchronization cost is included in these measurements. Nested teacher time is never added to actor time or the runtime estimate. Missing stage timers are unavailable, not zero.", ""])
     return lines
+
+
+def _failure_measurement_lines(cell: Mapping[str, Any]) -> list[str]:
+    failure = cell.get("failure")
+    if not isinstance(failure, Mapping):
+        return []
+    details = failure.get("diagnostics", {})
+    worst = details.get("worst_positions", [])
+    lines = []
+    if failure.get("optimizer_updates_completed") is False:
+        lines.append("The rejected iteration completed no optimizer updates. Partial timings are excluded from the training runtime estimate.")
+    if worst:
+        row = worst[0]
+        def log_value(value):
+            return f"{value:.6g}" if isinstance(value, (int, float)) and math.isfinite(value) else "unavailable/nonfinite"
+        lines.append(f"Worst replay comparison: prompt index {_markdown_value(row.get('prompt_index'))}, rollout rank {_markdown_value(row.get('rollout_rank'))}, response position {_markdown_value(row.get('response_position'))} ({_markdown_value(row.get('segment'))}); rollout log density {log_value(row.get('rollout_log_density'))}, actor log density {log_value(row.get('actor_log_density'))}, ratio error {log_value(row.get('ratio_abs_error'))}.")
+    stats = details.get("rollout_metrics", {})
+    if stats:
+        lines.append(f"Failed-batch cap rate: {_display_number(stats.get('latent/cap_rate'))}; soft-to-hard rate: {_display_number(stats.get('latent/soft_to_hard_rate'))}; valid boundaries: {_markdown_value(details.get('valid_boundary_count'))}.")
+    return ["", *lines, ""] if lines else []
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
@@ -540,6 +594,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         prefix = f"{cell['objective']} / {cell['gpus']} H100"
         if cell["status"] != "complete":
             lines.append(f"- **{prefix}:** incomplete — {_markdown_value(cell.get('reason', 'unfinished'))}.")
+            lines.extend(_failure_measurement_lines(cell))
         selection = cell.get("dispatch_selection")
         if selection:
             comparisons = "; ".join(f"batch {row['batch_index']}: wall {row['wall_speedup']:.3f}×, throughput {row['throughput_speedup']:.3f}×, tokens Δ{row['generated_tokens_difference']:g}" if row["valid"] else f"batch {row['batch_index']}: incomplete/invalid" for row in selection["comparisons"])

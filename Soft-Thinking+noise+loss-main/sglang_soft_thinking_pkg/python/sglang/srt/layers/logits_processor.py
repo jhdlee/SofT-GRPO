@@ -85,6 +85,10 @@ class LogitsProcessorOutput:
     # compact top-k tensor lets an external replay recover the sampler's
     # pre-noise log probabilities without persisting vocabulary logits.
     topk_gumbel_noise: Optional[torch.Tensor] = None
+    # Exact pre-noise support after top-k/top-p/min-p truncation, sorted with
+    # the emitted action. Unlike perturbation-minus-noise, this has no rounding
+    # ambiguity at a zero-probability filler slot. Observational metadata only.
+    topk_retained_mask: Optional[torch.Tensor] = None
     topk_indices: Optional[torch.Tensor] = None
     # ==========
     # end of soft thinking

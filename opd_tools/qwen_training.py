@@ -338,6 +338,7 @@ def profile_overrides(objective: str, gpus: int, root: Path | str, run_dir: Path
         "trainer.n_gpus_per_node": gpus, "trainer.nnodes": 1, "trainer.default_local_dir": str(run_dir), "trainer.save_freq": 25, "trainer.test_freq": 25, "trainer.checkpoint_keep_latest": 2,
         "trainer.rollout_integrity.enabled": True, "trainer.rollout_integrity.gate_first_n_iterations": 1,
         "algorithm.opd.prompt_profile": PROFILE_ID,
+        "actor_rollout_ref.rollout.require_retained_support": True,
         "ray_init.num_cpus": 16 * gpus,
     }
     result = [key + "=" + json.dumps(value, separators=(",", ":")) for key, value in values.items()]
