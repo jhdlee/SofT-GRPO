@@ -151,3 +151,71 @@ def test_probe_failure_keeps_completed_forward_evidence_and_previous_files(tmp_p
     with pytest.raises(SystemExit):
         probe.main(argv)
     assert output.read_bytes() == before
+
+
+def test_stage_differences_separate_shared_prefix_from_decode_rows():
+    left = {"layer.0.qkv": torch.zeros(16, 8), "logits": torch.zeros(1, 32)}
+    right = {key: value.clone() for key, value in left.items()}
+    right["layer.0.qkv"][3, :2] = 1
+    right["layer.0.qkv"][13, 0] = 1
+    regions = probe.compare_traces(left, right)["stages"]["layer.0.qkv"]["differing_rows"]
+    assert regions == {"prefix_elements": 2, "decode_elements_by_row": [0, 1, 0, 0], "first_row_indices": [3, 13]}
+
+
+def test_projection_shape_control_holds_exact_rows_and_weights_fixed():
+    value = torch.arange(48.).reshape(16, 3)
+    weight = torch.arange(15.).reshape(5, 3)
+    calls = []
+    def linear(x, w):
+        assert w is weight
+        calls.append(x.clone())
+        return torch.nn.functional.linear(x, w)
+    result = probe.projection_shape_controls(value, weight, linear)
+    assert all(row["max_abs"] == 0 for row in result.values())
+    assert [len(x) for x in calls] == [16, 12, 1, 1, 1, 1, 16]
+    assert torch.equal(torch.cat(calls[1:6]), value)
+
+
+def test_native_projection_replacement_is_instance_scoped_and_head_uses_it(monkeypatch):
+    class Unquantized:
+        def apply(self, layer, value, bias=None):
+            return torch.nn.functional.linear(value, layer.weight, bias)
+    class Native(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(4, 3))
+            self.quant_method = Unquantized()
+            self.logits_processor = SimpleNamespace(
+                do_tensor_parallel_all_gather=False, do_tensor_parallel_all_gather_dp_attn=False,
+                final_logit_softcapping=None, logit_scale=None, config=SimpleNamespace(vocab_size=4))
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.linear", SimpleNamespace(UnquantizedLinearMethod=Unquantized))
+    model, untouched = Native(), Native()
+    original = model.quant_method
+    parameters = list(model.parameters())
+    calls = []
+    def linear(value, weight, bias=None):
+        calls.append(weight)
+        return torch.nn.functional.linear(value, weight, bias)
+    assert probe.install_native_probe_linear(model, linear) == 1
+    assert model.quant_method is not original
+    x = torch.ones(2, 3)
+    assert torch.equal(model.quant_method.apply(model, x), original.apply(model, x))
+    assert torch.equal(model.logits_processor._get_logits(x, model, None), original.apply(model, x))
+    assert len(calls) == 2 and all(w is parameters[0] for w in calls)
+    assert "apply" not in untouched.quant_method.__dict__
+    model.logits_processor.do_tensor_parallel_all_gather = True
+    with pytest.raises(ValueError, match="TP1"):
+        probe.install_native_probe_linear(model, linear)
+
+
+def test_native_fa3_probe_fixes_both_prefill_and_decode_split_counts(monkeypatch):
+    calls = []
+    def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "actual-kernel-result"
+    backend = SimpleNamespace(flash_attn_varlen_func=original, flash_attn_with_kvcache=original)
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.attention", SimpleNamespace(flashattention_backend=backend))
+    probe.fix_native_fa3_split_count()
+    for name in ("flash_attn_varlen_func", "flash_attn_with_kvcache"):
+        assert getattr(backend, name)("query", num_splits=0, causal=True) == "actual-kernel-result"
+    assert calls == [(('query',), {"num_splits": 1, "causal": True})] * 2

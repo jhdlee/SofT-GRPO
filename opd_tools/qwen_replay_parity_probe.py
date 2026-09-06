@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import importlib
 import importlib.metadata
 import json
 import os
 from pathlib import Path
 import time
+import types
 
 import torch
 import torch.nn.functional as F
@@ -80,6 +82,14 @@ class Trace:
 def compare_traces(native, other):
     common = native.keys() & other.keys()
     rows = {name: difference(native[name], other[name]) for name in sorted(common) if name != "logits"}
+    for name, row in rows.items():
+        if row["shape_matches"] and row["exact_elements"] != row["elements"]:
+            different = (native[name] != other[name]).reshape(native[name].shape[0], -1).sum(-1)
+            row["differing_rows"] = {
+                "prefix_elements": int(different[:-4].sum()),
+                "decode_elements_by_row": different[-4:].tolist(),
+                "first_row_indices": different.nonzero().flatten()[:8].tolist(),
+            }
     return {"stages": rows, "missing_native": sorted(other.keys() - native.keys()),
             "missing_comparison": sorted(native.keys() - other.keys()),
             "final_logits": logits_difference(native["logits"], other["logits"])}
@@ -250,7 +260,7 @@ def hf_forward(model, ids, embedding=None, *, candidate_emit_state=None):
     return trace.finish()
 
 
-def packed_projection_controls(native, hf, trace):
+def packed_projection_controls(native, hf, trace, linear=F.linear):
     """Hold activations/weights fixed to isolate packed versus separate GEMMs."""
     rows = []
     for i, (nlayer, hlayer) in enumerate(zip(native.model.layers, hf.model.layers)):
@@ -262,12 +272,62 @@ def packed_projection_controls(native, hf, trace):
             if not torch.equal(weight, nmodule.weight):
                 raise RuntimeError(f"pinned packed weights differ at layer {i} {group}")
             x = trace[f"layer.{i}.{stage}"]
-            packed = F.linear(x, weight)
+            packed = linear(x, weight)
             separate = torch.cat([F.linear(x, m.weight) for m in hmodules], -1)
             rows.append({"layer": i, "group": group, "weights_equal": True,
                          "packed_vs_separate_same_input": difference(packed, separate),
                          "native_observed_vs_packed_same_input": difference(trace[f"layer.{i}.{group}"], packed)})
     return rows
+
+
+def projection_shape_controls(value, weight, linear=F.linear):
+    """Identical rows/weights under prefill, decode, and reordered schedules."""
+    full = linear(value, weight)
+    prefix = len(value) - 4
+    chunked = torch.cat([linear(value[:prefix], weight)] + [linear(value[i:i + 1], weight) for i in range(prefix, len(value))])
+    permutation = torch.arange(len(value) - 1, -1, -1, device=value.device)
+    permuted = linear(value[permutation], weight)[permutation]
+    return {"full_vs_prefix": difference(full[:prefix], chunked[:prefix]),
+            "full_vs_decode": difference(full[prefix:], chunked[prefix:]),
+            "full_vs_reordered": difference(full, permuted)}
+
+
+def install_native_probe_linear(model, linear):
+    """Instance-only TP1 unquantized projection/head control, never a server default."""
+    from sglang.srt.layers.linear import UnquantizedLinearMethod
+
+    processor = model.logits_processor
+    if processor.do_tensor_parallel_all_gather or processor.do_tensor_parallel_all_gather_dp_attn or processor.final_logit_softcapping:
+        raise ValueError("probe linear replacement requires TP1 without logit softcapping")
+    modules = [module for module in model.modules() if isinstance(getattr(module, "quant_method", None), UnquantizedLinearMethod)]
+    if not modules:
+        raise ValueError("no native unquantized projections found")
+    for module in modules:
+        method = copy.copy(module.quant_method)
+        def apply(method_self, layer, value, bias=None):
+            return linear(value, layer.weight, bias)
+        method.apply = types.MethodType(apply, method)
+        module.quant_method = method
+    def get_logits(processor_self, hidden_states, lm_head, logits_metadata, embedding_bias=None):
+        if embedding_bias is not None:
+            raise ValueError("probe native head does not support embedding bias")
+        logits = linear(hidden_states.to(lm_head.weight.dtype), lm_head.weight)
+        if processor_self.logit_scale is not None:
+            logits = logits * processor_self.logit_scale
+        return logits[:, :processor_self.config.vocab_size].float()
+    processor._get_logits = types.MethodType(get_logits, processor)
+    return len(modules)
+
+
+def fix_native_fa3_split_count():
+    """Probe process only: the pinned backend otherwise lets decode choose splits."""
+    from sglang.srt.layers.attention import flashattention_backend as backend
+    for name in ("flash_attn_varlen_func", "flash_attn_with_kvcache"):
+        original = getattr(backend, name)
+        def fixed(*args, _original=original, **kwargs):
+            kwargs["num_splits"] = 1
+            return _original(*args, **kwargs)
+        setattr(backend, name, fixed)
 
 
 def run(args, *, wandb_run=None):
@@ -293,13 +353,23 @@ def run(args, *, wandb_run=None):
     server = ServerArgs(model_path=model_path, dtype="bfloat16", device="cuda", tp_size=1,
                         context_length=512, max_total_tokens=1024, max_running_requests=2,
                         mem_fraction_static=0.2, chunked_prefill_size=512, max_prefill_tokens=512,
-                        attention_backend="flashinfer", disable_cuda_graph=True, disable_radix_cache=True,
+                        attention_backend=args.attention_backend, disable_cuda_graph=True, disable_radix_cache=True,
                         disable_overlap_schedule=True, enable_soft_thinking=True, max_topk=5, random_seed=11)
     _set_envs_and_config(server)
+    # Explicit FP32 backward policy for the differentiable projection candidate.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if args.attention_backend == "fa3":
+        fix_native_fa3_split_count()
     runner, tokenizer = load_model(server, PortArgs.init_new(server), 0)
     # bench_one_batch's generic loader omits these fork-specific model fields.
     runner.model_config.enable_soft_thinking = True
     runner.model_config.max_topk = 5
+    linear = F.linear
+    native_linear_count = 0
+    if args.batch_invariant_linear:
+        from verl.opd.batch_invariant_linear import batch_invariant_linear
+        linear = batch_invariant_linear
+        native_linear_count = install_native_probe_linear(runner.model, linear)
     def load_hf():
         model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=True, torch_dtype=torch.bfloat16,
                                                     attn_implementation="flash_attention_2").cuda()
@@ -319,7 +389,8 @@ def run(args, *, wandb_run=None):
               "model": assets["model"], "sequence": {"length": len(ids), "ids_sha256": canonical_sha256(ids.tolist()),
                       "support_sha256": canonical_sha256(support.tolist()), "probabilities_sha256": canonical_sha256(probs.tolist()),
                       "soft_positions": list(range(len(ids) - 9, len(ids) - 1)), "cached_decode_steps": 4},
-              "configuration": {"native": {"attention_backend": "flashinfer", "tp_size": 1, "disable_cuda_graph": True},
+              "configuration": {"native": {"attention_backend": args.attention_backend, "tp_size": 1, "disable_cuda_graph": True,
+                                              "fixed_num_splits": 1 if args.attention_backend == "fa3" else None},
                                 "hf": {"attention_backend": "flash_attention_2", "parameter_dtype": "bfloat16", "train_mode": True,
                                        "remove_padding": True, "batch_size": 1, "fsdp": False}},
               "packages": {name: importlib.metadata.version(name) for name in ("torch", "transformers", "flash-attn", "flashinfer-python")},
@@ -329,6 +400,16 @@ def run(args, *, wandb_run=None):
                               "Hooks clone actual intermediate tensors and disable CUDA graphs; timing is diagnostic, not throughput.",
                               "Native layer outputs retain a separate residual; block_total is the BF16 sum for comparison only.",
                               "Full-prefill versus cached decode changes GEMM/attention shapes; final-head controls must be interpreted separately."]}
+    result["configuration"]["projection"] = {
+        "policy": "fixed_tile_triton_32_64_32" if args.batch_invariant_linear else "pytorch_default",
+        "native_module_count": native_linear_count,
+        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        "flashinfer_use_tensor_core_env": os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE"),
+    }
+    if args.batch_invariant_linear:
+        result["configuration"]["projection"]["source_sha256"] = file_sha256(Path(importlib.import_module("verl.opd.batch_invariant_linear").__file__))
+        result["limitations"].append("Fixed-tile cases modify native inference and the replay candidate together; parity would validate this proposed common arithmetic, not the released F.linear inference path.")
     atomic_write_json(args.output, result)
     candidate_hf, candidate_emit_state = None, {}
     if args.candidate:
@@ -337,25 +418,49 @@ def run(args, *, wandb_run=None):
         # A separate instance prevents candidate patches from contaminating
         # subsequent baseline cases. Its own callbacks replace module hooks.
         candidate_hf = load_hf()
-        installed = getattr(imported, name)(candidate_hf, emit=lambda key, tensor: candidate_emit_state["trace"].emit(key, tensor))
+        installer_kwargs = {"emit": lambda key, tensor: candidate_emit_state["trace"].emit(key, tensor)}
+        if args.batch_invariant_linear:
+            installer_kwargs["linear"] = linear
+        if args.candidate_attention_fa3:
+            from verl.opd.native_fa3_attention import native_fa3_attention
+            installer_kwargs["attention"] = native_fa3_attention
+        installed = getattr(imported, name)(candidate_hf, **installer_kwargs)
         if installed is not None:
             candidate_hf = installed
         result["candidate"] = {"callable": args.candidate, "source_sha256": file_sha256(Path(imported.__file__))}
+        result["candidate"]["attention"] = "fa3_single_split_forward_fa2_backward" if args.candidate_attention_fa3 else "flash_attention_2"
+        if args.candidate_attention_fa3:
+            result["candidate"]["attention_source_sha256"] = file_sha256(Path(importlib.import_module("verl.opd.native_fa3_attention").__file__))
+            result["limitations"].append("Diagnostic FA3 candidate uses the installed FA2 analytic backward with actual FA3 output/LSE; synthetic gradient validation does not establish full OPD/FSDP acceptance.")
     for soft in (False, True):
         start = time.monotonic()
         native = native_forward(runner, ids, support if soft else None, probs if soft else None)
         cached = native_forward(runner, ids, support if soft else None, probs if soft else None, cached=True)
+        backend = runner.attn_backend
+        backend_identity = {"class": type(backend).__name__,
+                            "decode_use_tensor_cores": getattr(backend, "decode_use_tensor_cores", None),
+                            "ragged_prefill_backend_after_plan": getattr(getattr(backend, "prefill_wrapper_ragged", None), "_backend", None),
+                            "paged_prefill_backends_after_plan": [getattr(wrapper, "_backend", None) for wrapper in getattr(backend, "prefill_wrappers_paged", [])]}
         embed = None
         if soft:
             table = hf.model.embed_tokens(support.cuda())
             normalized = probs.cuda() / probs.cuda().sum(-1, keepdim=True)
             embed = torch.sum(normalized.unsqueeze(-1) * table, dim=1, dtype=table.dtype)
         baseline = hf_forward(hf, ids, embed)
-        row = {"input": "soft_mixtures" if soft else "hard_tokens", "native_prefill_vs_cached": compare_traces(native, cached),
+        row = {"input": "soft_mixtures" if soft else "hard_tokens", "native_attention_backend_observed": backend_identity,
+               "native_prefill_vs_cached": compare_traces(native, cached),
                "native_prefill_vs_hf": compare_traces(native, baseline),
                "native_cached_vs_hf": compare_traces(cached, baseline),
-               "packed_projection_controls": packed_projection_controls(runner.model, hf, native),
-               "head_same_input_last_position": difference(native["logits"][-1:], F.linear(native["final_norm"][-1:], hf.lm_head.weight).float())}
+               "packed_projection_controls": packed_projection_controls(runner.model, hf, native, linear),
+               "head_same_input_last_position": difference(native["logits"][-1:], linear(native["final_norm"][-1:], hf.lm_head.weight).float()),
+               "qkv_shape_controls": projection_shape_controls(native["layer.0.norm_in"], runner.model.model.layers[0].self_attn.qkv_proj.weight, linear),
+               "qkv_pytorch_shape_controls": projection_shape_controls(native["layer.0.norm_in"], runner.model.model.layers[0].self_attn.qkv_proj.weight)}
+        previous_reduction = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        try:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+            row["qkv_pytorch_full_accumulation_shape_controls"] = projection_shape_controls(native["layer.0.norm_in"], runner.model.model.layers[0].self_attn.qkv_proj.weight)
+        finally:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = previous_reduction
         # Feed exact native embedding values to HF, eliminating embedding arithmetic.
         controlled = hf_forward(hf, ids, native["embedding"])
         row["native_prefill_vs_hf_native_embedding"] = compare_traces(native, controlled)
@@ -402,6 +507,9 @@ def main(argv=None):
     parser.add_argument("--candidate", help="Optional module:function installer on a separate HF model; receives (model, emit=callback), returns model or None, and emits canonical per-layer stages.")
     parser.add_argument("--wandb", action="store_true", help="Publish scalar diagnostic metrics online to the existing benchmark project.")
     parser.add_argument("--backward-sanity", action="store_true", help="After all forward traces, run one short synthetic candidate backward without an optimizer.")
+    parser.add_argument("--batch-invariant-linear", action="store_true", help="Diagnostic fixed-tile matmul in native projections/head and the separate candidate; no training/default changes.")
+    parser.add_argument("--attention-backend", choices=("flashinfer", "fa3"), default="flashinfer")
+    parser.add_argument("--candidate-attention-fa3", action="store_true", help="Diagnostic one-split FA3 forward with existing FA2 analytic backward.")
     args = parser.parse_args(argv)
     if not 16 <= args.length <= 256:
         parser.error("--length must be between 16 and 256")
@@ -409,6 +517,10 @@ def main(argv=None):
         parser.error("--output already exists; preserve previous probe artifacts")
     if args.backward_sanity and not args.candidate:
         parser.error("--backward-sanity requires --candidate")
+    if args.batch_invariant_linear and not args.candidate:
+        parser.error("--batch-invariant-linear requires --candidate")
+    if args.candidate_attention_fa3 and (not args.candidate or args.attention_backend != "fa3"):
+        parser.error("--candidate-attention-fa3 requires --candidate and --attention-backend fa3")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     wandb_run = None
     try:
@@ -416,7 +528,10 @@ def main(argv=None):
             import wandb
             wandb_run = wandb.init(project="opd-qwen3-training-benchmark", entity=os.environ.get("WANDB_ENTITY"),
                                   job_type="forward-parity-diagnostic", mode="online", dir=str(args.output.parent),
-                                  config={"slurm_job_id": os.environ.get("SLURM_JOB_ID"), "length": args.length, "candidate": args.candidate})
+                                  config={"slurm_job_id": os.environ.get("SLURM_JOB_ID"), "length": args.length, "candidate": args.candidate,
+                                          "batch_invariant_linear": args.batch_invariant_linear,
+                                          "attention_backend": args.attention_backend, "candidate_attention_fa3": args.candidate_attention_fa3,
+                                          "flashinfer_use_tensor_core_env": os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")})
         result = run(args, wandb_run=wandb_run)
         if wandb_run is not None:
             wandb_run.finish(exit_code=0)

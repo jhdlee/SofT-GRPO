@@ -142,16 +142,16 @@ def native_rope(query, key, positions, cache):
     return _NativeRope.apply(query, key, positions, cache)
 
 
-def _packed_linear(value, modules):
+def _packed_linear(value, modules, linear=F.linear):
     weight = torch.cat([module.weight for module in modules], 0)
     biases = [module.bias for module in modules]
     if any(bias is None for bias in biases) and not all(bias is None for bias in biases):
         raise ValueError("mixed packed-projection bias settings are unsupported")
     bias = None if biases[0] is None else torch.cat(biases, 0)
-    return F.linear(value, weight, bias)
+    return linear(value, weight, bias)
 
 
-def install_probe_candidate(model, *, emit=None):
+def install_probe_candidate(model, *, emit=None, linear=F.linear, attention=None):
     """Patch one HF model instance for a controlled native-arithmetic comparison.
 
     No global class patch, parameter replacement, checkpoint renaming, density
@@ -177,7 +177,7 @@ def install_probe_candidate(model, *, emit=None):
         if emit is not None:
             emit(name, tensor.detach().reshape(-1, tensor.shape[-1]))
 
-    def layer_forward(layer, hidden_states, *, residual=None, attention_mask=None, position_ids=None, **kwargs):
+    def layer_forward(layer, hidden_states, *, residual=None, attention_mask=None, position_ids=None, rope_cache=None, **kwargs):
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         from transformers.models.qwen3.modeling_qwen3 import eager_attention_forward
 
@@ -189,30 +189,31 @@ def install_probe_candidate(model, *, emit=None):
             normalized, residual = native_rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon, residual)
         record(prefix + "norm_in", normalized)
         attn = layer.self_attn
-        qkv = _packed_linear(normalized, (attn.q_proj, attn.k_proj, attn.v_proj))
+        qkv = _packed_linear(normalized, (attn.q_proj, attn.k_proj, attn.v_proj), linear)
         record(prefix + "qkv", qkv)
         shape = normalized.shape[:-1]
         query, key, value = qkv.split((attn.q_proj.out_features, attn.k_proj.out_features, attn.v_proj.out_features), -1)
         query = native_rms_norm(query.reshape(-1, head_dim), attn.q_norm.weight, attn.q_norm.variance_epsilon).reshape(-1, config.num_attention_heads, head_dim)
         key = native_rms_norm(key.reshape(-1, head_dim), attn.k_norm.weight, attn.k_norm.variance_epsilon).reshape(-1, config.num_key_value_heads, head_dim)
         record(prefix + "q_norm", query.flatten(1)); record(prefix + "k_norm", key.flatten(1))
-        query, key = native_rope(query, key, position_ids, core._opd_native_rope_cache)
+        query, key = native_rope(query, key, position_ids, rope_cache)
         record(prefix + "q_rope", query.flatten(1)); record(prefix + "k_rope", key.flatten(1))
         query = query.reshape(*shape, -1, head_dim).transpose(1, 2)
         key = key.reshape(*shape, -1, head_dim).transpose(1, 2)
         value = value.reshape(*shape, -1, head_dim).transpose(1, 2)
-        interface = eager_attention_forward if config._attn_implementation == "eager" else ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
+        interface = attention or (eager_attention_forward if config._attn_implementation == "eager" else ALL_ATTENTION_FUNCTIONS[config._attn_implementation])
         attended, _ = interface(attn, query, key, value, attention_mask, dropout=attn.attention_dropout if layer.training else 0.0,
                                 scaling=attn.scaling, sliding_window=attn.sliding_window, position_ids=position_ids, **kwargs)
         attended = attended.reshape(*shape, -1).contiguous()
         record(prefix + "attention", attended)
-        projected = attn.o_proj(attended)
+        projected = linear(attended, attn.o_proj.weight, attn.o_proj.bias)
         record(prefix + "attention_projected", projected)
         normalized, residual = native_rms_norm(projected, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.variance_epsilon, residual)
         record(prefix + "norm_post", normalized)
-        gate_up = _packed_linear(normalized, (layer.mlp.gate_proj, layer.mlp.up_proj))
+        gate_up = _packed_linear(normalized, (layer.mlp.gate_proj, layer.mlp.up_proj), linear)
         record(prefix + "gate_up", gate_up)
-        hidden_states = layer.mlp.down_proj(native_silu_mul(gate_up.reshape(-1, gate_up.shape[-1])).reshape(*shape, -1))
+        hidden_states = linear(native_silu_mul(gate_up.reshape(-1, gate_up.shape[-1])).reshape(*shape, -1),
+                               layer.mlp.down_proj.weight, layer.mlp.down_proj.bias)
         record(prefix + "mlp", hidden_states)
         record(prefix + "block_total", (hidden_states.float() + residual.float()).to(hidden_states.dtype))
         return hidden_states, residual
@@ -222,7 +223,7 @@ def install_probe_candidate(model, *, emit=None):
 
     def model_forward(core_self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
                       inputs_embeds=None, use_cache=None, output_attentions=False, output_hidden_states=False,
-                      cache_position=None, **kwargs):
+                      cache_position=None, return_dict=None, **kwargs):
         from transformers.modeling_outputs import BaseModelOutputWithPast
 
         if use_cache or past_key_values is not None or output_attentions or output_hidden_states or core_self.gradient_checkpointing:
@@ -246,11 +247,18 @@ def install_probe_candidate(model, *, emit=None):
         mask = core_self._update_causal_mask(attention_mask, hidden_states, cache_position, None, False)
         record("embedding", hidden_states)
         residual = None
+        if core_self._opd_native_rope_cache.dtype != torch.float32:
+            raise ValueError("native arithmetic requires the original FP32 RoPE cache; do not cast an installed candidate")
         for layer in core_self.layers:
-            hidden_states, residual = layer(hidden_states, residual=residual, attention_mask=mask, position_ids=position_ids, **kwargs)
+            hidden_states, residual = layer(hidden_states, residual=residual, attention_mask=mask, position_ids=position_ids,
+                                            rope_cache=core_self._opd_native_rope_cache, **kwargs)
         hidden_states, _ = native_rms_norm(hidden_states, core_self.norm.weight, core_self.norm.variance_epsilon, residual)
         record("final_norm", hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 
     core.forward = types.MethodType(model_forward, core)
+    if linear is not F.linear:
+        def head_forward(head, hidden_states):
+            return linear(hidden_states, head.weight, head.bias)
+        model.lm_head.forward = types.MethodType(head_forward, model.lm_head)
     return model
