@@ -99,6 +99,16 @@ def provenance_inputs(tmp_path):
     return config, environment, model_manifest, data_manifest
 
 
+def test_changing_replay_arithmetic_rejects_exact_resume(provenance_inputs):
+    config, environment, *_ = provenance_inputs
+    before = build_checkpoint_provenance(config, source_commit="a" * 40, environment_identity=environment)
+    changed = deepcopy(config)
+    changed["actor_rollout_ref"]["model"]["qwen_replay_backend"] = "native_fa3_v1"
+    after = build_checkpoint_provenance(changed, source_commit="a" * 40, environment_identity=environment)
+    with pytest.raises(RuntimeError):
+        assert_checkpoint_provenance_matches(before, after)
+
+
 def test_builder_records_all_required_job_start_identities(provenance_inputs):
     config, environment, model_manifest, data_manifest = provenance_inputs
     provenance = build_checkpoint_provenance(

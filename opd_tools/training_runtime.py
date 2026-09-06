@@ -631,11 +631,29 @@ def _read_repair_submission(path: Path) -> dict[str, Any]:
             raise ValueError(f"repair {key} must be an absolute path")
     if not any(_canonical_sha256(record.get("dispatch")) == _canonical_sha256(value) for value in VARIANTS.values()):
         raise ValueError("repair dispatch must exactly match an allowed variant")
+    _repair_backend(record)
     return {**record, "input_path": str(path), "file_sha256": hashlib.sha256(encoded).hexdigest(),
             "validation_note": "Validated single-job request metadata; execution and source verification require authenticated measurements."}
 
 
-def _profile_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int], *, historical: bool = False) -> list[str]:
+def _repair_backend(submission: Mapping[str, Any]) -> str:
+    backend = submission.get("qwen_replay_backend", "disabled")
+    if not isinstance(backend, str) or backend not in ("disabled", "native_fa3_v1"):
+        raise ValueError("repair qwen_replay_backend must be disabled or native_fa3_v1")
+    return backend
+
+
+def _validate_repair_backend(configuration: Mapping[str, Any], submission: Mapping[str, Any]) -> None:
+    """Missing historical config keys mean disabled, never an enabled backend."""
+    expected = _repair_backend(submission)
+    root = configuration.get("actor_rollout_ref", {})
+    for section in ("model", "rollout"):
+        observed = root.get(section, {}).get("qwen_replay_backend", "disabled")
+        if observed != expected:
+            raise ValueError(f"repair phase configuration differs at actor_rollout_ref.{section}.qwen_replay_backend")
+
+
+def _profile_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int], *, historical: bool = False, replay_backend: str = "disabled") -> list[str]:
     """Recheck the recipe without reading model files or rebasing remote paths."""
     from .qwen_training import profile_overrides
 
@@ -643,7 +661,7 @@ def _profile_phase_overrides(objective: str, gpus: int, phase: str, variant: str
                      "custom_reward_function.path", "trainer.default_local_dir"}
     if historical:
         dynamic_paths.add("actor_rollout_ref.rollout.require_retained_support")
-    overrides = [item for item in profile_overrides(objective, gpus, "/unused-assets", "/unused-run")
+    overrides = [item for item in profile_overrides(objective, gpus, "/unused-assets", "/unused-run", replay_backend=replay_backend)
                  if item.split("=", 1)[0].lstrip("+") not in dynamic_paths]
     values = {
         **{"actor_rollout_ref.rollout." + key: value for key, value in VARIANTS[variant].items()},
@@ -663,7 +681,7 @@ def _profile_phase_overrides(objective: str, gpus: int, phase: str, variant: str
 
 
 def _repair_overrides(submission: Mapping[str, Any], variant: str) -> list[str]:
-    return _profile_phase_overrides(submission["objective"], submission["gpus"], "pilot", variant, [])
+    return _profile_phase_overrides(submission["objective"], submission["gpus"], "pilot", variant, [], replay_backend=_repair_backend(submission))
 
 
 def aggregate_repair_validation(submission_path: Path | str, input_root: Path | str | None = None) -> dict[str, Any]:
@@ -689,7 +707,8 @@ def aggregate_repair_validation(submission_path: Path | str, input_root: Path | 
         variant = next(key for key, value in VARIANTS.items() if value == submission["dispatch"])
         report.update(submission=submission, jobs={"slurm_job_id": str(submission["job_id"])},
                       source={key: submission[key] for key in ("parent_commit", "fork_commit", "source_snapshot")},
-                      objective=submission["objective"], gpus=submission["gpus"], requested_dispatch=variant, input_root=str(root))
+                      objective=submission["objective"], gpus=submission["gpus"], requested_dispatch=variant,
+                      requested_qwen_replay_backend=_repair_backend(submission), input_root=str(root))
         path = root / f"{submission['objective']}-gpu{submission['gpus']}" / "cell.json"
         if input_root is not None and (root / "cell.json").exists():
             path = root / "cell.json"  # Explicitly collected single-cell directory.
@@ -737,6 +756,7 @@ def aggregate_repair_validation(submission_path: Path | str, input_root: Path | 
                 raise ValueError("repair phase measurement SHA-256 differs from its embedded canonical bytes")
             if phase.get("phase") != "pilot" or phase.get("variant") != variant or phase.get("batches") != []:
                 raise ValueError("repair phase identity differs from the requested pilot")
+            _validate_repair_backend(measured.get("configuration", {}), submission)
             validate_phase_measurement(measured, phase="pilot", variant=variant, batches=[],
                                        overrides=_repair_overrides(submission, variant), source=raw["source"],
                                        assets=raw.get("assets", {}), run_id=phase.get("wandb_run_id"))
@@ -788,7 +808,7 @@ def render_repair_markdown(report: Mapping[str, Any]) -> str:
     lines = ["# Preliminary Qwen3 repair validation", "",
              f"Status: **{_markdown_value(report['status'])}**. {_markdown_value(report.get('reason', ''))}", "",
              "This is one bounded repair pilot. It does not supply the four-cell runtime estimate or an allocation recommendation.", "",
-             f"Job: `{_markdown_value(report.get('jobs', {}).get('slurm_job_id', 'unavailable'))}`; objective: {_markdown_value(report.get('objective', 'unavailable'))}; H100s: {_markdown_value(report.get('gpus', 'unavailable'))}; requested dispatch: `{_markdown_value(report.get('requested_dispatch', 'unavailable'))}`.", "",
+             f"Job: `{_markdown_value(report.get('jobs', {}).get('slurm_job_id', 'unavailable'))}`; objective: {_markdown_value(report.get('objective', 'unavailable'))}; H100s: {_markdown_value(report.get('gpus', 'unavailable'))}; requested dispatch: `{_markdown_value(report.get('requested_dispatch', 'unavailable'))}`; requested replay backend: `{_markdown_value(report.get('requested_qwen_replay_backend', 'unavailable'))}`.", "",
              f"Benchmark source: `{_markdown_value(report.get('source', {}))}`.", ""]
     if report.get("submission"):
         lines += [f"Submission registry SHA-256: `{report['submission']['file_sha256']}`.", ""]

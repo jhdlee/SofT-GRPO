@@ -433,6 +433,12 @@ class SGLangRollout(BaseRollout):
             self.config.get("max_running_requests"),
         )
         engine_options = {}
+        from verl.opd.qwen_replay_backend import validate_qwen_replay_backend
+        arithmetic = validate_qwen_replay_backend(self.config.get("qwen_replay_backend", "disabled"))
+        if arithmetic == "native_fa3_v1":
+            if self._tp_size != 1:
+                raise ValueError("native_fa3_v1 requires TP1")
+            engine_options.update(opd_qwen_replay_backend=arithmetic, attention_backend="fa3", device="cuda", disable_radix_cache=True)
         if self.config.get("max_running_requests") is not None:
             engine_options["max_running_requests"] = self.config.max_running_requests
         if self.config.get("engine_context_length") is not None:

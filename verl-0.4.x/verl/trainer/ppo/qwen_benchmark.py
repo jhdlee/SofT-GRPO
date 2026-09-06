@@ -95,6 +95,9 @@ class QwenTrainingBenchmarkTrainer(RayPPOTrainer):
             "checkpoint_provenance": self.checkpoint_provenance,
             "wandb_run_id": os.environ.get("WANDB_RUN_ID"),
         }
+        if self.config.actor_rollout_ref.model.get("qwen_replay_backend", "disabled") == "native_fa3_v1":
+            from verl.opd.qwen_replay_backend import qwen_replay_arithmetic_identity
+            self.measurement["qwen_replay_arithmetic"] = qwen_replay_arithmetic_identity()
         self._persist()
 
     def _persist(self):

@@ -1,14 +1,14 @@
-"""Opt-in Qwen3 forward-parity candidate for the diagnostic probe.
+"""Explicit Qwen3 replay arithmetic and the compatible diagnostic installer.
 
-This module is deliberately not installed by a trainer or profile. CUDA forward
-primitives use the same SGL kernels as native inference, with explicit backwards
-instead of transplanting inference's detached weights/in-place operations into
-the student. Attention still uses the configured HF/VERL backend. Thus matching
-these primitives does not assert full native cached-decode/replay equivalence.
+CUDA primitives use native SGL kernels with mathematical backwards. Production
+replay selects fixed-tile projections and FA3 attention with one split; the
+probe installer retains configurable projections and attention for comparisons.
+The worker must enforce the supported FSDP1 configuration before installation.
 """
 
 from __future__ import annotations
 
+import math
 import types
 
 import torch
@@ -60,6 +60,18 @@ class _NativeRMSNorm(torch.autograd.Function):
 
 def native_rms_norm(value, weight, epsilon=1e-6, residual=None):
     """Native forward ordering with gradients for input, residual, and weight."""
+    if value.ndim < 1 or value.shape[-1] == 0 or weight.shape != (value.shape[-1],):
+        raise ValueError("native RMSNorm requires nonempty features and a matching one-dimensional weight")
+    tensors = (value, weight) if residual is None else (value, weight, residual)
+    if any(t.dtype != value.dtype or t.device != value.device for t in tensors):
+        # The native kernel reinterprets all pointers using the input dtype.
+        raise ValueError("native RMSNorm input, weight, and residual must have matching dtype and device")
+    if value.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError("native RMSNorm requires real floating point tensors")
+    if residual is not None and residual.shape != value.shape:
+        raise ValueError("native RMSNorm residual shape must match the input")
+    if not math.isfinite(float(epsilon)) or float(epsilon) <= 0:
+        raise ValueError("native RMSNorm epsilon must be finite and positive")
     shape = value.shape
     output, carry = _NativeRMSNorm.apply(
         value.reshape(-1, shape[-1]), weight,
@@ -133,13 +145,49 @@ class _NativeRope(torch.autograd.Function):
         )
 
 
-def native_rope(query, key, positions, cache):
+def native_rope(query, key, positions, cache, *, _positions_validated=False):
     """NeoX RoPE on [tokens, heads, head_dim], with a fixed FP32 cache."""
-    if query.ndim != 3 or key.ndim != 3 or query.shape[0] != key.shape[0]:
+    if (query.ndim != 3 or key.ndim != 3 or query.shape[0] != key.shape[0]
+            or query.shape[-1] != key.shape[-1] or query.shape[-1] == 0 or query.shape[-1] % 2):
         raise ValueError("RoPE requires aligned token/head tensors")
     if positions.numel() != query.shape[0] or cache.requires_grad:
         raise ValueError("RoPE requires one position per token and a fixed cache")
+    if query.dtype != key.dtype or any(t.device != query.device for t in (key, positions, cache)):
+        raise ValueError("RoPE requires matching Q/K dtype and matching tensor devices")
+    if query.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError("RoPE requires real floating point Q/K tensors")
+    if positions.dtype != torch.int64:
+        raise ValueError("RoPE positions must be int64")
+    if cache.ndim != 2 or cache.shape[1] != query.shape[-1]:
+        raise ValueError("RoPE cache must have shape [max_positions, head_dim]")
+    if cache.dtype not in (torch.float32, torch.float64) or (query.is_cuda and cache.dtype != torch.float32):
+        raise ValueError("RoPE requires an FP32 CUDA cache (CPU double references may use FP64)")
+    if not _positions_validated:
+        _validate_rope_positions(positions, cache.shape[0])
     return _NativeRope.apply(query, key, positions, cache)
+
+
+def _validate_rope_positions(positions, cache_length):
+    if bool(((positions < 0) | (positions >= cache_length)).any()):
+        raise ValueError("RoPE position is outside the initialized cache")
+
+
+def _build_native_rope_cache(config, device):
+    # Native SGLang performs these operations on its model's CUDA device.
+    # Building this on CPU and transferring afterwards changes the arithmetic.
+    with torch.autocast(device_type=device.type, enabled=False):
+        head_dim = config.head_dim
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+        positions = torch.arange(config.max_position_embeddings, dtype=torch.float32, device=device)
+        angles = torch.einsum("i,j->ij", positions, inv_freq)
+        return torch.cat((angles.cos(), angles.sin()), -1)
+
+
+def _replay_cache_device(cache_device):
+    device = torch.device(cache_device)
+    if device.type != "cuda" or not torch.cuda.is_available() or torch.version.hip is not None:
+        raise ValueError("Qwen replay arithmetic requires an actual NVIDIA CUDA cache device")
+    return torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
 
 
 def _packed_linear(value, modules, linear=F.linear):
@@ -159,25 +207,70 @@ def install_probe_candidate(model, *, emit=None, linear=F.linear, attention=None
     training are rejected: this is a forward-parity experiment until GPU evidence
     justifies integrating a complete training implementation.
     """
+    return _install_native_arithmetic(model, emit=emit, linear=linear, attention=attention)
+
+
+def install_qwen_replay_arithmetic(model, *, cache_device, emit=None):
+    """Install replay arithmetic before FSDP wrapping without replacing weights.
+
+    ``cache_device`` must be the rank's actual CUDA execution device even when
+    model parameters are still FP32 on CPU. Workers must enforce FSDP1 with
+    BF16 parameters, FP32 buffers, TP/SP=1, and disabled gradient checkpointing.
+    Both actor and teacher must install this before EMA or checkpoint loading.
+    """
+    from verl.opd.batch_invariant_linear import batch_invariant_linear
+    from verl.opd.native_fa3_attention import native_fa3_attention
+
+    return _install_native_arithmetic(
+        model, emit=emit, linear=batch_invariant_linear, attention=native_fa3_attention,
+        cache_device=cache_device, production=True,
+    )
+
+
+def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=None,
+                               cache_device=None, production=False):
     if model.config.model_type != "qwen3" or getattr(model.config, "rope_scaling", None):
         raise ValueError("candidate supports unscaled dense Qwen3 only")
     if getattr(model, "_opd_native_arithmetic_candidate", False):
         raise ValueError("candidate already installed")
-    model._opd_native_arithmetic_candidate = True
     core = model.model
     config = model.config
-    device = core.embed_tokens.weight.device
+    if getattr(core, "gradient_checkpointing", False):
+        raise ValueError("native arithmetic does not support gradient checkpointing")
     head_dim = config.head_dim
-    inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-    positions = torch.arange(config.max_position_embeddings, dtype=torch.float32, device=device)
-    angles = torch.einsum("i,j->ij", positions, inv_freq)
-    core.register_buffer("_opd_native_rope_cache", torch.cat((angles.cos(), angles.sin()), -1), persistent=False)
+    if (type(head_dim) is not int or head_dim <= 0 or head_dim % 2
+            or type(config.max_position_embeddings) is not int or config.max_position_embeddings <= 0
+            or not math.isfinite(float(config.rope_theta)) or float(config.rope_theta) <= 0):
+        raise ValueError("native arithmetic requires a valid fixed RoPE configuration")
+    if hasattr(core, "_opd_native_rope_cache"):
+        raise ValueError("native arithmetic cache already exists")
+    if linear is not F.linear and (
+            not hasattr(model, "lm_head") or not hasattr(model.lm_head, "weight") or not hasattr(model.lm_head, "bias")):
+        raise ValueError("native arithmetic requires a compatible Qwen3 LM head")
+    if production:
+        if head_dim not in (64, 128, 256) or getattr(config, "hidden_act", "silu") != "silu":
+            raise ValueError("Qwen replay requires SiLU and a native supported head dimension")
+        if getattr(config, "attention_dropout", 0.0) != 0.0:
+            raise ValueError("Qwen replay requires zero attention dropout")
+        for layer in core.layers:
+            if layer.self_attn.sliding_window not in (None, -1):
+                raise ValueError("Qwen replay does not support sliding-window attention")
+        device = _replay_cache_device(cache_device)
+    else:
+        device = core.embed_tokens.weight.device
+    cache = _build_native_rope_cache(config, device)
+    # All rejecting validation and cache allocation precedes instance mutation.
+    core.register_buffer("_opd_native_rope_cache", cache, persistent=False)
+    model._opd_native_arithmetic_candidate = True
+    if production:
+        model._opd_qwen_replay_arithmetic = True
 
     def record(name, tensor):
         if emit is not None:
             emit(name, tensor.detach().reshape(-1, tensor.shape[-1]))
 
-    def layer_forward(layer, hidden_states, *, residual=None, attention_mask=None, position_ids=None, rope_cache=None, **kwargs):
+    def layer_forward(layer, hidden_states, *, residual=None, attention_mask=None, position_ids=None, rope_cache=None,
+                      _opd_rope_positions_validated=False, **kwargs):
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         from transformers.models.qwen3.modeling_qwen3 import eager_attention_forward
 
@@ -196,7 +289,8 @@ def install_probe_candidate(model, *, emit=None, linear=F.linear, attention=None
         query = native_rms_norm(query.reshape(-1, head_dim), attn.q_norm.weight, attn.q_norm.variance_epsilon).reshape(-1, config.num_attention_heads, head_dim)
         key = native_rms_norm(key.reshape(-1, head_dim), attn.k_norm.weight, attn.k_norm.variance_epsilon).reshape(-1, config.num_key_value_heads, head_dim)
         record(prefix + "q_norm", query.flatten(1)); record(prefix + "k_norm", key.flatten(1))
-        query, key = native_rope(query, key, position_ids, rope_cache)
+        query, key = native_rope(query, key, position_ids, rope_cache,
+                                _positions_validated=_opd_rope_positions_validated)
         record(prefix + "q_rope", query.flatten(1)); record(prefix + "k_rope", key.flatten(1))
         query = query.reshape(*shape, -1, head_dim).transpose(1, 2)
         key = key.reshape(*shape, -1, head_dim).transpose(1, 2)
@@ -215,7 +309,8 @@ def install_probe_candidate(model, *, emit=None, linear=F.linear, attention=None
         hidden_states = linear(native_silu_mul(gate_up.reshape(-1, gate_up.shape[-1])).reshape(*shape, -1),
                                layer.mlp.down_proj.weight, layer.mlp.down_proj.bias)
         record(prefix + "mlp", hidden_states)
-        record(prefix + "block_total", (hidden_states.float() + residual.float()).to(hidden_states.dtype))
+        if emit is not None:
+            record(prefix + "block_total", (hidden_states.float() + residual.float()).to(hidden_states.dtype))
         return hidden_states, residual
 
     for layer in core.layers:
@@ -223,35 +318,56 @@ def install_probe_candidate(model, *, emit=None, linear=F.linear, attention=None
 
     def model_forward(core_self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
                       inputs_embeds=None, use_cache=None, output_attentions=False, output_hidden_states=False,
-                      cache_position=None, return_dict=None, **kwargs):
+                      cache_position=None, return_dict=None, opd_cu_seqlens=None, opd_max_seqlen=None, **kwargs):
         from transformers.modeling_outputs import BaseModelOutputWithPast
 
         if use_cache or past_key_values is not None or output_attentions or output_hidden_states or core_self.gradient_checkpointing:
             raise ValueError("parity candidate supports uncached replay without attention/hidden-state returns or gradient checkpointing")
+        if return_dict is False:
+            raise ValueError("native arithmetic requires return_dict=True")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("provide exactly one of input_ids or inputs_embeds")
         hidden_states = core_self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        if hidden_states.ndim != 3 or (production and hidden_states.shape[0] != 1):
+            raise ValueError("Qwen replay requires hidden states [1, total_tokens, hidden_dim]")
         if position_ids is None:
             position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0).expand(hidden_states.shape[0], -1)
         elif position_ids.shape[0] == 1 and hidden_states.shape[0] != 1:
             position_ids = position_ids.expand(hidden_states.shape[0], -1)
-        # HF 4.51's ordinary eager/SDPA causal mask does not use position
-        # resets to separate packed rows. Only its FA2 varlen path does.
-        resets = position_ids[:, 1:] <= position_ids[:, :-1]
-        if attention_mask is not None and attention_mask.ndim == 2:
-            resets = resets & attention_mask[:, 1:].bool() & attention_mask[:, :-1].bool()
-        if config._attn_implementation != "flash_attention_2" and bool(resets.any()):
-            raise ValueError("packed position resets require flash_attention_2 in this diagnostic candidate")
-        if cache_position is None:
-            cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
-        mask = core_self._update_causal_mask(attention_mask, hidden_states, cache_position, None, False)
+        if production:
+            from verl.opd.native_fa3_attention import prepare_fa3_attention_layout
+
+            layout = prepare_fa3_attention_layout(
+                position_ids, total_tokens=hidden_states.shape[1], device=hidden_states.device,
+                attention_mask=attention_mask, opd_cu_seqlens=opd_cu_seqlens, opd_max_seqlen=opd_max_seqlen,
+            )
+            kwargs["opd_attention_layout"] = layout
+            mask = None
+        else:
+            if opd_cu_seqlens is not None or opd_max_seqlen is not None:
+                raise ValueError("explicit packed replay layout requires the production installer")
+            # HF 4.51 eager/SDPA does not separate rows at packed position resets.
+            resets = position_ids[:, 1:] <= position_ids[:, :-1]
+            if attention_mask is not None and attention_mask.ndim == 2:
+                resets = resets & attention_mask[:, 1:].bool() & attention_mask[:, :-1].bool()
+            if config._attn_implementation != "flash_attention_2" and bool(resets.any()):
+                raise ValueError("packed position resets require flash_attention_2 in this diagnostic candidate")
+            if cache_position is None:
+                cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+            mask = core_self._update_causal_mask(attention_mask, hidden_states, cache_position, None, False)
         record("embedding", hidden_states)
         residual = None
         if core_self._opd_native_rope_cache.dtype != torch.float32:
             raise ValueError("native arithmetic requires the original FP32 RoPE cache; do not cast an installed candidate")
+        if core_self._opd_native_rope_cache.device != hidden_states.device:
+            raise ValueError("native arithmetic RoPE cache must be initialized on the execution device")
+        if position_ids.dtype != torch.int64 or position_ids.device != hidden_states.device:
+            raise ValueError("native arithmetic positions must be int64 on the execution device")
+        _validate_rope_positions(position_ids, core_self._opd_native_rope_cache.shape[0])
         for layer in core_self.layers:
             hidden_states, residual = layer(hidden_states, residual=residual, attention_mask=mask, position_ids=position_ids,
-                                            rope_cache=core_self._opd_native_rope_cache, **kwargs)
+                                            rope_cache=core_self._opd_native_rope_cache,
+                                            _opd_rope_positions_validated=True, **kwargs)
         hidden_states, _ = native_rms_norm(hidden_states, core_self.norm.weight, core_self.norm.variance_epsilon, residual)
         record("final_norm", hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)

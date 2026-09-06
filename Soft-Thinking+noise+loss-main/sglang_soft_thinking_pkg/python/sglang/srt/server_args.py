@@ -125,6 +125,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: Optional[str] = None
+    opd_qwen_replay_backend: str = "disabled"
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
 
@@ -215,6 +216,11 @@ class ServerArgs:
     # ==========
 
     def __post_init__(self):
+        if self.opd_qwen_replay_backend != "disabled":
+            from sglang.srt.layers.qwen_replay_arithmetic import validate_qwen_replay_server_args
+
+            validate_qwen_replay_server_args(self)
+
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -844,6 +850,12 @@ class ServerArgs:
         )
 
         # Kernel backend
+        parser.add_argument(
+            "--opd-qwen-replay-backend",
+            choices=["disabled", "native_fa3_v1"],
+            default=ServerArgs.opd_qwen_replay_backend,
+            help="Explicit versioned Qwen3 replay arithmetic; requires TP1 BF16 CUDA FA3 and disabled graph/overlap/radix caching.",
+        )
         parser.add_argument(
             "--attention-backend",
             type=str,

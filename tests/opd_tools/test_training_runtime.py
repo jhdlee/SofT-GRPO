@@ -917,6 +917,80 @@ def test_repair_complete_revalidates_pilot_and_hashes_without_loading_assets(rep
     assert "Nested teacher time is never added" in markdown
 
 
+@pytest.mark.parametrize("requested,model_backend,rollout_backend,accepted", [
+    (None, None, None, True),
+    (None, "disabled", "disabled", True),
+    ("disabled", None, None, True),
+    ("disabled", "disabled", "disabled", True),
+    ("native_fa3_v1", "native_fa3_v1", "native_fa3_v1", True),
+    ("native_fa3_v1", None, None, False),
+    ("native_fa3_v1", "disabled", "disabled", False),
+    ("native_fa3_v1", "native_fa3_v1", None, False),
+    ("native_fa3_v1", "native_fa3_v1", "disabled", False),
+    ("native_fa3_v1", "disabled", "native_fa3_v1", False),
+    (None, "native_fa3_v1", "native_fa3_v1", False),
+    ("disabled", "native_fa3_v1", "native_fa3_v1", False),
+    ("disabled", "disabled", "native_fa3_v1", False),
+])
+def test_repair_backend_is_bound_to_request_even_when_configuration_is_resealed(
+        repair_evidence, requested, model_backend, rollout_backend, accepted):
+    from verl.opd.provenance import build_checkpoint_provenance
+
+    registry, _, measured, persist = repair_evidence
+    submission = json.loads(registry.read_text())
+    if requested is not None:
+        submission["qwen_replay_backend"] = requested
+    atomic_write_json(registry, submission)
+    for section, value in (("model", model_backend), ("rollout", rollout_backend)):
+        config = measured["configuration"]["actor_rollout_ref"][section]
+        if value is None:
+            config.pop("qwen_replay_backend", None)
+        else:
+            config["qwen_replay_backend"] = value
+    measured["checkpoint_provenance"] = build_checkpoint_provenance(
+        measured["configuration"], source_commit="b" * 40,
+        environment_identity=measured["checkpoint_provenance"]["environment"])
+    persist()  # Rebuild canonical phase bytes and SHA as the actual writer does.
+    report = aggregate_repair_validation(registry)
+    assert report["requested_qwen_replay_backend"] == (requested or "disabled")
+    if accepted:
+        assert report["status"] == "repair_validation_complete", report["reason"]
+        assert report["measurement_authenticated"] is True
+        assert not report["input_errors"]
+        assert f"requested replay backend: `{requested or 'disabled'}`" in render_repair_markdown(report)
+    else:
+        assert report["status"] == "incomplete"
+        assert report["input_errors"] and "qwen_replay_backend" in report["reason"]
+        assert not report.get("measurement_authenticated")
+        assert report["full_training_estimate"] is None
+
+
+def test_native_repair_failed_phase_cannot_authenticate_disabled_execution(repair_evidence):
+    registry, cell, measured, persist = repair_evidence
+    submission = json.loads(registry.read_text())
+    submission["qwen_replay_backend"] = "native_fa3_v1"
+    atomic_write_json(registry, submission)
+    measured.update(status="failed", iterations=[], error="RuntimeError: replay integrity failed")
+    cell.update(status="incomplete", reason="pilot failed with exit code 1")
+    persist()
+    report = aggregate_repair_validation(registry)
+    assert report["status"] == "incomplete"
+    assert "replay integrity failed" in report["failure"]["error"]
+    assert "qwen_replay_backend" in report["reason"]
+    assert report["input_errors"] and not report.get("measurement_authenticated")
+
+
+def test_native_repair_pending_retains_requested_backend(tmp_path):
+    submission = repair_submission(tmp_path)
+    submission["qwen_replay_backend"] = "native_fa3_v1"
+    registry = tmp_path / "submission.json"
+    atomic_write_json(registry, submission)
+    report = aggregate_repair_validation(registry)
+    assert report["status"] == "pending" and not report["input_errors"]
+    assert report["requested_qwen_replay_backend"] == "native_fa3_v1"
+    assert not report.get("measurement_authenticated")
+
+
 @pytest.mark.parametrize("old_format", [False, True])
 def test_repair_failure_preserves_exact_preupdate_reason_and_partial_timings(repair_evidence, old_format):
     registry, cell, measured, persist = repair_evidence
@@ -953,6 +1027,8 @@ def test_repair_failure_preserves_exact_preupdate_reason_and_partial_timings(rep
     ("parent_commit", "bad"), ("fork_commit", "C" * 40), ("source_snapshot", "relative"),
     ("run_root", "relative"), ("dispatch", {"dispatch_mode": "bounded_async", "max_running_requests": True, "async_queue_size": 64}),
     ("jobs", []), ("maximum_repair_gpu_hours", 2),
+    ("qwen_replay_backend", "native_fa3"), ("qwen_replay_backend", None),
+    ("qwen_replay_backend", True), ("qwen_replay_backend", {}),
 ])
 def test_repair_manifest_rejects_wrong_scope_types_pins_or_allocation(tmp_path, key, value):
     submission = repair_submission(tmp_path)

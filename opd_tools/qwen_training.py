@@ -308,13 +308,15 @@ def verify(root: Path | str) -> dict[str, Any]:
     return manifest
 
 
-def profile_overrides(objective: str, gpus: int, root: Path | str, run_dir: Path | str) -> list[str]:
+def profile_overrides(objective: str, gpus: int, root: Path | str, run_dir: Path | str, *, replay_backend="disabled") -> list[str]:
     """Return the complete common recipe and a distinct Qwen3 objective profile."""
 
     if objective not in ("standalone", "hybrid"):
         raise ValueError("Qwen3 objective must be standalone or hybrid")
     if type(gpus) is not int or gpus not in (1, 2):
         raise ValueError("Qwen3 training benchmark supports only the authorized 1 or 2 GPUs")
+    if replay_backend not in ("disabled", "native_fa3_v1"):
+        raise ValueError("unsupported Qwen3 replay arithmetic backend")
     root, run_dir = Path(root).expanduser().resolve(), Path(run_dir).expanduser().resolve()
     values = {
         "algorithm.adv_estimator": "grpo", "algorithm.norm_adv_by_std_in_grpo": True, "algorithm.use_kl_in_reward": False,
@@ -342,6 +344,8 @@ def profile_overrides(objective: str, gpus: int, root: Path | str, run_dir: Path
         "ray_init.num_cpus": 16 * gpus,
     }
     result = [key + "=" + json.dumps(value, separators=(",", ":")) for key, value in values.items()]
+    if replay_backend != "disabled":
+        result.append("actor_rollout_ref.model.qwen_replay_backend=" + replay_backend)
     arm = "softopd_math_s11" if objective == "standalone" else "softgrpo_math_opd_s11"
     return result + list(hydra_overrides(arm))
 

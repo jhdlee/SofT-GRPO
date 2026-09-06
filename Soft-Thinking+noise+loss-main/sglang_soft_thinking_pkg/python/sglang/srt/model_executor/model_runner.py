@@ -225,6 +225,16 @@ class ModelRunner:
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
+        self.opd_qwen_replay_provenance = {"backend": "disabled"}
+        if getattr(server_args, "opd_qwen_replay_backend", "disabled") != "disabled":
+            from sglang.srt.layers.qwen_replay_arithmetic import install_qwen_replay_backend
+
+            if self.is_draft_worker:
+                raise ValueError("native_fa3_v1 does not support a draft worker")
+            self.opd_qwen_replay_provenance = install_qwen_replay_backend(
+                self.model, self.model_config.hf_config, server_args
+            )
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,

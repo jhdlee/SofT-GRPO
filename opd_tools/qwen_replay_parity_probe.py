@@ -61,18 +61,35 @@ def logits_difference(left, right, limit=8):
 
 class Trace:
     """Clone before native in-place norms can overwrite observations."""
-    def __init__(self):
+    def __init__(self, *, total_tokens=None, capture_last=None):
         self.values = {}
         self.tokens = 0
+        self.start = 0
         self.layer = 0
+        if capture_last is not None and (type(capture_last) is not int or type(total_tokens) is not int
+                                         or not 1 <= capture_last <= total_tokens):
+            raise ValueError("selective traces require a positive capture count within the total sequence")
+        self.total_tokens, self.capture_last = total_tokens, capture_last
+
+    @property
+    def captures_activations(self):
+        return self.capture_last is None or self.start + self.tokens > self.total_tokens - self.capture_last
 
     def emit(self, name, value):
         if isinstance(value, (tuple, list)):
             value = value[0]
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"trace {name} is not a tensor")
+        if name != "logits" and not self.captures_activations:
+            return
         # Callers must put token dimension first (or batch=1, tokens second).
         value = value.reshape(self.tokens, -1) if name != "logits" else value.reshape(-1, value.shape[-1])
+        if self.capture_last is not None:
+            if name == "logits":
+                value = value[-1:]
+            else:
+                first = max(0, self.total_tokens - self.capture_last - self.start)
+                value = value[first:]
         self.values.setdefault(name, []).append(value.detach().clone())
 
     def finish(self):
@@ -97,10 +114,17 @@ def compare_traces(native, other):
 
 def synthetic_sequence(tokenizer, length):
     """Public fixed text and mixtures; no training rows or privileged answers."""
-    if type(length) is not int or not 16 <= length <= 256:
-        raise ValueError("sequence length must be between 16 and 256")
+    if type(length) is not int or not 16 <= length <= 8192:
+        raise ValueError("sequence length must be between 16 and 8192")
     text = "A short arithmetic example: seventeen plus twenty-five equals forty-two. Check each step carefully. "
-    ids = tokenizer.encode(text * 20, add_special_tokens=False)[:length]
+    # Keep the old text unchanged for short probes. For long probes, grow the
+    # same repetition until the tokenizer supplies the requested prefix.
+    repetitions = 20
+    ids = tokenizer.encode(text * repetitions, add_special_tokens=False)
+    while len(ids) < length and repetitions < 163840:
+        repetitions *= 2
+        ids = tokenizer.encode(text * repetitions, add_special_tokens=False)
+    ids = ids[:length]
     if len(ids) != length:
         raise ValueError("tokenizer did not produce the requested short sequence")
     support = torch.zeros(length, 5, dtype=torch.long)
@@ -124,6 +148,8 @@ def native_hooks(model, trace):
         prefix = f"layer.{i}."
         def before(mod, args, index=i):
             trace.layer = index
+            if not trace.captures_activations:
+                return
             hidden, residual = args[1], args[3]
             total = hidden if residual is None else (hidden.float() + residual.float()).to(hidden.dtype)
             trace.emit(f"layer.{index}.block_input", total)
@@ -144,6 +170,8 @@ def native_hooks(model, trace):
         hook(layer.mlp.gate_up_proj, prefix + "gate_up")
         hook(layer.mlp, prefix + "mlp")
         def after(mod, args, out, index=i):
+            if not trace.captures_activations:
+                return
             hidden, residual = out
             trace.emit(f"layer.{index}.block_total", (hidden.float() + residual.float()).to(hidden.dtype))
         handles.append(layer.register_forward_hook(after))
@@ -221,9 +249,9 @@ def make_native_batch(runner, ids):
     return batch
 
 
-def native_forward(runner, ids, support, probs, *, cached=False):
+def native_forward(runner, ids, support, probs, *, cached=False, capture_last=None):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    trace = Trace()
+    trace = Trace(total_tokens=len(ids), capture_last=capture_last)
     prefix = len(ids) - 4 if cached else len(ids)
     batch = make_native_batch(runner, ids[:prefix])
     with torch.no_grad(), native_hooks(runner.model, trace):
@@ -239,14 +267,15 @@ def native_forward(runner, ids, support, probs, *, cached=False):
                 forward.topk_indices = support[start:end].cuda()
                 forward.topk_probs = probs[start:end].cuda()
             trace.tokens = end - start
+            trace.start = start
             output = runner.forward(forward)
             trace.emit("logits", output.next_token_logits)
         torch.cuda.synchronize()
     return trace.finish()
 
 
-def hf_forward(model, ids, embedding=None, *, candidate_emit_state=None):
-    trace = Trace()
+def hf_forward(model, ids, embedding=None, *, candidate_emit_state=None, capture_last=None):
+    trace = Trace(total_tokens=len(ids), capture_last=capture_last)
     trace.tokens = len(ids)
     model.train()  # Qwen3 dropout is zero; the production replay model is in train mode.
     if candidate_emit_state is not None:
@@ -254,6 +283,8 @@ def hf_forward(model, ids, embedding=None, *, candidate_emit_state=None):
     hooks = hf_hooks(model, trace) if candidate_emit_state is None else contextlib.nullcontext()
     with torch.no_grad(), hooks:
         kwargs = {"input_ids": ids.cuda().unsqueeze(0)} if embedding is None else {"inputs_embeds": embedding.unsqueeze(0)}
+        if capture_last is not None:
+            kwargs["logits_to_keep"] = 1
         out = model(**kwargs, attention_mask=None, position_ids=torch.arange(len(ids), device="cuda").unsqueeze(0), use_cache=False)
         trace.emit("logits", out.logits)
         torch.cuda.synchronize()
@@ -330,6 +361,185 @@ def fix_native_fa3_split_count():
         setattr(backend, name, fixed)
 
 
+def production_server_options(model_path, length):
+    """Explicit production recipe; no diagnostic native monkeypatches."""
+    return dict(
+        model_path=str(model_path), dtype="bfloat16", device="cuda", tp_size=1,
+        context_length=max(512, length + 32), max_total_tokens=max(1024, length + 256),
+        max_running_requests=2, mem_fraction_static=0.2,
+        chunked_prefill_size=max(512, length), max_prefill_tokens=max(512, length),
+        attention_backend="fa3", opd_qwen_replay_backend="native_fa3_v1",
+        disable_cuda_graph=True, disable_radix_cache=True, disable_overlap_schedule=True,
+        enable_soft_thinking=True, max_topk=5, random_seed=11,
+    )
+
+
+def production_device_inventory(names, *, allow_idle_second_gpu=False):
+    expected = 2 if allow_idle_second_gpu else 1
+    if len(names) != expected or any("H100" not in name for name in names):
+        raise RuntimeError(f"production parity requires exactly {expected} visible allocated H100 GPU(s)")
+    return {"visible_count": len(names), "active_device_index": 0,
+            "idle_device_indices": [1] if expected == 2 else [],
+            "allocated_devices": [{"index": i, "name": name, "used_by_probe": i == 0} for i, name in enumerate(names)],
+            "budget_note": "Every allocated GPU counts toward allocation time, including the idle second GPU."}
+
+
+def expected_stage_names(layers, *, candidate=False):
+    names = {"embedding", "final_norm"}
+    suffixes = ("norm_in", "norm_post", "qkv", "q_norm", "k_norm", "q_rope", "k_rope",
+                "attention", "attention_projected", "gate_up", "mlp", "block_total")
+    if not candidate:
+        suffixes += ("block_input",)
+    names.update(f"layer.{i}.{suffix}" for i in range(layers) for suffix in suffixes)
+    return names
+
+
+def production_exact_issues(result):
+    """Fail closed on absent observations as well as numerical disagreement."""
+    issues = []
+    cases = result.get("cases", [])
+    if len(cases) != 2 or {case.get("input") for case in cases} != {"hard_tokens", "soft_mixtures"}:
+        issues.append("expected one completed hard-token and one soft-mixture case")
+    layers = result["model_config"]["num_hidden_layers"]
+    vocab = result["model_config"]["vocab_size"]
+    captured = result["capture"]["last_tokens"]
+    for case in cases:
+        for key in ("native_prefill_vs_cached", "native_prefill_vs_candidate", "native_cached_vs_candidate"):
+            comparison = case.get(key)
+            prefix = f"{case.get('input')}/{key}"
+            if not isinstance(comparison, dict):
+                issues.append(prefix + ": comparison missing")
+                continue
+            candidate = key != "native_prefill_vs_cached"
+            expected = expected_stage_names(layers, candidate=candidate)
+            if set(comparison.get("stages", {})) != expected:
+                issues.append(prefix + ": stage inventory differs")
+            allowed_missing = sorted(f"layer.{i}.block_input" for i in range(layers)) if candidate else []
+            if comparison.get("missing_native") != [] or comparison.get("missing_comparison") != allowed_missing:
+                issues.append(prefix + ": unexpected missing stages")
+            for stage, measured in comparison.get("stages", {}).items():
+                if (measured.get("shape_matches") is not True or measured.get("shape", [None])[0] != captured
+                        or measured.get("nonfinite_elements") != 0 or measured.get("max_abs") != 0.0
+                        or measured.get("elements", 0) <= 0 or measured.get("exact_elements") != measured.get("elements")):
+                    issues.append(prefix + "/" + stage + ": nonexact, nonfinite, or wrong capture shape")
+            logits = comparison.get("final_logits", {})
+            if (logits.get("shape_matches") is not True or logits.get("shape") != [vocab]
+                    or logits.get("nonfinite_elements") != 0 or logits.get("max_abs") != 0.0
+                    or logits.get("elements") != vocab or logits.get("exact_elements") != vocab
+                    or len(logits.get("native_top5_support", [])) != 5):
+                issues.append(prefix + ": final logits/support missing or not finite and exact")
+    return issues
+
+
+def _run_production(args, source, assets, *, wandb_run=None):
+    from sglang.bench_one_batch import load_model
+    from sglang.srt.entrypoints.engine import _set_envs_and_config
+    from sglang.srt.server_args import PortArgs, ServerArgs
+    from transformers import AutoModelForCausalLM
+    from verl.models.transformers.monkey_patch import apply_monkey_patch
+    from verl.opd.qwen_native_arithmetic import install_qwen_replay_arithmetic
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("production parity requires an allocated CUDA GPU")
+    devices = production_device_inventory(
+        [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+        allow_idle_second_gpu=args.allow_idle_second_gpu,
+    )
+    torch.manual_seed(11)
+    torch.cuda.set_device(0)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    model_path = Path(args.assets).resolve() / "model"
+    server = ServerArgs(**production_server_options(model_path, args.length))
+    _set_envs_and_config(server)
+    runner, tokenizer = load_model(server, PortArgs.init_new(server), 0)
+    runner.model_config.enable_soft_thinking = True
+    runner.model_config.max_topk = 5
+    native_provenance = getattr(runner, "opd_qwen_replay_provenance", {})
+    required_native = {"backend": "native_fa3_v1", "attention_backend": "fa3", "num_splits": 1,
+                       "projection_policy": "fixed_tile_triton_32_64_32", "projection_module_count": 112}
+    if any(native_provenance.get(key) != value for key, value in required_native.items()):
+        raise RuntimeError("native production arithmetic was not installed with the required provenance")
+    candidate = AutoModelForCausalLM.from_pretrained(
+        str(model_path), local_files_only=True, torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    ).cuda()
+    apply_monkey_patch(candidate, use_remove_padding=True, ulysses_sp_size=1, use_fused_kernels=False)
+    candidate_emit_state = {}
+    install_qwen_replay_arithmetic(
+        candidate, cache_device=torch.device("cuda:0"),
+        emit=lambda name, tensor: candidate_emit_state["trace"].emit(name, tensor),
+    )
+    if not getattr(candidate, "_opd_qwen_replay_arithmetic", False):
+        raise RuntimeError("candidate production arithmetic installer did not activate")
+    if not torch.equal(runner.model.model.embed_tokens.weight[:candidate.config.vocab_size], candidate.model.embed_tokens.weight):
+        raise RuntimeError("native/actor embedding weights differ")
+    ids, support, probs = synthetic_sequence(tokenizer, args.length)
+    module_names = ("verl.opd.qwen_native_arithmetic", "verl.opd.native_fa3_attention", "verl.opd.batch_invariant_linear")
+    result = {
+        "schema_version": 1, "role": "qwen3_forward_parity_diagnostic", "status": "running",
+        "production_arithmetic": True, "source": source, "assets_manifest_sha256": assets["manifest_content_sha256"],
+        "jobs": {"slurm_job_id": os.environ.get("SLURM_JOB_ID")}, "device": devices,
+        "wandb": {"enabled": wandb_run is not None, "run_id": wandb_run.id if wandb_run else None,
+                  "url": wandb_run.url if wandb_run else None, "finished": False},
+        "model": assets["model"],
+        "model_config": {"num_hidden_layers": candidate.config.num_hidden_layers, "vocab_size": candidate.config.vocab_size},
+        "sequence": {"length": len(ids), "ids_sha256": canonical_sha256(ids.tolist()),
+                     "support_sha256": canonical_sha256(support.tolist()), "probabilities_sha256": canonical_sha256(probs.tolist()),
+                     "soft_positions": list(range(len(ids) - 9, len(ids) - 1)), "cached_decode_steps": 4},
+        "capture": {"last_tokens": args.capture_last, "global_token_indices": list(range(len(ids) - args.capture_last, len(ids))),
+                    "cached_prefix_tokens": len(ids) - 4, "cached_prefix_activation_rows_captured": 0,
+                    "cached_decode_steps": 4, "all_sequence_positions_captured": False,
+                    "logits": "Only the final causal row of each forward is retained; comparisons use the final sequence position."},
+        "configuration": {"native": native_provenance, "candidate": {
+            "installer": "verl.opd.qwen_native_arithmetic:install_qwen_replay_arithmetic", "backend": "native_fa3_v1",
+            "batch_size": 1, "fsdp": False, "train_mode": True, "logits_to_keep": 1,
+            "source_sha256": {name: file_sha256(Path(importlib.import_module(name).__file__)) for name in module_names}},
+            "server_capacity": {key: getattr(server, key) for key in ("context_length", "max_total_tokens", "chunked_prefill_size", "max_prefill_tokens")}},
+        "packages": {name: importlib.metadata.version(name) for name in ("torch", "transformers", "flash-attn", "sgl-kernel")},
+        "cases": [], "full_training_estimate": None,
+        "limitations": ["Only the final four global token activations and final causal logits are compared; the prefix is computed but not captured.",
+                        "Predetermined hard/soft inputs; no sampling, rollout-density gate, teacher, FSDP, optimizer, EMA, or training acceptance.",
+                        "No backward in this long-context preflight. Packed-kernel and subsequent real-pilot checks remain separate gates.",
+                        "Hooks retain bounded observations and add overhead; these durations are not training throughput estimates."],
+    }
+    atomic_write_json(args.output, result)
+    for soft in (False, True):
+        started = time.monotonic()
+        native = native_forward(runner, ids, support if soft else None, probs if soft else None,
+                                capture_last=args.capture_last)
+        cached = native_forward(runner, ids, support if soft else None, probs if soft else None,
+                                cached=True, capture_last=args.capture_last)
+        embedding = None
+        if soft:
+            with torch.no_grad():
+                table = candidate.model.embed_tokens(support.cuda())
+                normalized = probs.cuda() / probs.cuda().sum(-1, keepdim=True)
+                embedding = torch.sum(normalized.unsqueeze(-1) * table, dim=1, dtype=table.dtype)
+                del table
+        replay = hf_forward(candidate, ids, embedding, candidate_emit_state=candidate_emit_state,
+                            capture_last=args.capture_last)
+        row = {"input": "soft_mixtures" if soft else "hard_tokens",
+               "native_attention_backend_observed": type(runner.attn_backend).__name__,
+               "native_prefill_vs_cached": compare_traces(native, cached),
+               "native_prefill_vs_candidate": compare_traces(native, replay),
+               "native_cached_vs_candidate": compare_traces(cached, replay),
+               "diagnostic_wall_seconds": time.monotonic() - started}
+        result["cases"].append(row)
+        if wandb_run is not None:
+            wandb_run.log({row["input"] + "/" + key + "/final_logit_max_abs": value["final_logits"]["max_abs"]
+                           for key, value in row.items() if isinstance(value, dict) and "final_logits" in value})
+        atomic_write_json(args.output, result)
+        del native, cached, replay, embedding
+    issues = production_exact_issues(result)
+    result["exact_gate"] = {"required": args.require_exact, "passed": not issues, "issues": issues}
+    result["peak_allocated_gpu_bytes"] = torch.cuda.max_memory_allocated(0)
+    result["status"] = "failed" if args.require_exact and issues else "diagnostic_complete"
+    atomic_write_json(args.output, result)
+    if args.require_exact and issues:
+        raise RuntimeError(f"production arithmetic parity gate failed: {len(issues)} issue(s); {issues[0]}")
+    return result
+
+
 def run(args, *, wandb_run=None):
     from .qwen_training import verify
     from .training_benchmark import source_identity
@@ -343,6 +553,8 @@ def run(args, *, wandb_run=None):
     source["source_snapshot"] = str(Path(__file__).resolve().parents[3])
     source["probe_file_sha256"] = file_sha256(Path(__file__))
     assets = verify(args.assets)
+    if getattr(args, "production_arithmetic", False):
+        return _run_production(args, source, assets, wandb_run=wandb_run)
     if not torch.cuda.is_available():
         raise RuntimeError("this probe requires an allocated CUDA GPU")
     if torch.cuda.device_count() != 1 or "H100" not in torch.cuda.get_device_name(0):
@@ -510,9 +722,22 @@ def main(argv=None):
     parser.add_argument("--batch-invariant-linear", action="store_true", help="Diagnostic fixed-tile matmul in native projections/head and the separate candidate; no training/default changes.")
     parser.add_argument("--attention-backend", choices=("flashinfer", "fa3"), default="flashinfer")
     parser.add_argument("--candidate-attention-fa3", action="store_true", help="Diagnostic one-split FA3 forward with existing FA2 analytic backward.")
+    parser.add_argument("--production-arithmetic", action="store_true", help="Use the guarded native_fa3_v1 server and actor installers, capturing only the last four positions.")
+    parser.add_argument("--capture-last", type=int, help="Production preflight activation capture count; currently exactly 4.")
+    parser.add_argument("--require-exact", action="store_true", help="Production preflight exits unsuccessfully on any missing, nonfinite, or nonexact expected observation.")
+    parser.add_argument("--allow-idle-second-gpu", action="store_true", help="Production preflight requires two visible H100s but computes on GPU0 only; both remain counted in allocation time.")
     args = parser.parse_args(argv)
-    if not 16 <= args.length <= 256:
-        parser.error("--length must be between 16 and 256")
+    if not 16 <= args.length <= 8192:
+        parser.error("--length must be between 16 and 8192")
+    if args.production_arithmetic:
+        if args.candidate or args.batch_invariant_linear or args.candidate_attention_fa3 or args.backward_sanity:
+            parser.error("--production-arithmetic selects its own installers and does not permit diagnostic patches or backward")
+        if args.capture_last not in (None, 4):
+            parser.error("production preflight requires --capture-last 4")
+        args.capture_last = 4
+        args.attention_backend = "fa3"
+    elif args.length > 256 or args.capture_last is not None or args.require_exact or args.allow_idle_second_gpu:
+        parser.error("long lengths, selective capture, exact gating, and an idle second GPU require --production-arithmetic")
     if args.output.exists():
         parser.error("--output already exists; preserve previous probe artifacts")
     if args.backward_sanity and not args.candidate:
@@ -531,6 +756,8 @@ def main(argv=None):
                                   config={"slurm_job_id": os.environ.get("SLURM_JOB_ID"), "length": args.length, "candidate": args.candidate,
                                           "batch_invariant_linear": args.batch_invariant_linear,
                                           "attention_backend": args.attention_backend, "candidate_attention_fa3": args.candidate_attention_fa3,
+                                          "production_arithmetic": args.production_arithmetic, "capture_last": args.capture_last,
+                                          "require_exact": args.require_exact, "allow_idle_second_gpu": args.allow_idle_second_gpu,
                                           "flashinfer_use_tensor_core_env": os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")})
         result = run(args, wandb_run=wandb_run)
         if wandb_run is not None:

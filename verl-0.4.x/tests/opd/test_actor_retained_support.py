@@ -18,7 +18,9 @@ def _load_forward(score):
 
     def unpad(values, mask):
         indices = mask.flatten().nonzero().flatten()
-        return values.flatten(0, 1)[indices], indices, None, None
+        lengths = mask.sum(-1).to(torch.int32)
+        cumulative = torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0, dtype=torch.int32)))
+        return values.flatten(0, 1)[indices], indices, cumulative, int(lengths.max())
 
     def pad(hidden_states, indices, batch, seqlen):
         result = torch.zeros(batch * seqlen, hidden_states.shape[-1], dtype=hidden_states.dtype)
@@ -67,6 +69,7 @@ class Model:
     def __call__(self, *, inputs_embeds, **kwargs):
         assert not inputs_embeds.requires_grad  # Previous sampled actions are detached.
         self.last_inputs = inputs_embeds
+        self.last_kwargs = kwargs
         return SimpleNamespace(logits=torch.zeros(*inputs_embeds.shape[:-1], 16))
 
 
@@ -109,3 +112,15 @@ def test_qwen_replay_rejects_missing_filter_mask_before_model_forward():
     batch.pop("rollout_topk_retained_mask")
     with pytest.raises(RuntimeError, match="requires the recorded retained support mask"):
         forward(_actor(), batch, temperature=1.0)
+
+
+def test_native_replay_passes_real_row_boundaries_without_changing_action_order():
+    forward = _load_forward(lambda **kwargs: torch.zeros(kwargs["labels"].shape))
+    actor = _actor()
+    actor.qwen_replay_backend = "native_fa3_v1"
+    batch = _batch()
+    forward(actor, batch, temperature=1.0)
+    metadata = actor.actor_module.last_kwargs
+    assert torch.equal(metadata["opd_cu_seqlens"], torch.tensor([0, 5, 10], dtype=torch.int32))
+    assert metadata["opd_max_seqlen"] == 5
+    assert torch.equal(metadata["position_ids"], torch.tensor([[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]]))

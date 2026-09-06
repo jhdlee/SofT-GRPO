@@ -279,7 +279,8 @@ class CellRunner:
         phase_root.mkdir()
         output = phase_root / "measurement.json"
         dispatch, running, queue = VARIANT_CONFIGS[variant]
-        overrides = profile_overrides(self.args.objective, self.args.gpus, self.args.root, phase_root / "training")
+        overrides = profile_overrides(self.args.objective, self.args.gpus, self.args.root, phase_root / "training",
+                                      replay_backend=getattr(self.args, "qwen_replay_backend", "disabled"))
         overrides += [
             f"actor_rollout_ref.rollout.dispatch_mode={dispatch}",
             f"actor_rollout_ref.rollout.max_running_requests={running}",
@@ -414,11 +415,15 @@ def main(argv=None):
     parser.add_argument("--time-limit-seconds", type=int, default=7100)
     parser.add_argument("--repair-pilot", choices=tuple(VARIANT_CONFIGS), default=None,
                         help="Run only the strict three-iteration pilot; no dispatch-study estimate")
+    parser.add_argument("--qwen-replay-backend", choices=("disabled", "native_fa3_v1"), default="disabled",
+                        help="Versioned common inference/replay arithmetic; opt-in repair pilot only")
     args = parser.parse_args(argv)
     if not 60 <= args.time_limit_seconds <= 7200:
         parser.error("benchmark time limit must remain within two hours")
     if args.repair_pilot is not None and args.time_limit_seconds > 1800:
         parser.error("repair validation must be explicitly capped at thirty minutes")
+    if args.qwen_replay_backend != "disabled" and args.repair_pilot is None:
+        parser.error("native replay arithmetic currently requires --repair-pilot")
     CellRunner(args).run()
 
 

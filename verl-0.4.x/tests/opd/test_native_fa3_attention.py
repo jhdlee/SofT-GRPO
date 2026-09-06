@@ -44,7 +44,7 @@ def test_cpu_causality_gqa_shape_and_gradients():
 
 
 @pytest.mark.parametrize("options", [
-    {"attention_mask": torch.ones(1, 5)},
+    {"attention_mask": torch.tensor([[1, 1, 1, 1, 0]])},
     {"dropout": 0.1}, {"sliding_window": 2}, {"is_causal": False},
     {"position_ids": torch.tensor([[0, 1, 0, 1, 2]])},
     {"position_ids": torch.tensor([[0, 1, 2, 4, 5]])},
@@ -150,6 +150,146 @@ def test_pinned_backward_writes_buffers_and_does_not_return_them(monkeypatch):
         assert actual.shape == original.shape and torch.equal(actual, torch.full_like(original, number))
 
 
+def _layout(lengths=(3, 1, 5), *, device="cpu", mask=None):
+    positions = torch.cat([torch.arange(length, device=device) for length in lengths])[None]
+    cumulative = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32, device=device)
+    layout = bridge.prepare_fa3_attention_layout(
+        positions, total_tokens=sum(lengths), device=device, attention_mask=mask,
+        opd_cu_seqlens=cumulative, opd_max_seqlen=max(lengths),
+    )
+    return positions, cumulative, layout
+
+
+def test_packed_cpu_outputs_gradcheck_and_no_cross_row_gradients():
+    positions, _, layout = _layout()
+    q, k, v = _inputs(length=9, dim=2)
+    run = lambda a, b, c: bridge.native_fa3_attention(
+        None, a, b, c, scaling=0.37, opd_attention_layout=layout,
+    )[0]
+    actual = run(q, k, v)
+    expected = torch.cat([
+        bridge.native_fa3_attention(None, q[:, :, b:e], k[:, :, b:e], v[:, :, b:e], scaling=0.37)[0]
+        for b, e in layout.segments
+    ], 1)
+    assert torch.equal(actual, expected)
+    assert torch.autograd.gradcheck(run, (q, k, v))
+    changed_k, changed_v = k.detach().clone(), v.detach().clone()
+    changed_k[:, :, :4] += 10
+    changed_v[:, :, :4] -= 10
+    assert torch.equal(actual[:, 4:], run(q, changed_k, changed_v)[:, 4:])
+    actual[:, 4:6].square().sum().backward()
+    for tensor in (q, k, v):
+        assert torch.count_nonzero(tensor.grad[:, :, :4]) == 0
+        assert torch.count_nonzero(tensor.grad[:, :, 6:]) == 0
+        assert tensor.grad[:, :, 4:6].abs().sum() > 0
+    assert positions.tolist() == [[0, 1, 2, 0, 0, 1, 2, 3, 4]]
+
+
+def test_prepared_layout_reused_without_metadata_host_reads(monkeypatch):
+    positions, cumulative, layout = _layout()
+    q, k, v = _inputs(length=9)
+    # Caller-owned metadata can change without changing the validated copy.
+    cumulative.fill_(-1)
+    assert layout.cu_seqlens.tolist() == [0, 3, 4, 9]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("attention layer attempted repeated metadata validation/host synchronization")
+
+    monkeypatch.setattr(bridge, "prepare_fa3_attention_layout", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+    monkeypatch.setattr(torch.Tensor, "item", forbidden)
+    monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
+    for _ in range(3):
+        output, _ = bridge.native_fa3_attention(None, q, k, v, opd_attention_layout=layout)
+        assert output.shape == (1, 9, 4, 8)
+
+
+@pytest.mark.parametrize("field", ["position_ids", "attention_mask", "cu_seqlens"])
+def test_prepared_layout_rejects_mutated_metadata(field):
+    mask = torch.ones(1, 9, dtype=torch.int64)
+    _, _, layout = _layout(mask=mask)
+    getattr(layout, field).add_(1)
+    with pytest.raises(ValueError, match="modified in place"):
+        bridge.native_fa3_attention(None, *_inputs(length=9), opd_attention_layout=layout)
+
+
+def test_layout_rejects_other_forward_metadata_and_mixed_raw_arguments():
+    positions, cumulative, layout = _layout()
+    q, k, v = _inputs(length=9)
+    with pytest.raises(ValueError, match="different position IDs"):
+        bridge.native_fa3_attention(None, q, k, v, position_ids=positions.clone(), opd_attention_layout=layout)
+    with pytest.raises(ValueError, match="not both"):
+        bridge.native_fa3_attention(None, q, k, v, opd_attention_layout=layout,
+                                   opd_cu_seqlens=cumulative, opd_max_seqlen=5)
+    with pytest.raises(ValueError, match="token count"):
+        bridge.native_fa3_attention(None, q[:, :, :-1], k[:, :, :-1], v[:, :, :-1], opd_attention_layout=layout)
+
+
+def test_all_ones_teacher_mask_and_raw_packed_metadata_are_supported():
+    q, k, v = _inputs()
+    masked, _ = bridge.native_fa3_attention(None, q, k, v, attention_mask=torch.ones(1, 5))
+    plain, _ = bridge.native_fa3_attention(None, q, k, v)
+    assert torch.equal(masked, plain)
+    positions, cumulative, layout = _layout()
+    q, k, v = _inputs(length=9)
+    raw, _ = bridge.native_fa3_attention(None, q, k, v, position_ids=positions,
+                                       opd_cu_seqlens=cumulative, opd_max_seqlen=5)
+    prepared, _ = bridge.native_fa3_attention(None, q, k, v, opd_attention_layout=layout)
+    assert torch.equal(raw, prepared)
+
+
+@pytest.mark.parametrize("boundaries,maximum,positions", [
+    ([1, 3, 5], 3, [0, 1, 2, 0, 1]),
+    ([0, 3, 4], 3, [0, 1, 2, 0, 1]),
+    ([0, 3, 3, 5], 3, [0, 1, 2, 0, 1]),
+    ([0, 4, 3, 5], 4, [0, 1, 2, 0, 1]),
+    ([0, 3, 5], 4, [0, 1, 2, 0, 1]),
+    ([0, 3, 5], True, [0, 1, 2, 0, 1]),
+    ([0, 3, 5], 3, [0, 1, 2, 3, 4]),
+    ([0, 3, 5], 3, [0, 1, 2, 0, 2]),
+    ([0, 3, 5], 3, [1, 2, 3, 0, 1]),
+    ([0, 3, 5], 3, None),
+])
+def test_invalid_packed_boundaries_or_positions_fail_before_kernels(boundaries, maximum, positions):
+    with pytest.raises(ValueError):
+        bridge.prepare_fa3_attention_layout(
+            None if positions is None else torch.tensor([positions]), total_tokens=5, device="cpu",
+            opd_cu_seqlens=torch.tensor(boundaries, dtype=torch.int32), opd_max_seqlen=maximum,
+        )
+
+
+def test_layout_rejects_noncontiguous_or_wrong_dtype_and_half_supplied_metadata():
+    positions = torch.tensor([[0, 1, 2, 0, 1]])
+    for cumulative, maximum in ((torch.tensor([0, 3, 5]), 3),
+                                 (torch.tensor([0, 9, 3, 9, 5], dtype=torch.int32)[::2], 3),
+                                 (None, 3), (torch.tensor([0, 3, 5], dtype=torch.int32), None)):
+        with pytest.raises(ValueError):
+            bridge.prepare_fa3_attention_layout(positions, total_tokens=5, device="cpu",
+                                                opd_cu_seqlens=cumulative, opd_max_seqlen=maximum)
+
+
+def test_packed_autograd_preserves_total_lse_width_and_max_segment_length(monkeypatch):
+    _, _, layout = _layout()
+    q, k, v = (tensor.transpose(1, 2).squeeze(0).detach().contiguous().requires_grad_() for tensor in _inputs(length=9))
+    calls = []
+
+    def forward(a, b, c, cumulative, maximum, scale):
+        assert cumulative is layout.cu_seqlens and maximum == 5
+        calls.append("forward")
+        return torch.ones_like(a), torch.zeros(4, 9, dtype=torch.float32)
+
+    def backward(gradient, a, b, c, output, lse, cumulative, maximum, scale):
+        assert cumulative is layout.cu_seqlens and maximum == 5 and lse.shape == (4, 9)
+        calls.append("backward")
+        return torch.ones_like(a), torch.ones_like(b), torch.ones_like(c)
+
+    monkeypatch.setattr(bridge, "_fa3_forward", forward)
+    monkeypatch.setattr(bridge, "_fa2_backward", backward)
+    bridge._NativeFA3Attention.apply(q, k, v, 0.37, layout).sum().backward()
+    assert calls == ["forward", "backward"]
+    assert all(tensor.grad is not None for tensor in (q, k, v))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires allocated H100 and pinned FA3/FA2 kernels")
 def test_h100_actual_forward_and_mathematical_gradients():
     if torch.cuda.get_device_capability()[0] != 9:
@@ -185,3 +325,41 @@ def test_h100_actual_forward_and_mathematical_gradients():
         # derivatives of each kernel's rounding or a relaxed replay ratio gate.
         torch.testing.assert_close(actual.float(), math_input.grad.float(), rtol=0.03, atol=0.003)
         torch.testing.assert_close(actual.float(), fa2_input.grad.transpose(1, 2).float(), rtol=0.03, atol=0.003)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires allocated H100 and pinned FA3/FA2 kernels")
+def test_h100_packed_forward_gradients_and_row_isolation():
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("pinned sgl-kernel FA3 requires Hopper")
+    from flash_attn import flash_attn_varlen_func as fa2_varlen
+    from sgl_kernel.flash_attn import flash_attn_varlen_func as fa3_varlen
+
+    lengths = (17, 1, 129)
+    positions, _, layout = _layout(lengths, device="cuda:0")
+    q, k, v = _inputs(length=sum(lengths), dim=128, dtype=torch.bfloat16, device="cuda:0")
+    output, _ = bridge.native_fa3_attention(None, q, k, v, scaling=0.13, opd_attention_layout=layout)
+    packed = [tensor.transpose(1, 2).squeeze(0).contiguous() for tensor in (q, k, v)]
+    direct, lse, *_ = fa3_varlen(*packed, layout.cu_seqlens, layout.cu_seqlens, 129, 129,
+                               softmax_scale=0.13, causal=True, num_splits=1, return_softmax_lse=True)
+    assert torch.equal(output.squeeze(0), direct) and lse.shape == (4, sum(lengths))
+    for begin, end in layout.segments:
+        single_cumulative = torch.tensor([0, end - begin], dtype=torch.int32, device=q.device)
+        single = fa3_varlen(*(tensor[begin:end] for tensor in packed), single_cumulative, single_cumulative,
+                            end - begin, end - begin, softmax_scale=0.13, causal=True, num_splits=1)
+        torch.testing.assert_close(direct[begin:end], single, rtol=0, atol=0)
+    output[:, 18:27].float().square().sum().backward()
+    actual_gradients = [tensor.grad.detach().clone() for tensor in (q, k, v)]
+    reference = [tensor.detach().double().requires_grad_() for tensor in (q, k, v)]
+    dense, _ = bridge.native_fa3_attention(None, *(tensor.cpu() for tensor in reference), scaling=0.13,
+        opd_cu_seqlens=layout.cu_seqlens.cpu(), opd_max_seqlen=129, position_ids=positions.cpu())
+    dense[:, 18:27].square().sum().backward()
+    fa2_inputs = [tensor.detach().requires_grad_() for tensor in packed]
+    fa2_output = fa2_varlen(*fa2_inputs, layout.cu_seqlens, layout.cu_seqlens, 129, 129,
+                            dropout_p=0.0, softmax_scale=0.13, causal=True, deterministic=True)
+    fa2_output[18:27].float().square().sum().backward()
+    for actual, math_input, fa2_input in zip(actual_gradients, reference, fa2_inputs):
+        assert torch.isfinite(actual).all() and actual[:, :, 18:27].abs().sum() > 0
+        assert torch.count_nonzero(actual[:, :, :18]) == 0
+        assert torch.count_nonzero(actual[:, :, 27:]) == 0
+        torch.testing.assert_close(actual.float(), math_input.grad.float(), rtol=0.03, atol=0.003)
+        torch.testing.assert_close(actual.float(), fa2_input.grad.transpose(0, 1)[None].float(), rtol=0.03, atol=0.003)

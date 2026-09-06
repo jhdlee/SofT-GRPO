@@ -172,13 +172,14 @@ def test_profile_overrides_preserve_recipe_horizon_and_use_isolated_qwen_identit
 @pytest.mark.parametrize("objective", ["standalone", "hybrid"])
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("phase", ["calibration", "pilot"])
-def test_full_profiles_compose_with_real_hydra_and_phase_overrides(tmp_path, objective, gpus, phase):
+@pytest.mark.parametrize("replay_backend", ["disabled", "native_fa3_v1"])
+def test_full_profiles_compose_with_real_hydra_and_phase_overrides(tmp_path, objective, gpus, phase, replay_backend):
     hydra = pytest.importorskip("hydra")
     from omegaconf import OmegaConf
     from verl.opd.config import OPDConfig
 
     config_dir = Path(training.__file__).resolve().parents[1] / "verl-0.4.x/verl/trainer/config"
-    overrides = training.profile_overrides(objective, gpus, tmp_path / "assets", tmp_path / "run")
+    overrides = training.profile_overrides(objective, gpus, tmp_path / "assets", tmp_path / "run", replay_backend=replay_backend)
     # The child-phase overrides applied by CellRunner must replace the common
     # settings without shortening the production optimization horizon.
     overrides += [
@@ -202,6 +203,8 @@ def test_full_profiles_compose_with_real_hydra_and_phase_overrides(tmp_path, obj
     assert str(opd.mode) == ("standalone" if objective == "standalone" else "auxiliary")
     assert config.actor_rollout_ref.rollout.n == (1 if objective == "standalone" else 8)
     assert config.actor_rollout_ref.rollout.engine_context_length == 12000
+    assert config.actor_rollout_ref.model.qwen_replay_backend == replay_backend
+    assert config.actor_rollout_ref.rollout.qwen_replay_backend == replay_backend
     assert config.trainer.total_training_steps is None
     assert config.trainer.total_epochs == 1
     assert config.trainer.max_rollout_iterations_per_invocation == 3

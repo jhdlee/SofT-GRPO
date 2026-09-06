@@ -192,6 +192,13 @@ class ActorRolloutRefWorker(Worker):
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
+        from verl.opd.qwen_replay_backend import validate_qwen_replay_worker
+        qwen_replay_backend = validate_qwen_replay_worker(
+            self.config, use_remove_padding=use_remove_padding, use_fused_kernels=use_fused_kernels,
+            enable_gradient_checkpointing=enable_gradient_checkpointing,
+            enable_activation_offload=enable_activation_offload, use_liger=use_liger,
+            sequence_parallel_size=self.ulysses_sequence_parallel_size,
+        )
 
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
@@ -258,6 +265,15 @@ class ActorRolloutRefWorker(Worker):
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
+            if qwen_replay_backend == "native_fa3_v1":
+                from verl.opd.qwen_native_arithmetic import install_qwen_replay_arithmetic
+                from verl.opd.qwen_replay_backend import qwen_replay_arithmetic_identity, validate_qwen_replay_runtime
+                validate_qwen_replay_runtime()
+                torch.backends.cuda.matmul.allow_tf32 = False
+                install_qwen_replay_arithmetic(
+                    actor_module, cache_device=torch.device("cuda", get_torch_device().current_device()),
+                )
+                logger.info("Qwen replay arithmetic role=%s identity=%s", role, qwen_replay_arithmetic_identity())
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -286,6 +302,8 @@ class ActorRolloutRefWorker(Worker):
             buffer_dtype = torch.float32
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        if qwen_replay_backend == "native_fa3_v1" and (param_dtype != torch.bfloat16 or buffer_dtype != torch.float32):
+            raise ValueError("native_fa3_v1 requires BF16 FSDP forward parameters and FP32 buffers")
 
         auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get("wrap_policy", None), is_lora=self.config.model.get("lora_rank", 0) > 0)
 
@@ -560,6 +578,12 @@ class ActorRolloutRefWorker(Worker):
                     cpu_offload_params=False,
                 )[0]
                 freeze_teacher_(self.opd_teacher_module_fsdp)
+                if self.config.model.get("qwen_replay_backend", "disabled") == "native_fa3_v1":
+                    actor_buffers = dict(self.actor_module_fsdp.named_buffers())
+                    teacher_buffers = dict(self.opd_teacher_module_fsdp.named_buffers())
+                    cache_names = [name for name in actor_buffers if name.endswith("_opd_native_rope_cache")]
+                    if not cache_names or any(name not in teacher_buffers or not torch.equal(actor_buffers[name], teacher_buffers[name]) for name in cache_names):
+                        raise RuntimeError("actor and privileged teacher native RoPE caches differ")
                 squared_distance, parameter_count = parameter_squared_distance_sum_and_count(
                     self.opd_teacher_module_fsdp,
                     self.actor_module_fsdp,
@@ -584,6 +608,7 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
+                self.config.actor.qwen_replay_backend = self.config.model.get("qwen_replay_backend", "disabled")
             self.actor = DataParallelPPOActor(
                 config=self.config.actor,
                 actor_module=self.actor_module_fsdp,
@@ -613,6 +638,7 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
+                self.config.ref.qwen_replay_backend = self.config.model.get("qwen_replay_backend", "disabled")
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
         if self._is_actor:

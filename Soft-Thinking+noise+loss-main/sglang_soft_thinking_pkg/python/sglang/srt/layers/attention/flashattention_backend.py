@@ -301,6 +301,11 @@ class FlashAttentionBackend(AttentionBackend):
         speculative_num_steps=0,
     ):
         super().__init__()
+        from sglang.srt.layers.qwen_replay_arithmetic import fa3_replay_callables
+
+        self._flash_attn_varlen_func, self._flash_attn_with_kvcache = fa3_replay_callables(
+            model_runner.server_args, flash_attn_varlen_func, flash_attn_with_kvcache
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -714,7 +719,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
+            result = self._flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
@@ -734,7 +739,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o_expand, softmax_lse_expand, *rest_expand = self._flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -777,7 +782,7 @@ class FlashAttentionBackend(AttentionBackend):
                     chunk_idx = forward_batch.prefix_chunk_idx
                     assert chunk_idx >= 0
 
-                    output, lse, *rest = flash_attn_varlen_func(
+                    output, lse, *rest = self._flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -791,7 +796,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output, lse, *rest = flash_attn_varlen_func(
+                    output, lse, *rest = self._flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -828,7 +833,7 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                result = flash_attn_with_kvcache(
+                result = self._flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
@@ -848,7 +853,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self._flash_attn_with_kvcache(
                             q=q_rope,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
@@ -954,7 +959,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
-                o = flash_attn_with_kvcache(
+                o = self._flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -972,7 +977,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attention:
                 # Use chunked (local) attention batching for self-attention
-                o = flash_attn_with_kvcache(
+                o = self._flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -998,7 +1003,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
-                result = flash_attn_with_kvcache(
+                result = self._flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1018,7 +1023,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self._flash_attn_with_kvcache(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -1070,7 +1075,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            result = flash_attn_with_kvcache(
+            result = self._flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -1089,7 +1094,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o_expand, softmax_lse_expand, *rest_expand = self._flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,

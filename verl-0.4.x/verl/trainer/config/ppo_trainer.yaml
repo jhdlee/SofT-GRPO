@@ -43,6 +43,7 @@ actor_rollout_ref:
     use_liger: False
     use_fused_kernels: False
     trust_remote_code: False
+    qwen_replay_backend: disabled # opt-in native_fa3_v1; versioned replay arithmetic
   actor:
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
     ppo_mini_batch_size: 256
@@ -126,6 +127,7 @@ actor_rollout_ref:
     require_retained_support: false # Qwen benchmark fails closed without observed top-p support
     max_running_requests: null # SGLang scheduler bound; null preserves engine default
     engine_context_length: null # opt-in SGLang context_length; null preserves legacy default
+    qwen_replay_backend: ${actor_rollout_ref.model.qwen_replay_backend}
     max_num_seqs: 1024
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null

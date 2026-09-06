@@ -1,4 +1,5 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import importlib
 import json
 import sys
 from types import SimpleNamespace
@@ -219,3 +220,246 @@ def test_native_fa3_probe_fixes_both_prefill_and_decode_split_counts(monkeypatch
     for name in ("flash_attn_varlen_func", "flash_attn_with_kvcache"):
         assert getattr(backend, name)("query", num_splits=0, causal=True) == "actual-kernel-result"
     assert calls == [(('query',), {"num_splits": 1, "causal": True})] * 2
+
+
+def test_selective_trace_captures_global_last_four_and_keeps_one_logit_row_per_forward():
+    trace = probe.Trace(total_tokens=8192, capture_last=4)
+    trace.tokens = 8188
+    trace.emit("embedding", torch.ones(8188, 8))
+    trace.emit("logits", torch.ones(8188, 16))
+    assert "embedding" not in trace.values
+    assert trace.values["logits"][0].shape == (1, 16)
+    for position in range(8188, 8192):
+        trace.start, trace.tokens = position, 1
+        value = torch.full((1, 8), float(position))
+        trace.emit("embedding", value)
+        value.zero_()
+        trace.emit("logits", torch.ones(1, 16))
+    result = trace.finish()
+    assert result["embedding"][:, 0].tolist() == list(range(8188, 8192))
+    assert result["logits"].shape == (5, 16)
+    full = probe.Trace(total_tokens=8192, capture_last=4)
+    full.tokens = 8192
+    full.emit("embedding", torch.arange(8192.)[:, None].expand(-1, 8))
+    assert torch.equal(full.finish()["embedding"], result["embedding"])
+    assert sum(tensor.numel() for values in trace.values.values() for tensor in values) == 4 * 8 + 5 * 16
+
+
+def test_long_synthetic_sequence_keeps_original_short_prefix_and_bounded_soft_positions():
+    seen = []
+    def encode(text, **kwargs):
+        seen.append(text)
+        return [ord(character) % 32 for character in text]
+    tokenizer = SimpleNamespace(vocab_size=32, encode=encode)
+    short, _, _ = probe.synthetic_sequence(tokenizer, 64)
+    long, support, probabilities = probe.synthetic_sequence(tokenizer, 8192)
+    assert torch.equal(long[:64], short)
+    assert len(long) == 8192 and len(seen) > 2
+    assert ((probabilities > 0).sum(-1) == 5).nonzero().flatten().tolist() == list(range(8183, 8191))
+    assert support.shape == (8192, 5)
+    assert torch.equal(probabilities.sum(-1), torch.ones(8192))
+
+
+def test_actual_cached_control_flow_excludes_prefix_activations(monkeypatch):
+    state = {}
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    @contextmanager
+    def hooks(model, trace):
+        state["trace"] = trace
+        yield
+    monkeypatch.setattr(probe, "native_hooks", hooks)
+    class Batch:
+        def __init__(self, ids):
+            self.input_ids, self.reqs = ids, [SimpleNamespace()]
+        def prepare_for_decode(self):
+            self.input_ids = self.output_ids
+        def get_model_worker_batch(self):
+            return self
+    monkeypatch.setattr(probe, "make_native_batch", lambda runner, ids: Batch(ids))
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_executor.forward_batch_info",
+                        SimpleNamespace(ForwardBatch=SimpleNamespace(init_new=lambda batch, runner: batch)))
+    def forward(batch):
+        state["trace"].emit("embedding", batch.input_ids[:, None].expand(-1, 8).float())
+        return SimpleNamespace(next_token_logits=torch.zeros(len(batch.input_ids), 16))
+    result = probe.native_forward(SimpleNamespace(model=None, forward=forward), torch.arange(8192),
+                                  None, None, cached=True, capture_last=4)
+    assert result["embedding"][:, 0].tolist() == list(range(8188, 8192))
+    assert result["logits"].shape == (5, 16)
+
+
+def test_selective_hf_forward_requests_only_the_final_logit_row(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    original_arange = torch.arange
+    monkeypatch.setattr(torch, "arange", lambda *args, **kwargs: original_arange(*args, **{k: v for k, v in kwargs.items() if k != "device"}))
+    state, calls = {}, []
+    class Model:
+        def train(self):
+            pass
+        def __call__(self, **kwargs):
+            calls.append(kwargs)
+            state["trace"].emit("embedding", torch.arange(16.)[:, None])
+            return SimpleNamespace(logits=torch.zeros(1, 1, 16))
+    result = probe.hf_forward(Model(), torch.arange(16), candidate_emit_state=state, capture_last=4)
+    assert calls[0]["logits_to_keep"] == 1 and calls[0]["use_cache"] is False
+    assert result["embedding"][:, 0].tolist() == [12, 13, 14, 15]
+    assert result["logits"].shape == (1, 16)
+
+
+def _exact_production_result(layers=1, vocab=16):
+    native = {stage: torch.zeros(4, 8) for stage in probe.expected_stage_names(layers)}
+    native["logits"] = torch.zeros(1, vocab)
+    candidate = {stage: value for stage, value in native.items() if not stage.endswith(".block_input")}
+    result = {"model_config": {"num_hidden_layers": layers, "vocab_size": vocab}, "capture": {"last_tokens": 4}, "cases": []}
+    for input_kind in ("hard_tokens", "soft_mixtures"):
+        result["cases"].append({"input": input_kind,
+            "native_prefill_vs_cached": probe.compare_traces(native, native),
+            "native_prefill_vs_candidate": probe.compare_traces(native, candidate),
+            "native_cached_vs_candidate": probe.compare_traces(native, candidate)})
+    return result
+
+
+@pytest.mark.parametrize("corruption", ["drift", "nonfinite", "missing_both", "missing_comparison", "support", "wrong_rows", "missing_case"])
+def test_production_exact_gate_blocks_incomplete_or_nonexact_evidence(corruption):
+    result = _exact_production_result()
+    assert probe.production_exact_issues(result) == []
+    comparison = result["cases"][0]["native_prefill_vs_candidate"]
+    if corruption == "drift":
+        comparison["stages"]["layer.0.qkv"]["max_abs"] = 0.0001
+    elif corruption == "nonfinite":
+        comparison["final_logits"]["nonfinite_elements"] = 1
+    elif corruption == "missing_both":
+        comparison["stages"].pop("layer.0.qkv")
+    elif corruption == "missing_comparison":
+        comparison["missing_comparison"].append("layer.0.qkv")
+    elif corruption == "support":
+        comparison["final_logits"].pop("native_top5_support")
+    elif corruption == "wrong_rows":
+        comparison["stages"]["embedding"]["shape"][0] = 8192
+    else:
+        result["cases"].pop()
+    assert probe.production_exact_issues(result)
+
+
+def test_production_capacity_and_idle_gpu_accounting_are_explicit():
+    options = probe.production_server_options("/sealed/model", 8192)
+    assert options["opd_qwen_replay_backend"] == "native_fa3_v1" and options["attention_backend"] == "fa3"
+    assert options["context_length"] >= 8224 and options["max_total_tokens"] >= 8448
+    assert options["chunked_prefill_size"] >= 8192 and options["max_prefill_tokens"] >= 8192
+    assert all(options[key] is True for key in ("disable_cuda_graph", "disable_overlap_schedule", "disable_radix_cache"))
+    devices = probe.production_device_inventory(["NVIDIA H100", "NVIDIA H100"], allow_idle_second_gpu=True)
+    assert devices["visible_count"] == 2 and devices["idle_device_indices"] == [1]
+    assert devices["active_device_index"] == 0 and devices["allocated_devices"][1]["used_by_probe"] is False
+    for names, allow in ((["H100", "H100"], False), (["H100"], True), (["H100", "A100"], True)):
+        with pytest.raises(RuntimeError):
+            probe.production_device_inventory(names, allow_idle_second_gpu=allow)
+
+
+def test_production_cli_infers_installers_and_exact_bounded_capture(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(probe, "run", lambda args, **kwargs: seen.append(args))
+    assert probe.main(["--assets", str(tmp_path), "--output", str(tmp_path / "result.json"),
+                       "--production-arithmetic", "--length", "8192", "--capture-last", "4",
+                       "--require-exact", "--allow-idle-second-gpu"]) == 0
+    args = seen[0]
+    assert args.candidate is None and args.attention_backend == "fa3"
+    assert args.capture_last == 4 and args.length == 8192 and args.require_exact and args.allow_idle_second_gpu
+    assert not args.backward_sanity and not args.batch_invariant_linear and not args.candidate_attention_fa3
+
+
+@pytest.mark.parametrize("flags", [["--length", "8192"], ["--require-exact"], ["--allow-idle-second-gpu"],
+    ["--production-arithmetic", "--capture-last", "8"],
+    ["--production-arithmetic", "--candidate", "untrusted:installer"],
+    ["--production-arithmetic", "--backward-sanity"]])
+def test_production_cli_rejects_unbounded_or_mixed_modes(tmp_path, flags):
+    with pytest.raises(SystemExit):
+        probe.main(["--assets", str(tmp_path), "--output", str(tmp_path / "result.json"), *flags])
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_production_run_uses_guarded_installers_only_and_persists_exact_gate(tmp_path, monkeypatch, drift):
+    """Exercise actual orchestration; only model loading/GPU forwards are fake."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "NVIDIA H100")
+    monkeypatch.setattr(torch.cuda, "set_device", lambda index: calls.append(("device", index)))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda index: 1234)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(probe.importlib.metadata, "version", lambda name: "test-pinned")
+    table = torch.nn.Embedding(16, 8)
+    candidate = SimpleNamespace(config=SimpleNamespace(vocab_size=16, num_hidden_layers=28),
+                                model=SimpleNamespace(embed_tokens=table))
+    candidate.cuda = lambda: candidate
+    runner = SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(embed_tokens=table)),
+        model_config=SimpleNamespace(), attn_backend=SimpleNamespace(),
+        opd_qwen_replay_provenance={"backend": "native_fa3_v1", "attention_backend": "fa3", "num_splits": 1,
+                                   "projection_policy": "fixed_tile_triton_32_64_32", "projection_module_count": 112})
+    tokenizer = SimpleNamespace(vocab_size=16, encode=lambda *args, **kwargs: list(range(16)))
+
+    def load_native(server, ports, rank):
+        assert server.opd_qwen_replay_backend == "native_fa3_v1" and server.attention_backend == "fa3"
+        assert rank == 0
+        calls.append(("load_native",))
+        return runner, tokenizer
+
+    def load_hf(*args, **kwargs):
+        calls.append(("load_hf",))
+        return candidate
+
+    monkeypatch.setitem(sys.modules, "sglang.bench_one_batch", SimpleNamespace(load_model=load_native))
+    monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.engine", SimpleNamespace(_set_envs_and_config=lambda server: None))
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", SimpleNamespace(
+        ServerArgs=lambda **kwargs: SimpleNamespace(**kwargs), PortArgs=SimpleNamespace(init_new=lambda server: None)))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoModelForCausalLM=SimpleNamespace(from_pretrained=load_hf)))
+    monkeypatch.setitem(sys.modules, "verl.models.transformers.monkey_patch", SimpleNamespace(apply_monkey_patch=lambda *args, **kwargs: None))
+    arithmetic = importlib.import_module("verl.opd.qwen_native_arithmetic")
+
+    def install(model, *, cache_device, emit):
+        assert model is candidate and cache_device == torch.device("cuda:0") and callable(emit)
+        model._opd_qwen_replay_arithmetic = True
+        calls.append(("install_production",))
+        return model
+
+    monkeypatch.setattr(arithmetic, "install_qwen_replay_arithmetic", install)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("production run entered a legacy patch or diagnostic control")
+    for name in ("install_native_probe_linear", "fix_native_fa3_split_count", "packed_projection_controls", "projection_shape_controls"):
+        monkeypatch.setattr(probe, name, forbidden)
+
+    def native(model, ids, support, probabilities, *, cached=False, capture_last=None):
+        assert model is runner and capture_last == 4
+        calls.append(("native_forward", cached, support is None))
+        trace = {name: torch.zeros(4, 8) for name in probe.expected_stage_names(28)}
+        trace["logits"] = torch.zeros(5 if cached else 1, 16)
+        return trace
+
+    def hf(model, ids, embedding, *, candidate_emit_state, capture_last):
+        assert model is candidate and capture_last == 4
+        calls.append(("candidate_forward", embedding is None))
+        trace = {name: torch.zeros(4, 8) for name in probe.expected_stage_names(28, candidate=True)}
+        trace["logits"] = torch.zeros(1, 16)
+        if drift:
+            trace["logits"][0, 0] = 0.001
+        return trace
+
+    monkeypatch.setattr(probe, "native_forward", native)
+    monkeypatch.setattr(probe, "hf_forward", hf)
+    args = SimpleNamespace(assets=tmp_path, length=16, capture_last=4, require_exact=True,
+                           allow_idle_second_gpu=True, output=tmp_path / "production.json")
+    if drift:
+        with pytest.raises(RuntimeError, match="parity gate failed"):
+            probe._run_production(args, {}, {"manifest_content_sha256": "sealed", "model": {}})
+    else:
+        probe._run_production(args, {}, {"manifest_content_sha256": "sealed", "model": {}})
+    result = json.loads(args.output.read_text())
+    assert result["exact_gate"]["passed"] is (not drift)
+    assert result["status"] == ("failed" if drift else "diagnostic_complete")
+    assert len(result["cases"]) == 2
+    assert calls.count(("load_hf",)) == 1 and calls.count(("install_production",)) == 1
+    assert [call for call in calls if call[0] == "device"] == [("device", 0)]
+    assert [call for call in calls if call[0] == "candidate_forward"] == [("candidate_forward", True), ("candidate_forward", False)]
+    assert result["capture"]["cached_prefix_activation_rows_captured"] == 0
+    assert result["capture"]["all_sequence_positions_captured"] is False
+    assert result["device"]["visible_count"] == 2 and result["device"]["idle_device_indices"] == [1]

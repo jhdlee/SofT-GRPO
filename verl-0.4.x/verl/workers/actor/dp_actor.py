@@ -173,6 +173,7 @@ class DataParallelPPOActor(BasePPOActor):
             self.opd_replay = PrivilegedReplay(teacher_module, tokenizer, self.opd_config)
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
+        self.qwen_replay_backend = self.config.get("qwen_replay_backend", "disabled")
         if torch.distributed.get_rank() == 0:
             print(f"Actor use_remove_padding={self.use_remove_padding}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
@@ -281,7 +282,7 @@ class DataParallelPPOActor(BasePPOActor):
 
             # print(input_ids.size(), rollout_topk_ids.size(), rollout_topk_gumbels.size())
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
+                input_ids_rmpad, indices, packed_cu_seqlens, packed_max_seqlen, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
                 if continuous_replay:
@@ -441,6 +442,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
+                if getattr(self, "qwen_replay_backend", "disabled") == "native_fa3_v1":
+                    extra_args.update(opd_cu_seqlens=packed_cu_seqlens, opd_max_seqlen=int(packed_max_seqlen))
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                 # print(input_ids_rmpad.size(), topk_embeds_rmpad.size(), topk_gumbels_rmpad_rolled.size())
