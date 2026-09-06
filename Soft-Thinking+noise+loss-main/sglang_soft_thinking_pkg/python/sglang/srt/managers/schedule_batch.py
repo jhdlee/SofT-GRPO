@@ -1532,6 +1532,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if self.enable_soft_thinking:
+            # Request processing can switch to categorical mode at </think>.
+            # SamplingBatchInfo copied the original flags at prefill; rebuild
+            # them in the current (possibly filtered/merged) request order.
+            self.sampling_info.soft_thinking_modes = torch.tensor(
+                [req.sampling_params.soft_thinking_mode for req in self.reqs],
+                dtype=torch.bool,
+            ).to(self.device, non_blocking=True)
+
         if self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.

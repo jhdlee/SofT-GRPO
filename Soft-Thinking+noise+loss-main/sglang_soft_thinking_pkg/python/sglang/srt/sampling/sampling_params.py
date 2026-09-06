@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Sampling parameters for text generation."""
-import torch
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.sampling.stateless_random import MAX_SEED
@@ -228,5 +227,6 @@ class SamplingParams:
             self.stop_str_max_len = stop_str_max_len
 
     def post_init_soft_thinking_mode(self):
-        # TODO: 换成cpu的，然后init的时候再传输，topk也是一样，会造成主卡显存不足
-        self.soft_thinking_mode = torch.tensor(True, dtype=torch.bool, device='cuda')
+        # This is request-side control state. SamplingBatchInfo materializes
+        # the ordered device tensor, without reading per-request CUDA scalars.
+        self.soft_thinking_mode = True
