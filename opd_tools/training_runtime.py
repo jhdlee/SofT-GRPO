@@ -455,6 +455,213 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
     }
 
 
+def _read_repair_submission(path: Path) -> dict[str, Any]:
+    """Authenticate one explicitly requested repair job, separate from the study."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("repair submission must be a regular file")
+    encoded = path.read_bytes()
+    record = json.loads(encoded, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"nonfinite submission JSON number {value}")))
+    _canonical_sha256(record)  # Also rejects exponent overflow in optional fields.
+    if not isinstance(record, Mapping) or type(record.get("schema_version")) is not int or record["schema_version"] != 1:
+        raise ValueError("repair submission schema must be version 1")
+    if record.get("role") != "repair_validation" or record.get("state") != "submitted" or "jobs" in record:
+        raise ValueError("repair submission must identify one submitted repair_validation job")
+    if not isinstance(record.get("submission_id"), str) or not record["submission_id"]:
+        raise ValueError("repair submission_id is missing")
+    if type(record.get("job_id")) is not int or record["job_id"] <= 0:
+        raise ValueError("repair job_id must be a positive integer")
+    if record.get("objective") not in OBJECTIVES:
+        raise ValueError("repair objective must be standalone or hybrid")
+    gpus = _gpu_count(record.get("gpus"))
+    seconds = record.get("time_limit_seconds")
+    if type(seconds) is not int or not 0 < seconds <= 1800:
+        raise ValueError("repair time_limit_seconds must be a positive integer at most 1800")
+    if "internal_deadline_seconds" in record:
+        deadline = record["internal_deadline_seconds"]
+        if type(deadline) is not int or not 0 < deadline <= seconds:
+            raise ValueError("repair internal deadline exceeds its allocation")
+    if "maximum_repair_gpu_hours" in record:
+        cap = _number(record["maximum_repair_gpu_hours"], "maximum_repair_gpu_hours", positive=True)
+        if not seconds * gpus / 3600 <= cap <= 1:
+            raise ValueError("repair GPU-hour cap differs from its bounded allocation")
+    for key in ("parent_commit", "fork_commit"):
+        if not isinstance(record.get(key), str) or re.fullmatch(r"[0-9a-f]{40}", record[key]) is None:
+            raise ValueError(f"repair {key} must be a full 40-character Git SHA")
+    for key in ("source_snapshot", "run_root"):
+        if not isinstance(record.get(key), str) or not Path(record[key]).is_absolute():
+            raise ValueError(f"repair {key} must be an absolute path")
+    if not any(_canonical_sha256(record.get("dispatch")) == _canonical_sha256(value) for value in VARIANTS.values()):
+        raise ValueError("repair dispatch must exactly match an allowed variant")
+    return {**record, "input_path": str(path), "file_sha256": hashlib.sha256(encoded).hexdigest(),
+            "validation_note": "Validated single-job request metadata; execution and source verification require authenticated measurements."}
+
+
+def _repair_overrides(submission: Mapping[str, Any], variant: str) -> list[str]:
+    """Recheck the recipe without reading model files or rebasing remote paths."""
+    from .qwen_training import profile_overrides
+
+    dynamic_paths = {"data.train_files", "data.val_files", "actor_rollout_ref.model.path",
+                     "custom_reward_function.path", "trainer.default_local_dir"}
+    overrides = [item for item in profile_overrides(submission["objective"], submission["gpus"], "/unused-assets", "/unused-run")
+                 if item.split("=", 1)[0].lstrip("+") not in dynamic_paths]
+    values = {
+        **{"actor_rollout_ref.rollout." + key: value for key, value in VARIANTS[variant].items()},
+        "trainer.training_benchmark_mode": "pilot", "trainer.training_benchmark_variant": variant,
+        "trainer.training_benchmark_batches": [], "trainer.val_before_train": False,
+        "trainer.test_freq": -1, "trainer.save_freq": -1, "trainer.log_val_generations": 0,
+        "trainer.resume_mode": "disable", "trainer.max_rollout_iterations_per_invocation": 3,
+        "trainer.rollout_integrity.full_dose_gradient_gate_enabled": False,
+        "trainer.rollout_integrity.max_cap_rate": 0.05,
+        "trainer.rollout_integrity.max_all_soft_rate": 0.05,
+        "trainer.rollout_integrity.min_close_tag_rate": 0.95,
+        "trainer.rollout_integrity.min_soft_to_hard_rate": 0.95,
+        "trainer.rollout_integrity.min_categorical_boxed_answer_rate": 0.95,
+        "trainer.rollout_integrity.max_replay_ratio_abs_error": 1e-4,
+    }
+    return overrides + [key + "=" + json.dumps(value) for key, value in values.items()]
+
+
+def aggregate_repair_validation(submission_path: Path | str, input_root: Path | str | None = None) -> dict[str, Any]:
+    """Report one bounded repair pilot; never infer a full-training allocation.
+
+    Phase hashes authenticate the embedded canonical measurement bytes written
+    by the trainer. Checkpoint commit evidence is checked without rereading the
+    checkpoint's multi-GB tensor payloads. A local collection may override the
+    remote run root, but cannot change the submitted job/source identity.
+    """
+    report: dict[str, Any] = {
+        "protocol": "opd-qwen3-repair-validation-report-v1", "role": "repair_validation",
+        "preliminary": True, "status": "incomplete", "submission": None, "jobs": {},
+        "source": {}, "input_errors": [], "pilot_gates": [], "measurements": {},
+        "full_training_estimate": None, "allocation_recommendation": None,
+        "remaining_gates": {"full_dose_gradient_acceptance": "pending", "exact_next_update_resume": "pending",
+                            "four_cell_runtime_estimate": "unsupported by this repair pilot", "dispatch_recalibration": "not performed"},
+    }
+    path = Path(submission_path)
+    try:
+        submission = _read_repair_submission(path)
+        root = Path(input_root) if input_root is not None else Path(submission["run_root"])
+        variant = next(key for key, value in VARIANTS.items() if value == submission["dispatch"])
+        report.update(submission=submission, jobs={"slurm_job_id": str(submission["job_id"])},
+                      source={key: submission[key] for key in ("parent_commit", "fork_commit", "source_snapshot")},
+                      objective=submission["objective"], gpus=submission["gpus"], requested_dispatch=variant, input_root=str(root))
+        path = root / f"{submission['objective']}-gpu{submission['gpus']}" / "cell.json"
+        if input_root is not None and (root / "cell.json").exists():
+            path = root / "cell.json"  # Explicitly collected single-cell directory.
+        cells = list(root.rglob("cell.json"))
+        if not cells and not path.is_symlink():
+            report.update(status="pending", reason="job submitted; no cell measurement yet")
+            return report
+        if cells != [path] or path.is_symlink() or not path.is_file():
+            raise ValueError("repair input root must contain exactly its single regular cell.json; study matrices are separate")
+        raw = json.loads(path.read_text(), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"nonfinite measurement JSON number {value}")))
+        _canonical_sha256(raw)
+        if not isinstance(raw, Mapping) or raw.get("role") != "repair_validation":
+            raise ValueError("cell is not an explicit repair_validation pilot")
+        if raw.get("objective") != submission["objective"] or _gpu_count(raw.get("gpus")) != submission["gpus"]:
+            raise ValueError("repair cell objective/GPU identity differs from submission")
+        _match_submission_identity(raw, submission, submission)
+        if raw.get("requested_dispatch") != variant or raw.get("screen_rows") or raw.get("confirm_rows"):
+            raise ValueError("repair cell dispatch/scope differs from submission")
+        report["submission_identity_matches"] = True
+        report["cell"] = raw
+        phases = raw.get("phases", [])
+        if not isinstance(phases, list) or len(phases) > 1 or any(not isinstance(row, Mapping) for row in phases):
+            raise ValueError("repair must contain only one pilot phase")
+        phase = phases[0] if phases else {}
+        measured = phase.get("measurement", {})
+        if not isinstance(measured, Mapping):
+            raise ValueError("repair phase measurement must be a mapping")
+        view = {key: measured.get(key, raw.get(key)) for key in
+                ("startup_seconds", "iterations", "validation_seconds", "validation_example_count", "checkpoint_seconds", "failed_iterations")}
+        view.update(objective=submission["objective"], iterations=view.get("iterations") or [])
+        failure, _ = _measurement_failure(raw)
+        if failure:
+            view["failure"] = failure
+            report["failure"] = failure
+            report["failure_status"] = failure.get("status", "failed")
+        report["measurements"] = view
+        report["wandb_run_ids"] = raw.get("wandb_run_ids", [])
+        if measured:
+            from .training_benchmark import validate_phase_measurement
+
+            if raw["source"].get("snapshot_verified") is not True:
+                raise ValueError("repair phase has no verified benchmark source snapshot")
+            encoded = json.dumps(measured, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+            if phase.get("sha256") != hashlib.sha256(encoded).hexdigest():
+                raise ValueError("repair phase measurement SHA-256 differs from its embedded canonical bytes")
+            if phase.get("phase") != "pilot" or phase.get("variant") != variant or phase.get("batches") != []:
+                raise ValueError("repair phase identity differs from the requested pilot")
+            validate_phase_measurement(measured, phase="pilot", variant=variant, batches=[],
+                                       overrides=_repair_overrides(submission, variant), source=raw["source"],
+                                       assets=raw.get("assets", {}), run_id=phase.get("wandb_run_id"))
+            report["measurement_authenticated"] = True
+        if failure:
+            report["reason"] = f"{failure.get('status', 'failed')} at {failure.get('stage', 'unknown')}: {failure['error']}"
+            return report
+        if raw.get("status") != "repair_validation_complete":
+            report["reason"] = raw.get("reason") or raw.get("error") or f"repair status is {raw.get('status', 'missing')}"
+            return report
+        _validate_cell_provenance(raw, submission["objective"], submission["gpus"])
+        if measured.get("status") != "complete" or measured.get("failed_iterations"):
+            raise ValueError("repair pilot measurement did not complete without failed iterations")
+        from .training_benchmark import validate_pilot_metrics
+
+        rows = measured.get("iterations")
+        if not isinstance(rows, list) or len(rows) != 3 or any(not isinstance(row, Mapping) or type(row.get("rollout_iteration")) is not int for row in rows) or [row["rollout_iteration"] for row in rows] != [0, 1, 2]:
+            raise ValueError("repair requires exactly three completed iterations 0, 1, 2")
+        for key in ("startup_seconds", "iterations", "validation_seconds", "validation_example_count", "checkpoint_seconds", "checkpoint_provenance"):
+            if _canonical_sha256(raw.get(key)) != _canonical_sha256(measured.get(key)):
+                raise ValueError("repair cell differs from authenticated pilot at " + key)
+        for row in rows:
+            _iteration_cost(row)
+            accepted = validate_pilot_metrics(submission["objective"], row["rollout_iteration"], row.get("metrics"),
+                                              actor_update_timing=row.get("actor_update_timing"), expected_ranks=submission["gpus"])
+            if row.get("pilot_acceptance") != accepted:
+                raise ValueError("repair stored pilot acceptance differs from recomputed evidence")
+            report["pilot_gates"].append(accepted)
+        for key, threshold, maximum in (("latent/cap_rate", 0.05, True), ("latent/close_tag_rate", 0.95, False), ("latent/soft_to_hard_rate", 0.95, False)):
+            value = _number(rows[0]["metrics"].get(key), key)
+            if value > 1 or (value > threshold if maximum else value < threshold):
+                raise ValueError("repair first-iteration integrity gate rejected " + key)
+        _number(measured.get("startup_seconds"), "startup_seconds")
+        _number(measured.get("validation_seconds"), "validation_seconds", positive=True)
+        checkpoint = _number(measured.get("checkpoint_seconds"), "checkpoint_seconds", positive=True)
+        if measured.get("validation_example_count") != 128 or not isinstance(measured.get("timing_only_validation_metrics"), Mapping) or not measured["timing_only_validation_metrics"]:
+            raise ValueError("repair timing-only validation evidence must identify 128 examples and metrics")
+        if rows[-1]["timing_s"].get("save_checkpoint") != checkpoint or rows[-1]["metrics"].get("integrity/checkpoint_committed") != 1:
+            raise ValueError("repair checkpoint lacks matching authenticated commit/timing evidence")
+        report.update(status="repair_validation_complete", reason="Authenticated three-iteration repair pilot, checkpoint commit, timing validation, and finished online W&B publication.",
+                      checkpoint_authentication="Trainer's authenticated commit evidence; checkpoint tensor payloads were not rehashed by this CPU report.")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError) as error:
+        report["reason"] = str(error)
+        report["input_errors"].append({"path": str(path), "error": str(error)})
+    return report
+
+
+def render_repair_markdown(report: Mapping[str, Any]) -> str:
+    lines = ["# Preliminary Qwen3 repair validation", "",
+             f"Status: **{_markdown_value(report['status'])}**. {_markdown_value(report.get('reason', ''))}", "",
+             "This is one bounded repair pilot. It does not supply the four-cell runtime estimate or an allocation recommendation.", "",
+             f"Job: `{_markdown_value(report.get('jobs', {}).get('slurm_job_id', 'unavailable'))}`; objective: {_markdown_value(report.get('objective', 'unavailable'))}; H100s: {_markdown_value(report.get('gpus', 'unavailable'))}; requested dispatch: `{_markdown_value(report.get('requested_dispatch', 'unavailable'))}`.", "",
+             f"Benchmark source: `{_markdown_value(report.get('source', {}))}`.", ""]
+    if report.get("submission"):
+        lines += [f"Submission registry SHA-256: `{report['submission']['file_sha256']}`.", ""]
+    if report.get("reporter"):
+        lines += [f"Reporter source (separate from benchmark): `{_markdown_value(report['reporter'])}`.", ""]
+    lines += [f"Revalidated pilot iterations: {len(report.get('pilot_gates', []))}/3. Recorded W&B run IDs: `{_markdown_value(report.get('wandb_run_ids', []))}`.", ""]
+    view = report.get("measurements", {})
+    try:
+        lines += _failure_measurement_lines(view) + _stage_measurement_lines(view)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        lines += ["Timing/diagnostic table unavailable: malformed measurement fields; see the recorded input error.", ""]
+    if report.get("failure"):
+        lines += [f"Persisted failure: {_markdown_value(report['failure'].get('error', 'unavailable'))}.", ""]
+    lines += ["Pilot acceptance checks replay tolerance, real soft-to-hard transitions, active OPD gradients, optimizer and per-rank EMA cadence. Existing production causal-mask, frozen-teacher, and finite-update guards remain authoritative. Full-dose gradient acceptance and exact next-update resume remain production gates. Timing-only validation is excluded from BEST selection.", "",
+              "Authenticated checkpoint timing uses the trainer's committed-checkpoint evidence; the CPU report does not rehash tensor payloads. Detailed configurations, phase hashes, and bounded failure diagnostics are retained in `repair_report.json`.", ""]
+    return "\n".join(lines)
+
+
 def _markdown_value(value: Any) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
     return text.replace("|", "\\|").replace("\n", " ")
@@ -623,7 +830,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     aggregate = subparsers.add_parser("aggregate", help="Publish complete and explicitly incomplete benchmark cells")
     aggregate.add_argument("--input-root", required=True, type=Path)
     aggregate.add_argument("--output-dir", required=True, type=Path)
+    repair = subparsers.add_parser("repair", help="Publish a separate, explicitly submitted repair-validation pilot")
+    repair.add_argument("--submission", required=True, type=Path)
+    repair.add_argument("--input-root", type=Path)
+    repair.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args(argv)
+    if args.command == "repair":
+        report = aggregate_repair_validation(args.submission, args.input_root)
+        atomic_write_json(args.output_dir / "repair_report.json", report)
+        atomic_write_text(args.output_dir / "repair_report.md", render_repair_markdown(report))
+        return 0
     report = aggregate_cells(args.input_root)
     atomic_write_json(args.output_dir / "training_runtime.json", report)
     atomic_write_text(args.output_dir / "training_runtime.md", render_markdown(report))
