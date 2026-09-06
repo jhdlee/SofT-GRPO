@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import tempfile
+from functools import lru_cache
 
 import pytest
 
@@ -34,31 +36,104 @@ def iterations():
     ]
 
 
+@lru_cache(maxsize=1)
+def fixture_assets():
+    from pathlib import Path
+    from opd_tools.manifest import canonical_sha256, write_manifest_atomic
+    from opd_tools.training_runtime import MODEL_ID
+    directory = tempfile.TemporaryDirectory(prefix="qtb-report-test-assets-")
+    root = Path(directory.name)
+    model_root, data_root = root / "model", root / "data"
+    model_root.mkdir()
+    data_root.mkdir()
+    def seal(path, value):
+        value = {**value, "manifest_content_sha256": canonical_sha256(value)}
+        write_manifest_atomic(path, value, validator=None)
+        return value
+    model = seal(model_root / "manifest.json", {"model": {"id": MODEL_ID, "resolved_revision": MODEL_REVISION}, "inventory_sha256": "c" * 64})
+    for name in ("train.parquet", "validation.parquet"):
+        (data_root / name).write_bytes(b"data")
+    data = seal(data_root / "manifest.json", {"files": {name: {"size": 4, "sha256": "d" * 64} for name in ("train.parquet", "validation.parquet")}})
+    assets = {"model": {"id": MODEL_ID, "revision": MODEL_REVISION},
+              "model_manifest_content_sha256": model["manifest_content_sha256"],
+              "data_manifest_content_sha256": data["manifest_content_sha256"]}
+    assets["manifest_content_sha256"] = canonical_sha256(assets)
+    return directory, root, assets
+
+
+def phase_fixture(objective, gpus, kind, variant, batches, *, rows=None, **values):
+    from opd_tools.training_runtime import _study_phase_overrides
+    from verl.opd.provenance import _environment_identity, build_checkpoint_provenance
+    _, root, _ = fixture_assets()
+    config = {}
+    for override in _study_phase_overrides(objective, gpus, kind, variant, batches):
+        key, encoded = override.lstrip("+").split("=", 1)
+        target = config
+        for part in key.split(".")[:-1]:
+            target = target.setdefault(part, {})
+        try:
+            value = json.loads(encoded)
+        except json.JSONDecodeError:
+            value = encoded
+        target[key.split(".")[-1]] = value
+    config["actor_rollout_ref"]["model"]["path"] = str(root / "model")
+    config["data"].update(train_files=str(root / "data/train.parquet"), val_files=str(root / "data/validation.parquet"))
+    provenance = build_checkpoint_provenance(config, source_commit="b" * 40, environment_identity=_environment_identity(package_versions={"torch": "2.6.0", "verl": "0.4.0"}))
+    run_id = f"abc123-{kind}-{variant}-{batches}"
+    measured = {"phase": kind, "variant": variant, "configuration": config, "checkpoint_provenance": provenance,
+                "wandb_run_id": run_id, "wandb_online": True, "wandb_finished": True, "status": "complete", "rows": rows or [], **values}
+    return {"phase": kind, "variant": variant, "batches": batches, "status": "complete", "authenticated": True,
+            "wandb_run_id": run_id, "measurement": measured}
+
+
+def seal_fixture_phases(cell):
+    from opd_tools.manifest import canonical_json_bytes
+    cell["wandb_run_ids"] = [phase["wandb_run_id"] for phase in cell["phases"]]
+    for phase in cell["phases"]:
+        phase["sha256"] = hashlib.sha256(canonical_json_bytes(phase["measurement"]) + b"\n").hexdigest()
+
+
+def sync_fixture_measurements(cell):
+    for phase in cell["phases"]:
+        if phase["phase"] == "calibration":
+            source = cell["screen_rows"] if phase["batches"] == [0] else cell["confirm_rows"]
+            phase["measurement"]["rows"] = [copy.deepcopy(row) for row in source if row["variant"] == phase["variant"]]
+        else:
+            for key in ("startup_seconds", "iterations", "validation_seconds", "validation_example_count", "checkpoint_seconds", "checkpoint_provenance"):
+                if key in cell:
+                    phase["measurement"][key] = copy.deepcopy(cell[key])
+    seal_fixture_phases(cell)
+
+
+def append_failed_fixture_phase(cell, kind, *, variant="bounded_async16", **measured):
+    cell["phases"] = [phase for phase in cell["phases"] if phase["phase"] != "pilot"]
+    phase = phase_fixture(cell["objective"], cell["gpus"], kind, variant, [] if kind == "pilot" else [1], **measured)
+    phase["status"] = "incomplete"
+    # Interrupted extra calibration phases have no completed summary row.
+    phase["wandb_run_id"] += "-failed"
+    phase["measurement"]["wandb_run_id"] = phase["wandb_run_id"]
+    cell["phases"].append(phase)
+    seal_fixture_phases(cell)
+
+
 def complete_cell(objective="standalone", gpus=1):
-    def digest(value):
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    assets = {"model": {"id": "Qwen/Qwen3-0.6B", "revision": MODEL_REVISION}}
-    assets["manifest_content_sha256"] = digest(assets)
-    resolved_config = {"trainer": {"n_gpus_per_node": gpus}}
-    provenance = {"source": {"commit": "b" * 40}, "model": {"id": "Qwen/Qwen3-0.6B", "resolved_revision": MODEL_REVISION}, "resolved_hydra_config": {"full_sha256": digest(resolved_config)}}
-    return {
-        "objective": objective,
-        "gpus": gpus,
-        "status": "complete",
-        "startup_seconds": 100,
-        "iterations": iterations(),
-        "validation_seconds": 8,
-        "validation_example_count": 128,
-        "checkpoint_seconds": 3,
-        "screen_rows": [measurement("legacy_batch"), measurement("bounded_async16", wall=8)],
+    cell = {
+        "objective": objective, "gpus": gpus, "status": "complete", "startup_seconds": 100,
+        "iterations": iterations(), "validation_seconds": 8, "validation_example_count": 128, "checkpoint_seconds": 3,
+        "screen_rows": [measurement("legacy_batch"), measurement("bounded_async16", wall=8), measurement("expanded_batch", wall=9), measurement("bounded_async32", wall=9)],
         "confirm_rows": [measurement("legacy_batch", batch=1), measurement("bounded_async16", batch=1, wall=8)],
         "source": {"parent_commit": "a" * 40, "fork_commit": "b" * 40, "snapshot_verified": True, "implementation_sha256": "c" * 64, "files": [{"path": "file.py", "sha256": "d" * 64}]},
-        "assets": assets,
+        "assets": copy.deepcopy(fixture_assets()[2]),
         "configuration": {"model_id": "Qwen/Qwen3-0.6B", "model_revision": MODEL_REVISION, "objective": objective, "gpus": gpus, "dispatch_mode": "bounded_async", "max_running_requests": 16, "async_queue_size": 32},
-        "phases": [{"status": "complete", "authenticated": True, "wandb_run_id": "abc123", "measurement": {"wandb_online": True, "wandb_finished": True, "wandb_run_id": "abc123", "configuration": resolved_config, "checkpoint_provenance": provenance}}],
-        "jobs": [{"job_id": "123", "time_limit_seconds": 7200}],
-        "wandb_run_ids": ["abc123"],
+        "phases": [], "jobs": {"slurm_job_id": "123"},
     }
+    for row in cell["screen_rows"] + cell["confirm_rows"]:
+        cell["phases"].append(phase_fixture(objective, gpus, "calibration", row["variant"], [row["batch_index"]], rows=[copy.deepcopy(row)]))
+    pilot = phase_fixture(objective, gpus, "pilot", "bounded_async16", [])
+    cell["checkpoint_provenance"] = pilot["measurement"]["checkpoint_provenance"]
+    cell["phases"].append(pilot)
+    sync_fixture_measurements(cell)
+    return cell
 
 
 def test_dispatch_registry_preserves_separate_queue_and_scheduler_capacity():
@@ -190,6 +265,7 @@ def test_only_planned_objectives_and_allocations(objective, gpus):
 def test_aggregation_preserves_provenance_and_publishes_missing_cells(tmp_path):
     cell = complete_cell()
     cell["screen_rows"][1].update(rank_tail_seconds=[7.9, 8.0], peak_memory_bytes=[123, 456])
+    sync_fixture_measurements(cell)
     atomic_write_json(tmp_path / "standalone-gpu1" / "cell.json", cell)
     report = aggregate_cells(tmp_path)
     assert len(report["cells"]) == 4
@@ -271,6 +347,7 @@ def test_recommend_smallest_conservative_fit_and_no_unmeasured_fallback(tmp_path
         cell = complete_cell(gpus=gpus)
         if gpus == 1:
             cell["startup_seconds"] = 40000
+            sync_fixture_measurements(cell)
         atomic_write_json(tmp_path / f"standalone-gpu{gpus}" / "cell.json", cell)
     report = aggregate_cells(tmp_path)
     assert report["recommendations"][0]["gpus"] == 2
@@ -280,6 +357,114 @@ def test_recommend_smallest_conservative_fit_and_no_unmeasured_fallback(tmp_path
         if row.get("estimate"):
             row["estimate"]["eligible_under_12_hours"] = False
     assert recommend_allocation(report["cells"], "standalone")["gpus"] is None
+
+
+@pytest.mark.parametrize("status", ["complete", "incomplete"])
+@pytest.mark.parametrize("key", ["screen_rows", "confirm_rows"])
+def test_duplicated_dispatch_summaries_must_match_hashed_phases_even_after_failure(tmp_path, status, key):
+    cell = complete_cell()
+    cell.update(status=status, reason="pilot failed")
+    # Leave every phase, source identity, and checkpoint seal unchanged.
+    cell[key][1]["wall_seconds"] /= 10
+    atomic_write_json(tmp_path / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    measured = report["cells"][0]
+    assert measured["status"] == "incomplete" and measured["estimate"] is None
+    assert key in measured["measurement_authentication_error"]
+    assert not measured["dispatch_selection"]["accepted"]
+    assert measured[key] == [] and measured["reported_" + key] == cell[key]
+    assert report["input_errors"] and report["recommendations"][0]["gpus"] is None
+    assert "| standalone | 1 | incomplete | unmeasured |" in render_markdown(report)
+
+
+@pytest.mark.parametrize("key", ["startup_seconds", "iterations", "validation_seconds", "checkpoint_seconds"])
+def test_pilot_timing_copies_cannot_replace_authenticated_measurements(tmp_path, key):
+    cell = complete_cell()
+    if key == "iterations":
+        cell[key][1]["timing_s"]["step"] /= 2
+    else:
+        cell[key] /= 2
+    atomic_write_json(tmp_path / "cell.json", cell)
+    measured = aggregate_cells(tmp_path)["cells"][0]
+    assert key in measured["measurement_authentication_error"]
+    assert measured["estimate"] is None
+
+
+@pytest.mark.parametrize("path,value", [
+    ("actor_rollout_ref.actor.optim.lr", 1e-3),
+    ("algorithm.opd.enabled", False),
+    ("algorithm.opd.mode", "hybrid"),
+    ("algorithm.opd.beta_base", 0.1),
+    ("algorithm.opd.warmup_fraction", 0.2),
+    ("trainer.total_epochs", 2),
+    ("actor_rollout_ref.rollout.n", 8),
+])
+def test_resealed_phase_with_changed_training_recipe_is_rejected(tmp_path, path, value):
+    from verl.opd.provenance import build_checkpoint_provenance
+    cell = complete_cell()
+    measured = cell["phases"][0]["measurement"]
+    target = measured["configuration"]
+    for part in path.split(".")[:-1]:
+        target = target[part]
+    target[path.split(".")[-1]] = value
+    measured["checkpoint_provenance"] = build_checkpoint_provenance(
+        measured["configuration"], source_commit="b" * 40,
+        environment_identity=measured["checkpoint_provenance"]["environment"])
+    seal_fixture_phases(cell)
+    atomic_write_json(tmp_path / "cell.json", cell)
+    result = aggregate_cells(tmp_path)["cells"][0]
+    assert "configuration differs at " + path in result["measurement_authentication_error"]
+    assert not result["dispatch_selection"]["accepted"] and result["estimate"] is None
+
+
+@pytest.mark.parametrize("change", ["screen", "confirmation", "pilot", "duplicate_screen"])
+def test_complete_study_requires_full_measured_dispatch_protocol(tmp_path, change):
+    cell = complete_cell()
+    if change == "pilot":
+        cell["phases"] = cell["phases"][:-1]
+    elif change == "duplicate_screen":
+        phase = copy.deepcopy(cell["phases"][0])
+        phase["wandb_run_id"] += "-duplicate"
+        phase["measurement"]["wandb_run_id"] = phase["wandb_run_id"]
+        cell["phases"].insert(1, phase)
+        cell["screen_rows"].insert(1, copy.deepcopy(cell["screen_rows"][0]))
+    else:
+        batches = [0] if change == "screen" else [1]
+        cell["phases"] = [phase for phase in cell["phases"] if not (phase["batches"] == batches and phase["variant"] == "legacy_batch")]
+        key = "screen_rows" if change == "screen" else "confirm_rows"
+        cell[key] = [row for row in cell[key] if row["variant"] != "legacy_batch"]
+    seal_fixture_phases(cell)
+    atomic_write_json(tmp_path / "cell.json", cell)
+    measured = aggregate_cells(tmp_path)["cells"][0]
+    assert measured["status"] == "incomplete" and measured["estimate"] is None
+    assert measured["measurement_authentication_error"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("screen_rows", None), ("confirm_rows", [None]), ("phases", None), ("phases", [None]),
+    ("phases", [{"phase": "pilot", "variant": {}}]), ("configuration", []), ("source", None),
+])
+def test_malformed_unauthenticated_measurements_still_publish_incomplete(tmp_path, key, value):
+    cell = complete_cell()
+    cell[key] = value
+    cell.update(failure={"error": {"malformed": True}, "diagnostics": None}, iterations=[None])
+    atomic_write_json(tmp_path / "input/cell.json", cell)
+    report = aggregate_cells(tmp_path / "input")
+    assert report["input_errors"]
+    assert not report["cells"][0]["dispatch_selection"]["accepted"]
+    assert "malformed measurement fields" in render_markdown(report)
+    assert main(["aggregate", "--input-root", str(tmp_path / "input"), "--output-dir", str(tmp_path / "reports")]) == 0
+    assert json.loads((tmp_path / "reports/training_runtime.json").read_text())["cells"][0]["status"] == "incomplete"
+
+
+def test_historical_profile_does_not_require_new_repair_only_support_flag(tmp_path):
+    cell = complete_cell()
+    assert all("require_retained_support" not in phase["measurement"]["configuration"]["actor_rollout_ref"]["rollout"] for phase in cell["phases"])
+    atomic_write_json(tmp_path / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    assert report["cells"][0]["status"] == "complete"
+    assert report["completion_policy"]["scheduler_accounting_checked"] is False
+    assert "Measurement-only aggregation" in render_markdown(report)
 
 
 def test_cli_atomic_json_and_markdown_with_empty_or_invalid_input(tmp_path):
@@ -308,6 +493,7 @@ def test_markdown_shows_actual_dispatch_lengths_rank_tails_memory_and_stage_cost
     cell["screen_rows"][1]["generated_tokens"] = 1100
     for row in cell["iterations"]:
         row["timing_s"]["weight_sync"] = 3
+    sync_fixture_measurements(cell)
     atomic_write_json(tmp_path / "cell.json", cell)
     markdown = render_markdown(aggregate_cells(tmp_path))
     assert "| bounded_async16 / 0 | yes | 8.00 | 137.50 | 550.00 (+50.00) | r0: 6.00; r1: 8.00 | GPU 0: 12.50; GPU 1: 13.75; measured aggregate: 25.75 |" in markdown
@@ -334,6 +520,7 @@ def test_teacher_diagnostics_show_max_rank_wall_without_changing_runtime(tmp_pat
     original = estimate_runtime(cell["objective"], cell["gpus"], cell["startup_seconds"], cell["iterations"], cell["validation_seconds"], cell["checkpoint_seconds"])
     for row, maximum in zip(cell["iterations"], (0, 8, 12)):
         row["actor_update_timing"] = {"teacher_seconds_max": maximum, "ranks": [{"rank": 0, "teacher_seconds": maximum / 2}, {"rank": 1, "teacher_seconds": maximum}], "timing_method": "cuda_synchronized_wall", "timing_note": "synchronization cost included"}
+    sync_fixture_measurements(cell)
     atomic_write_json(tmp_path / "cell.json", cell)
     report = aggregate_cells(tmp_path)
     assert report["cells"][3]["estimate"] == original
@@ -489,9 +676,8 @@ def test_report_surfaces_persisted_replay_failure_and_startup_without_fabricatin
         "diagnostics": {"rollout_metrics": {"latent/cap_rate": 0.25, "latent/soft_to_hard_rate": 0.75},
                         "valid_boundary_count": 48, "worst_positions": [{"prompt_index": 123, "rollout_rank": 1, "response_position": 456, "segment": "soft_prefix", "rollout_log_density": -12, "actor_log_density": -11.88, "ratio_abs_error": 0.125}]},
     }
-    cell["phases"].append({"phase": "pilot", "status": "incomplete", "measurement": {
-        "status": "failed", "error": failure["error"], "failure": failure, "failed_iterations": [failure], "startup_seconds": 17,
-    }})
+    append_failed_fixture_phase(cell, "pilot", status="failed", error=failure["error"], failure=failure,
+                                failed_iterations=[failure], startup_seconds=17)
     atomic_write_json(tmp_path / "cell.json", cell)
     report = aggregate_cells(tmp_path)
     measured = report["cells"][0]
@@ -515,7 +701,7 @@ def test_report_surfaces_persisted_replay_failure_and_startup_without_fabricatin
 def test_old_failed_phases_surface_actual_error_without_new_diagnostic_fields(tmp_path):
     cell = complete_cell()
     cell.update(status="incomplete", reason="exit code 1", iterations=[])
-    cell["phases"].append({"phase": "pilot", "status": "incomplete", "measurement": {"status": "failed", "error": "RuntimeError: rollout/replay ratio error 35310 exceeds 0.0001"}})
+    append_failed_fixture_phase(cell, "pilot", status="failed", error="RuntimeError: rollout/replay ratio error 35310 exceeds 0.0001")
     atomic_write_json(tmp_path / "cell.json", cell)
     measured = aggregate_cells(tmp_path)["cells"][0]
     assert "ratio error 35310" in measured["reason"]
@@ -534,9 +720,8 @@ def test_authenticated_parent_timeout_keeps_child_shutdown_error_separate(tmp_pa
     cell.update(status="incomplete", error=parent_error, reason=parent_error, iterations=[],
                 jobs={"slurm_job_id": "102"})
     del cell["startup_seconds"]
-    cell["phases"].append({"phase": "calibration", "status": "incomplete", "authenticated": True,
-                           "measurement": {"phase": "calibration", "status": "failed", "error": "SystemExit: 1",
-                                           "startup_seconds": 51, "failed_iterations": [{"stage": "calibration"}]}})
+    append_failed_fixture_phase(cell, "calibration", status="failed", error="SystemExit: 1",
+                                startup_seconds=51, failed_iterations=[{"stage": "calibration"}])
     atomic_write_json(tmp_path / "submission.json", submission_record())
     atomic_write_json(tmp_path / "cell.json", cell)
 
@@ -573,8 +758,7 @@ def test_timeout_text_cannot_override_child_error_without_exact_type_and_identit
     parent_error = "TimeoutExpired: trainer exceeded the cell allocation deadline"
     cell.update(status="incomplete", error=parent_error, reason=parent_error, iterations=[],
                 jobs={"slurm_job_id": "102"})
-    cell["phases"].append({"phase": "calibration", "status": "incomplete", "authenticated": True,
-                           "measurement": {"status": "failed", "error": "SystemExit: 1"}})
+    append_failed_fixture_phase(cell, "calibration", status="failed", error="SystemExit: 1")
     submission = submission_record()
     if change == "reason_only":
         del cell["error"]
@@ -601,6 +785,8 @@ def test_timeout_text_cannot_override_child_error_without_exact_type_and_identit
     assert measured["estimate"] is None
     if change in ("job_mismatch", "invalid_submission"):
         assert "submission identity" in measured["reason"]
+    elif change == "unverified_snapshot":
+        assert "measurement authentication failed" in measured["reason"]
     else:
         assert measured["reason"] == "failed at calibration: SystemExit: 1"
 

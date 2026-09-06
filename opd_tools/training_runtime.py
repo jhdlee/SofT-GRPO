@@ -250,7 +250,7 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def _validate_cell_provenance(cell: Mapping[str, Any], objective: str, gpus: int) -> None:
+def _validate_cell_identity(cell: Mapping[str, Any], objective: str, gpus: int) -> None:
     configuration = cell.get("configuration")
     if not isinstance(configuration, Mapping):
         raise ValueError("configuration must be a mapping")
@@ -266,6 +266,11 @@ def _validate_cell_provenance(cell: Mapping[str, Any], objective: str, gpus: int
         raise ValueError("sealed assets do not identify the pinned Qwen3 model")
     if assets.get("manifest_content_sha256") != _canonical_sha256({key: value for key, value in assets.items() if key != "manifest_content_sha256"}):
         raise ValueError("asset manifest content hash differs")
+
+
+def _validate_cell_provenance(cell: Mapping[str, Any], objective: str, gpus: int) -> None:
+    _validate_cell_identity(cell, objective, gpus)
+    source = cell["source"]
     phases = cell.get("phases", [])
     if not phases or any(phase.get("status") != "complete" or phase.get("authenticated") is not True for phase in phases):
         raise ValueError("all benchmark phases must complete with authenticated measurements")
@@ -286,6 +291,89 @@ def _validate_cell_provenance(cell: Mapping[str, Any], objective: str, gpus: int
         raise ValueError("benchmark job identity is missing")
     if cell.get("validation_example_count") != TIMING_VALIDATION_EXAMPLES:
         raise ValueError("timing validation must contain exactly 128 examples")
+
+
+def _study_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int]) -> list[str]:
+    """Authenticate the original study contract without requiring newer fields."""
+    return _profile_phase_overrides(objective, gpus, phase, variant, batches, historical=True)
+
+
+def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gpus: int) -> dict[str, Any]:
+    """Bind duplicated rollout and pilot summaries to their authenticated phase.
+
+    This also runs for failed cells: their completed calibration measurements
+    remain useful, but must not gain trust merely from an authenticated job ID.
+    Old snapshots need no fields added by subsequent replay/repair changes.
+    """
+    from .training_benchmark import validate_phase_measurement
+
+    _validate_cell_identity(cell, objective, gpus)
+    phases = cell.get("phases", [])
+    if not isinstance(phases, list) or any(not isinstance(phase, Mapping) for phase in phases):
+        raise ValueError("study phases must be a list of mappings")
+    summaries: dict[str, list[Any]] = {"screen_rows": [], "confirm_rows": []}
+    run_ids = []
+    pilot = None
+    for phase in phases:
+        kind, variant, batches = phase.get("phase"), phase.get("variant"), phase.get("batches")
+        if kind not in ("calibration", "pilot") or variant not in VARIANTS:
+            raise ValueError("study phase identity is invalid")
+        if (not isinstance(batches, list) or any(type(batch) is not int for batch in batches)
+                or batches not in ([[0], [1]] if kind == "calibration" else [[]])):
+            raise ValueError("study phase batches differ from its declared role")
+        run_id = phase.get("wandb_run_id")
+        if not isinstance(run_id, str) or not run_id or run_id in run_ids:
+            raise ValueError("study phase W&B run ID is missing or duplicated")
+        run_ids.append(run_id)
+        measured = phase.get("measurement")
+        if measured is None and phase.get("status") in ("running", "incomplete"):
+            continue
+        if not isinstance(measured, Mapping):
+            raise ValueError("study phase measurement must be a mapping")
+        encoded = json.dumps(measured, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+        if phase.get("sha256") != hashlib.sha256(encoded).hexdigest():
+            raise ValueError("study phase measurement SHA-256 differs from its embedded canonical bytes")
+        validate_phase_measurement(measured, phase=kind, variant=variant, batches=batches,
+                                   overrides=_study_phase_overrides(objective, gpus, kind, variant, batches),
+                                   source=cell["source"], assets=cell["assets"], run_id=run_id)
+        if phase.get("authenticated") is not True:
+            raise ValueError("study phase was not authenticated by its controller")
+        if phase.get("status") == "complete" and (measured.get("status") != "complete" or measured.get("wandb_online") is not True or measured.get("wandb_finished") is not True):
+            raise ValueError("complete study phase lacks finished online W&B publication")
+        if kind == "calibration":
+            target = "screen_rows" if batches == [0] else "confirm_rows"
+            summaries[target].extend({**row, "valid": row.get("valid") is True and phase.get("status") == "complete"}
+                                     for row in measured.get("rows", []))
+        else:
+            if pilot is not None:
+                raise ValueError("study repeats a training pilot")
+            pilot = measured
+    if cell.get("wandb_run_ids") != run_ids:
+        raise ValueError("study W&B run identities differ from its phases")
+    for key, expected in summaries.items():
+        if _canonical_sha256(cell.get(key, [])) != _canonical_sha256(expected):
+            raise ValueError("study " + key + " differ from authenticated phase measurements")
+    if pilot is not None:
+        for key in ("startup_seconds", "iterations", "validation_seconds", "validation_example_count", "checkpoint_seconds", "checkpoint_provenance"):
+            if key in pilot and key in cell and _canonical_sha256(cell[key]) != _canonical_sha256(pilot[key]):
+                raise ValueError("study " + key + " differs from authenticated pilot measurement")
+    if cell.get("status") in ("complete", "completed"):
+        if pilot is None or pilot.get("status") != "complete":
+            raise ValueError("complete study requires an authenticated completed training pilot")
+        for key in ("startup_seconds", "iterations", "validation_seconds", "validation_example_count", "checkpoint_seconds", "checkpoint_provenance"):
+            if key not in pilot or key not in cell:
+                raise ValueError("complete study is missing authenticated pilot " + key)
+        if (len(summaries["screen_rows"]) != len(VARIANTS)
+                or {(row["variant"], row["batch_index"]) for row in summaries["screen_rows"]} != {(variant, 0) for variant in VARIANTS}):
+            raise ValueError("complete study is missing a requested dispatch screen")
+        selection = select_dispatch(summaries["screen_rows"], summaries["confirm_rows"])
+        expected_confirm = {("legacy_batch", 1), (selection["candidate_variant"], 1)}
+        if (len(summaries["confirm_rows"]) != len(expected_confirm)
+                or {(row["variant"], row["batch_index"]) for row in summaries["confirm_rows"]} != expected_confirm):
+            raise ValueError("complete study is missing the requested dispatch confirmation")
+        if pilot["variant"] != selection["selected_variant"]:
+            raise ValueError("training pilot dispatch differs from authenticated selection")
+    return {"phase_count": len(phases), "pilot_present": pilot is not None}
 
 
 def _read_submission(path: Path) -> dict[str, Any]:
@@ -352,14 +440,17 @@ def _match_submission_identity(cell: Mapping[str, Any], submission: Mapping[str,
 def _measurement_failure(cell: Mapping[str, Any]) -> tuple[dict[str, Any] | None, Mapping[str, Any]]:
     """Prefer the worker's persisted failure to a generic subprocess exit."""
     direct = cell.get("failure")
-    if isinstance(direct, Mapping) and direct.get("error"):
+    if isinstance(direct, Mapping) and isinstance(direct.get("error"), str) and direct["error"]:
         return dict(direct), cell
-    for phase in reversed(cell.get("phases", [])):
+    phases = cell.get("phases", [])
+    for phase in reversed(phases if isinstance(phases, list) else []):
+        if not isinstance(phase, Mapping):
+            continue
         measured = phase.get("measurement", {})
         if not isinstance(measured, Mapping):
             continue
         failure = measured.get("failure")
-        if isinstance(failure, Mapping) and failure.get("error"):
+        if isinstance(failure, Mapping) and isinstance(failure.get("error"), str) and failure["error"]:
             return dict(failure), {"phase": phase.get("phase"), **measured}
         if measured.get("status") == "failed" and isinstance(measured.get("error"), str):
             return {"status": "failed", "stage": phase.get("phase", "unknown"), "error": measured["error"]}, {"phase": phase.get("phase"), **measured}
@@ -367,7 +458,12 @@ def _measurement_failure(cell: Mapping[str, Any]) -> tuple[dict[str, Any] | None
 
 
 def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
-    """Read all expected cells; absent or invalid measurements stay explicit."""
+    """Authenticate measurement artifacts; missing/invalid cells stay explicit.
+
+    This pure helper does not query Slurm. The CPU reporting job additionally
+    requires successful, unambiguous scheduler accounting before retaining a
+    completed cell or its allocation recommendation.
+    """
     input_root = Path(input_root)
     found: dict[tuple[str, int], list[tuple[Path, dict[str, Any]]]] = {}
     errors = []
@@ -383,7 +479,10 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
     submitted_jobs = {(row["objective"], row["gpus"]): row for row in submission["jobs"]} if submission else {}
     for path in sorted(input_root.rglob("cell.json")):
         try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("cell.json must be a regular file")
             value = json.loads(path.read_text(encoding="utf-8"), parse_constant=lambda text: (_ for _ in ()).throw(ValueError(f"nonfinite JSON number {text}")))
+            _canonical_sha256(value)
             key = (_objective(value["objective"]), _gpu_count(value["gpus"]))
             found.setdefault(key, []).append((path, value))
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -414,7 +513,7 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
             if submitted_job is not None:
                 cell["submission_job"] = dict(submitted_job)
             cell.update({"objective": objective, "gpus": gpus, "status": "incomplete", "estimate": None, "input_path": str(path), "measurement_status": raw.get("status")})
-            cell["dispatch_selection"] = select_dispatch(raw.get("screen_rows", []), raw.get("confirm_rows", []))
+            cell["dispatch_selection"] = select_dispatch([], [])
             failure, failed_measurement = _measurement_failure(raw)
             parent_error = raw.get("error") or raw.get("reason")
             cell["parent_error"] = parent_error if isinstance(parent_error, str) else None
@@ -437,6 +536,20 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
                     cell["submission_identity_matches"] = False
                     _match_submission_identity(raw, submission, submitted_job)
                     cell["submission_identity_matches"] = True
+                try:
+                    cell["measurement_authentication"] = _authenticate_study_measurements(raw, objective, gpus)
+                    cell["dispatch_selection"] = select_dispatch(raw.get("screen_rows", []), raw.get("confirm_rows", []))
+                except (ValueError, TypeError, KeyError, AttributeError, RuntimeError) as error:
+                    cell["measurement_authentication_error"] = str(error)
+                    # Preserve raw summaries for diagnosis; do not publish their
+                    # gains or validity flags when the source measurements differ.
+                    for key in ("screen_rows", "confirm_rows"):
+                        cell["reported_" + key] = cell.get(key)
+                        cell[key] = []
+                    cell["dispatch_selection"] = select_dispatch([], [])
+                    errors.append({"path": str(path), "error": str(error)})
+                    raise ValueError("measurement authentication failed: " + str(error)) from error
+                if submission is not None:
                     # CellRunner serializes the actual exception type in error.
                     # A deadline can terminate the child with generic SystemExit;
                     # free-form reason/child text must not acquire this priority.
@@ -460,10 +573,17 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
                 cell["status"] = "complete"
             except (ValueError, TypeError, KeyError, AttributeError) as error:
                 cell["reason"] = str(error)
+                if not cell.get("measurement_authentication"):
+                    for key in ("screen_rows", "confirm_rows"):
+                        cell.setdefault("reported_" + key, cell.get(key))
+                        cell[key] = []
+                    cell["dispatch_selection"] = select_dispatch([], [])
             cells.append(cell)
     return {
         "protocol": PROTOCOL,
         "preliminary": True,
+        "completion_policy": {"measurement_authentication_required": True, "scheduler_accounting_checked": False,
+                              "note": "Measurement-only aggregation; the CPU reporting job additionally requires one Slurm COMPLETED/0:0 record per complete cell."},
         "submission": submission,
         "recipe": {"model": MODEL_ID, "model_revision": MODEL_REVISION, "train_examples": TRAIN_EXAMPLES, "train_batch_size": TRAIN_BATCH_SIZE, "rollout_iterations": ROLLOUT_ITERATIONS, "optimizer_steps": OPTIMIZER_STEPS, "max_response_tokens": MAX_RESPONSE_TOKENS, "hybrid_warmup_iterations": 11, "validation_examples": VALIDATION_EXAMPLES, "timing_validation_examples": TIMING_VALIDATION_EXAMPLES, "validation_events": VALIDATION_EVENTS, "checkpoint_saves": CHECKPOINT_SAVES},
         "budget": {"jobs": 4, "hours_per_job": JOB_LIMIT_HOURS, "maximum_allocated_gpu_hours": MAX_ALLOCATED_GPU_HOURS},
@@ -515,18 +635,20 @@ def _read_repair_submission(path: Path) -> dict[str, Any]:
             "validation_note": "Validated single-job request metadata; execution and source verification require authenticated measurements."}
 
 
-def _repair_overrides(submission: Mapping[str, Any], variant: str) -> list[str]:
+def _profile_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int], *, historical: bool = False) -> list[str]:
     """Recheck the recipe without reading model files or rebasing remote paths."""
     from .qwen_training import profile_overrides
 
     dynamic_paths = {"data.train_files", "data.val_files", "actor_rollout_ref.model.path",
                      "custom_reward_function.path", "trainer.default_local_dir"}
-    overrides = [item for item in profile_overrides(submission["objective"], submission["gpus"], "/unused-assets", "/unused-run")
+    if historical:
+        dynamic_paths.add("actor_rollout_ref.rollout.require_retained_support")
+    overrides = [item for item in profile_overrides(objective, gpus, "/unused-assets", "/unused-run")
                  if item.split("=", 1)[0].lstrip("+") not in dynamic_paths]
     values = {
         **{"actor_rollout_ref.rollout." + key: value for key, value in VARIANTS[variant].items()},
-        "trainer.training_benchmark_mode": "pilot", "trainer.training_benchmark_variant": variant,
-        "trainer.training_benchmark_batches": [], "trainer.val_before_train": False,
+        "trainer.training_benchmark_mode": phase, "trainer.training_benchmark_variant": variant,
+        "trainer.training_benchmark_batches": batches, "trainer.val_before_train": False,
         "trainer.test_freq": -1, "trainer.save_freq": -1, "trainer.log_val_generations": 0,
         "trainer.resume_mode": "disable", "trainer.max_rollout_iterations_per_invocation": 3,
         "trainer.rollout_integrity.full_dose_gradient_gate_enabled": False,
@@ -538,6 +660,10 @@ def _repair_overrides(submission: Mapping[str, Any], variant: str) -> list[str]:
         "trainer.rollout_integrity.max_replay_ratio_abs_error": 1e-4,
     }
     return overrides + [key + "=" + json.dumps(value) for key, value in values.items()]
+
+
+def _repair_overrides(submission: Mapping[str, Any], variant: str) -> list[str]:
+    return _profile_phase_overrides(submission["objective"], submission["gpus"], "pilot", variant, [])
 
 
 def aggregate_repair_validation(submission_path: Path | str, input_root: Path | str | None = None) -> dict[str, Any]:
@@ -825,7 +951,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         prefix = f"{cell['objective']} / {cell['gpus']} H100"
         if cell["status"] != "complete":
             lines.append(f"- **{prefix}:** incomplete — {_markdown_value(cell.get('reason', 'unfinished'))}.")
-            lines.extend(_failure_measurement_lines(cell))
+            try:
+                lines.extend(_failure_measurement_lines(cell))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                lines.append("Failure diagnostics unavailable: malformed measurement fields.")
         selection = cell.get("dispatch_selection")
         if selection:
             comparisons = "; ".join(f"batch {row['batch_index']}: wall {row['wall_speedup']:.3f}×, throughput {row['throughput_speedup']:.3f}×, tokens Δ{row['generated_tokens_difference']:g}" if row["valid"] else f"batch {row['batch_index']}: incomplete/invalid" for row in selection["comparisons"])
@@ -836,8 +965,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             provenance["source"] = {key: value for key, value in source.items() if isinstance(value, (str, int, float))}
         if provenance:
             lines.append(f"- **{prefix} provenance:** `{_markdown_value(provenance)}`.")
-        lines.extend(_dispatch_measurement_lines(cell))
-        lines.extend(_stage_measurement_lines(cell))
+        try:
+            lines.extend(_dispatch_measurement_lines(cell))
+            lines.extend(_stage_measurement_lines(cell))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            lines.append("Measurement table unavailable: malformed measurement fields.")
     lines.extend(["", "Full configurations, source hashes/inventories, raw comparison records, memory observations, rank timings, and iteration timing breakdowns are retained in `training_runtime.json` when supplied by the jobs.", "", "## Allocation recommendation", ""])
     for row in report["recommendations"]:
         choice = f"{row['gpus']} H100{'s' if row['gpus'] == 2 else ''}" if row["gpus"] else "undetermined"
@@ -845,6 +977,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.extend(["", "The 1.5× and 2× values are planning scenarios, not confidence intervals. They scale generation, replay/reference scoring, actor update (including its nested teacher work), and validation; measured weight synchronization stays fixed. Iteration totals exclude nested validation/checkpoint time and never add nested teacher timing twice.", "", "Full-dose gradient acceptance and exact next-update resume remain subsequent production gates. Timing-subset validation does not enter BEST selection.", ""])
     if report.get("input_errors"):
         lines.extend(["Input errors: " + _markdown_value(report["input_errors"]), ""])
+    if report.get("completion_policy"):
+        lines.extend([report["completion_policy"]["note"], ""])
     return "\n".join(lines)
 
 
