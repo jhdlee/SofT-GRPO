@@ -61,12 +61,12 @@ def fixture_assets():
     return directory, root, assets
 
 
-def phase_fixture(objective, gpus, kind, variant, batches, *, rows=None, **values):
+def phase_fixture(objective, gpus, kind, variant, batches, *, rows=None, replay_backend="disabled", **values):
     from opd_tools.training_runtime import _study_phase_overrides
     from verl.opd.provenance import _environment_identity, build_checkpoint_provenance
     _, root, _ = fixture_assets()
     config = {}
-    for override in _study_phase_overrides(objective, gpus, kind, variant, batches):
+    for override in _study_phase_overrides(objective, gpus, kind, variant, batches, replay_backend=replay_backend):
         key, encoded = override.lstrip("+").split("=", 1)
         target = config
         for part in key.split(".")[:-1]:
@@ -77,6 +77,9 @@ def phase_fixture(objective, gpus, kind, variant, batches, *, rows=None, **value
             value = encoded
         target[key.split(".")[-1]] = value
     config["actor_rollout_ref"]["model"]["path"] = str(root / "model")
+    if replay_backend != "disabled":
+        # Emulate Hydra's resolved model-to-rollout interpolation.
+        config["actor_rollout_ref"]["rollout"]["qwen_replay_backend"] = replay_backend
     config["data"].update(train_files=str(root / "data/train.parquet"), val_files=str(root / "data/validation.parquet"))
     provenance = build_checkpoint_provenance(config, source_commit="b" * 40, environment_identity=_environment_identity(package_versions={"torch": "2.6.0", "verl": "0.4.0"}))
     run_id = f"abc123-{kind}-{variant}-{batches}"
@@ -116,7 +119,7 @@ def append_failed_fixture_phase(cell, kind, *, variant="bounded_async16", **meas
     seal_fixture_phases(cell)
 
 
-def complete_cell(objective="standalone", gpus=1):
+def complete_cell(objective="standalone", gpus=1, *, replay_backend="disabled"):
     cell = {
         "objective": objective, "gpus": gpus, "status": "complete", "startup_seconds": 100,
         "iterations": iterations(), "validation_seconds": 8, "validation_example_count": 128, "checkpoint_seconds": 3,
@@ -127,9 +130,11 @@ def complete_cell(objective="standalone", gpus=1):
         "configuration": {"model_id": "Qwen/Qwen3-0.6B", "model_revision": MODEL_REVISION, "objective": objective, "gpus": gpus, "dispatch_mode": "bounded_async", "max_running_requests": 16, "async_queue_size": 32},
         "phases": [], "jobs": {"slurm_job_id": "123"},
     }
+    if replay_backend != "disabled":
+        cell["configuration"]["qwen_replay_backend"] = replay_backend
     for row in cell["screen_rows"] + cell["confirm_rows"]:
-        cell["phases"].append(phase_fixture(objective, gpus, "calibration", row["variant"], [row["batch_index"]], rows=[copy.deepcopy(row)]))
-    pilot = phase_fixture(objective, gpus, "pilot", "bounded_async16", [])
+        cell["phases"].append(phase_fixture(objective, gpus, "calibration", row["variant"], [row["batch_index"]], rows=[copy.deepcopy(row)], replay_backend=replay_backend))
+    pilot = phase_fixture(objective, gpus, "pilot", "bounded_async16", [], replay_backend=replay_backend)
     cell["checkpoint_provenance"] = pilot["measurement"]["checkpoint_provenance"]
     cell["phases"].append(pilot)
     sync_fixture_measurements(cell)
@@ -570,6 +575,114 @@ def submission_record():
         ],
         "state": "submitted",
     }
+
+
+def test_native_study_authenticates_all_four_objective_gpu_cells(tmp_path):
+    submission = {**submission_record(), "qwen_replay_backend": "native_fa3_v1"}
+    atomic_write_json(tmp_path / "submission.json", submission)
+    for job in submission["jobs"]:
+        cell = complete_cell(job["objective"], job["gpus"], replay_backend="native_fa3_v1")
+        cell["jobs"]["slurm_job_id"] = str(job["job_id"])
+        atomic_write_json(tmp_path / f"{job['objective']}-gpu{job['gpus']}" / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    assert report["input_errors"] == []
+    assert report["submission"]["qwen_replay_backend"] == "native_fa3_v1"
+    for cell in report["cells"]:
+        assert cell["status"] == "complete", cell.get("reason")
+        assert cell["estimate"] is not None
+        assert cell["measurement_authentication"]["qwen_replay_backend"] == "native_fa3_v1"
+        for phase in cell["phases"]:
+            config = phase["measurement"]["configuration"]
+            assert config["trainer"]["n_gpus_per_node"] == cell["gpus"]
+            assert config["actor_rollout_ref"]["rollout"]["n"] == (1 if cell["objective"] == "standalone" else 8)
+            assert config["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 1
+            assert config["actor_rollout_ref"]["actor"]["ppo_micro_batch_size_per_gpu"] == 2
+
+
+@pytest.mark.parametrize("requested,declared,accepted", [
+    (None, None, True), ("disabled", None, True), ("disabled", "disabled", True),
+    ("native_fa3_v1", "native_fa3_v1", True), ("native_fa3_v1", None, False),
+    ("native_fa3_v1", "disabled", False), (None, "native_fa3_v1", False),
+    ("disabled", "native_fa3_v1", False),
+])
+def test_study_backend_is_bound_to_submission_and_cell(tmp_path, requested, declared, accepted):
+    submission = submission_record()
+    if requested is not None:
+        submission["qwen_replay_backend"] = requested
+    cell = complete_cell(replay_backend=declared or "disabled")
+    if declared is not None:
+        cell["configuration"]["qwen_replay_backend"] = declared
+    cell["jobs"]["slurm_job_id"] = str(submission["jobs"][0]["job_id"])
+    atomic_write_json(tmp_path / "submission.json", submission)
+    atomic_write_json(tmp_path / "cell.json", cell)
+    observed = aggregate_cells(tmp_path)["cells"][0]
+    assert observed["status"] == ("complete" if accepted else "incomplete"), observed.get("reason")
+    if not accepted:
+        assert observed["estimate"] is None
+        assert "qwen_replay_backend" in observed["reason"]
+
+
+@pytest.mark.parametrize("phase_index", [0, 4, 6])  # Screening, confirmation, and training.
+@pytest.mark.parametrize("section", ["model", "rollout"])
+@pytest.mark.parametrize("wrong_backend", [None, "disabled"])
+def test_native_study_rejects_resealed_backend_mismatches_in_every_phase(tmp_path, phase_index, section, wrong_backend):
+    from verl.opd.provenance import build_checkpoint_provenance
+
+    submission = {**submission_record(), "qwen_replay_backend": "native_fa3_v1"}
+    cell = complete_cell(replay_backend="native_fa3_v1")
+    cell["jobs"]["slurm_job_id"] = str(submission["jobs"][0]["job_id"])
+    measured = cell["phases"][phase_index]["measurement"]
+    config = measured["configuration"]["actor_rollout_ref"][section]
+    if wrong_backend is None:
+        del config["qwen_replay_backend"]
+    else:
+        config["qwen_replay_backend"] = wrong_backend
+    measured["checkpoint_provenance"] = build_checkpoint_provenance(
+        measured["configuration"], source_commit="b" * 40,
+        environment_identity=measured["checkpoint_provenance"]["environment"])
+    if phase_index == 6:
+        cell["checkpoint_provenance"] = copy.deepcopy(measured["checkpoint_provenance"])
+    seal_fixture_phases(cell)
+    atomic_write_json(tmp_path / "submission.json", submission)
+    atomic_write_json(tmp_path / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    observed = report["cells"][0]
+    assert observed["status"] == "incomplete" and observed["estimate"] is None
+    assert "qwen_replay_backend" in observed["reason"]
+    assert report["input_errors"]
+    assert not observed.get("measurement_authentication")
+
+
+def test_native_study_failed_phase_cannot_authenticate_undeclared_execution(tmp_path):
+    submission = {**submission_record(), "qwen_replay_backend": "native_fa3_v1"}
+    cell = complete_cell(replay_backend="native_fa3_v1")
+    cell["jobs"]["slurm_job_id"] = str(submission["jobs"][0]["job_id"])
+    append_failed_fixture_phase(cell, "pilot", status="failed", error="RuntimeError: replay failed")
+    cell.update(status="incomplete", error="RuntimeError: pilot exited")
+    atomic_write_json(tmp_path / "submission.json", submission)
+    atomic_write_json(tmp_path / "cell.json", cell)
+    observed = aggregate_cells(tmp_path)["cells"][0]
+    assert observed["status"] == "incomplete" and observed["estimate"] is None
+    assert "qwen_replay_backend" in observed["reason"]
+    assert not observed.get("measurement_authentication")
+
+
+@pytest.mark.parametrize("invalid", [None, True, {}, "native_fa3"])
+def test_study_rejects_invalid_explicit_requested_backend(tmp_path, invalid):
+    submission = {**submission_record(), "qwen_replay_backend": invalid}
+    atomic_write_json(tmp_path / "submission.json", submission)
+    report = aggregate_cells(tmp_path)
+    assert report["submission"] is None
+    assert "qwen_replay_backend" in report["input_errors"][0]["error"]
+    assert all(cell["estimate"] is None for cell in report["cells"])
+
+
+def test_native_study_pending_receipt_preserves_backend_without_an_estimate(tmp_path):
+    submission = {**submission_record(), "qwen_replay_backend": "native_fa3_v1"}
+    atomic_write_json(tmp_path / "submission.json", submission)
+    report = aggregate_cells(tmp_path)
+    assert report["submission"]["qwen_replay_backend"] == "native_fa3_v1"
+    assert all(cell["estimate"] is None for cell in report["cells"])
 
 
 def test_pending_submission_retains_job_source_and_registry_identity_without_measurements(tmp_path):

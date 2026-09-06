@@ -432,8 +432,52 @@ def test_repair_pilot_cli_requires_explicit_thirty_minute_cap(monkeypatch, tmp_p
                         "--objective", "standalone", "--gpus", "2", "--repair-pilot", "bounded_async32"])
 
 
+@pytest.mark.parametrize("objective,gpus", [("standalone", 1), ("standalone", 2), ("hybrid", 1), ("hybrid", 2)])
+@pytest.mark.parametrize("backend", [None, "native_fa3_v1"])
+def test_full_study_cli_keeps_default_and_accepts_explicit_native_backend(monkeypatch, tmp_path, objective, gpus, backend):
+    observed = []
+    monkeypatch.setattr(benchmark, "CellRunner", lambda args: SimpleNamespace(run=lambda: observed.append(args)))
+    arguments = ["--root", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+                 "--objective", objective, "--gpus", str(gpus), "--time-limit-seconds", "7100"]
+    if backend is not None:
+        arguments += ["--qwen-replay-backend", backend]
+    benchmark.main(arguments)
+    assert len(observed) == 1
+    args = observed[0]
+    assert (args.objective, args.gpus, args.time_limit_seconds) == (objective, gpus, 7100)
+    assert args.qwen_replay_backend == (backend or "disabled")
+    assert args.repair_pilot is None
+
+
+@pytest.mark.parametrize("repair,seconds", [(False, 7201), (True, 1801)])
+def test_native_cli_preserves_full_study_and_repair_time_bounds(monkeypatch, tmp_path, repair, seconds):
+    monkeypatch.setattr(benchmark, "CellRunner", lambda args: pytest.fail("oversized allocation initialized"))
+    arguments = ["--root", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+                 "--objective", "standalone", "--gpus", "1", "--time-limit-seconds", str(seconds),
+                 "--qwen-replay-backend", "native_fa3_v1"]
+    if repair:
+        arguments += ["--repair-pilot", "bounded_async32"]
+    with pytest.raises(SystemExit):
+        benchmark.main(arguments)
+
+
+@pytest.mark.parametrize("backend", ["disabled", "native_fa3_v1"])
+def test_cell_initial_metadata_records_requested_backend(monkeypatch, tmp_path, backend):
+    from opd_tools import qwen_training
+
+    monkeypatch.setattr(qwen_training, "verify", lambda root: {})
+    monkeypatch.setattr(benchmark, "source_identity", lambda root: {"fork_commit": "b" * 40})
+    args = SimpleNamespace(root=tmp_path / "assets", output_dir=tmp_path / "cell", objective="hybrid", gpus=2,
+                           time_limit_seconds=7100, qwen_replay_backend=backend)
+    instance = benchmark.CellRunner(args)
+    assert instance.cell["configuration"]["qwen_replay_backend"] == backend
+    assert json.loads((args.output_dir / "cell.json").read_text())["configuration"]["qwen_replay_backend"] == backend
+
+
+@pytest.mark.parametrize("backend", ["disabled", "native_fa3_v1"])
 @pytest.mark.parametrize("outcome", ["complete", "timeout", "exit_failure", "bad_json", "wrong_identity"])
-def test_phase_preserves_partial_rows_authenticates_results_and_keeps_invocation_horizon(runner, monkeypatch, outcome):
+def test_phase_preserves_partial_rows_authenticates_results_and_keeps_invocation_horizon(runner, monkeypatch, outcome, backend):
+    runner.args.qwen_replay_backend = backend
     captured = {}
     def authenticate(measured, **kwargs):
         captured["authentication"] = kwargs
@@ -472,6 +516,7 @@ def test_phase_preserves_partial_rows_authenticates_results_and_keeps_invocation
     assert "trainer.max_rollout_iterations_per_invocation=3" in command
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=1" in command
     assert "actor_rollout_ref.rollout.async_queue_size=32" in command
+    assert ("actor_rollout_ref.model.qwen_replay_backend=native_fa3_v1" in command) == (backend == "native_fa3_v1")
     assert any(item.startswith("hydra.run.dir=" + str(runner.root)) for item in command)
     assert "hydra.job.chdir=false" in command
     assert captured["start_new_session"] is True

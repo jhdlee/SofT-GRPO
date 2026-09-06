@@ -293,12 +293,29 @@ def _validate_cell_provenance(cell: Mapping[str, Any], objective: str, gpus: int
         raise ValueError("timing validation must contain exactly 128 examples")
 
 
-def _study_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int]) -> list[str]:
+def _study_backend(record: Mapping[str, Any]) -> str:
+    """Missing historical request/cell fields denote the disabled backend."""
+    backend = record.get("qwen_replay_backend", "disabled")
+    if not isinstance(backend, str) or backend not in ("disabled", "native_fa3_v1"):
+        raise ValueError("study qwen_replay_backend must be disabled or native_fa3_v1")
+    return backend
+
+
+def _validate_study_backend(configuration: Mapping[str, Any], expected: str) -> None:
+    root = configuration.get("actor_rollout_ref", {})
+    for section in ("model", "rollout"):
+        observed = root.get(section, {}).get("qwen_replay_backend", "disabled")
+        if observed != expected:
+            raise ValueError(f"study phase configuration differs at actor_rollout_ref.{section}.qwen_replay_backend")
+
+
+def _study_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int], *, replay_backend: str = "disabled") -> list[str]:
     """Authenticate the original study contract without requiring newer fields."""
-    return _profile_phase_overrides(objective, gpus, phase, variant, batches, historical=True)
+    return _profile_phase_overrides(objective, gpus, phase, variant, batches,
+                                    historical=replay_backend == "disabled", replay_backend=replay_backend)
 
 
-def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gpus: int) -> dict[str, Any]:
+def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gpus: int, *, submission: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Bind duplicated rollout and pilot summaries to their authenticated phase.
 
     This also runs for failed cells: their completed calibration measurements
@@ -308,6 +325,9 @@ def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gp
     from .training_benchmark import validate_phase_measurement
 
     _validate_cell_identity(cell, objective, gpus)
+    backend = _study_backend(cell["configuration"])
+    if submission is not None and backend != _study_backend(submission):
+        raise ValueError("cell qwen_replay_backend differs from submission request")
     phases = cell.get("phases", [])
     if not isinstance(phases, list) or any(not isinstance(phase, Mapping) for phase in phases):
         raise ValueError("study phases must be a list of mappings")
@@ -333,8 +353,9 @@ def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gp
         encoded = json.dumps(measured, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
         if phase.get("sha256") != hashlib.sha256(encoded).hexdigest():
             raise ValueError("study phase measurement SHA-256 differs from its embedded canonical bytes")
+        _validate_study_backend(measured.get("configuration", {}), backend)
         validate_phase_measurement(measured, phase=kind, variant=variant, batches=batches,
-                                   overrides=_study_phase_overrides(objective, gpus, kind, variant, batches),
+                                   overrides=_study_phase_overrides(objective, gpus, kind, variant, batches, replay_backend=backend),
                                    source=cell["source"], assets=cell["assets"], run_id=run_id)
         _completion_gate_enabled(measured["configuration"])
         if phase.get("authenticated") is not True:
@@ -374,7 +395,7 @@ def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gp
             raise ValueError("complete study is missing the requested dispatch confirmation")
         if pilot["variant"] != selection["selected_variant"]:
             raise ValueError("training pilot dispatch differs from authenticated selection")
-    return {"phase_count": len(phases), "pilot_present": pilot is not None}
+    return {"phase_count": len(phases), "pilot_present": pilot is not None, "qwen_replay_backend": backend}
 
 
 def _read_submission(path: Path) -> dict[str, Any]:
@@ -389,6 +410,7 @@ def _read_submission(path: Path) -> dict[str, Any]:
         raise ValueError("submission must identify the submitted Qwen3 training benchmark")
     if not isinstance(record.get("submission_id"), str) or not record["submission_id"]:
         raise ValueError("submission_id is missing")
+    _study_backend(record)
     snapshot = record.get("source_snapshot")
     if not isinstance(snapshot, str) or not snapshot or not Path(snapshot).is_absolute():
         raise ValueError("submission source_snapshot must be an absolute path")
@@ -538,7 +560,7 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
                     _match_submission_identity(raw, submission, submitted_job)
                     cell["submission_identity_matches"] = True
                 try:
-                    cell["measurement_authentication"] = _authenticate_study_measurements(raw, objective, gpus)
+                    cell["measurement_authentication"] = _authenticate_study_measurements(raw, objective, gpus, submission=submission)
                     cell["dispatch_selection"] = select_dispatch(raw.get("screen_rows", []), raw.get("confirm_rows", []))
                 except (ValueError, TypeError, KeyError, AttributeError, RuntimeError) as error:
                     cell["measurement_authentication_error"] = str(error)

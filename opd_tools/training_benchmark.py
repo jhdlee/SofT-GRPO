@@ -247,7 +247,8 @@ class CellRunner:
             "schema_version": 1, "profile": "qwen3-training-benchmark-v1",
             "objective": args.objective, "gpus": args.gpus, "status": "running",
             "source": self.source, "assets": self.assets,
-            "configuration": {"model_id": MODEL_ID, "model_revision": MODEL_REVISION, "objective": args.objective, "gpus": args.gpus, "tensor_parallel_size": 1, "rollout_iterations": 109, "time_limit_seconds": args.time_limit_seconds, "variants": VARIANT_CONFIGS},
+            "configuration": {"model_id": MODEL_ID, "model_revision": MODEL_REVISION, "objective": args.objective, "gpus": args.gpus, "tensor_parallel_size": 1, "rollout_iterations": 109, "time_limit_seconds": args.time_limit_seconds, "variants": VARIANT_CONFIGS,
+                              "qwen_replay_backend": getattr(args, "qwen_replay_backend", "disabled")},
             "jobs": {"slurm_job_id": os.environ.get("SLURM_JOB_ID"), "account": os.environ.get("SLURM_JOB_ACCOUNT")},
             "wandb_run_ids": [], "screen_rows": [], "confirm_rows": [], "iterations": [], "phases": [],
         }
@@ -418,14 +419,12 @@ def main(argv=None):
     parser.add_argument("--repair-pilot", choices=tuple(VARIANT_CONFIGS), default=None,
                         help="Run only the strict three-iteration pilot; no dispatch-study estimate")
     parser.add_argument("--qwen-replay-backend", choices=("disabled", "native_fa3_v1"), default="disabled",
-                        help="Versioned common inference/replay arithmetic; opt-in repair pilot only")
+                        help="Versioned common inference/replay arithmetic for the full study or repair pilot")
     args = parser.parse_args(argv)
     if not 60 <= args.time_limit_seconds <= 7200:
         parser.error("benchmark time limit must remain within two hours")
     if args.repair_pilot is not None and args.time_limit_seconds > 1800:
         parser.error("repair validation must be explicitly capped at thirty minutes")
-    if args.qwen_replay_backend != "disabled" and args.repair_pilot is None:
-        parser.error("native replay arithmetic currently requires --repair-pilot")
     CellRunner(args).run()
 
 
