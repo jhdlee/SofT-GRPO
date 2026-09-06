@@ -360,9 +360,9 @@ def _measurement_failure(cell: Mapping[str, Any]) -> tuple[dict[str, Any] | None
             continue
         failure = measured.get("failure")
         if isinstance(failure, Mapping) and failure.get("error"):
-            return dict(failure), measured
+            return dict(failure), {"phase": phase.get("phase"), **measured}
         if measured.get("status") == "failed" and isinstance(measured.get("error"), str):
-            return {"status": "failed", "stage": phase.get("phase", "unknown"), "error": measured["error"]}, measured
+            return {"status": "failed", "stage": phase.get("phase", "unknown"), "error": measured["error"]}, {"phase": phase.get("phase"), **measured}
     return None, {}
 
 
@@ -416,15 +416,20 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
             cell.update({"objective": objective, "gpus": gpus, "status": "incomplete", "estimate": None, "input_path": str(path), "measurement_status": raw.get("status")})
             cell["dispatch_selection"] = select_dispatch(raw.get("screen_rows", []), raw.get("confirm_rows", []))
             failure, failed_measurement = _measurement_failure(raw)
+            parent_error = raw.get("error") or raw.get("reason")
+            cell["parent_error"] = parent_error if isinstance(parent_error, str) else None
+            cell["child_error"] = failure.get("error") if failure is not None else None
+            cell["primary_error_origin"] = None
             if failure is not None:
                 cell["failure"] = failure
                 cell["failure_status"] = failure.get("status", "failed")
                 # Startup remains an observed measurement even if replay fails
                 # before the first completed training iteration is recorded.
-                if cell.get("startup_seconds") is None and "startup_seconds" in failed_measurement:
-                    cell["startup_seconds"] = failed_measurement["startup_seconds"]
-                if "failed_iterations" in failed_measurement:
-                    cell["failed_iterations"] = failed_measurement["failed_iterations"]
+                if failed_measurement.get("phase") == "pilot":
+                    if cell.get("startup_seconds") is None and "startup_seconds" in failed_measurement:
+                        cell["startup_seconds"] = failed_measurement["startup_seconds"]
+                    if "failed_iterations" in failed_measurement:
+                        cell["failed_iterations"] = failed_measurement["failed_iterations"]
             try:
                 if submission_error is not None:
                     raise ValueError("submission identity invalid: " + submission_error)
@@ -432,7 +437,21 @@ def aggregate_cells(input_root: Path | str) -> dict[str, Any]:
                     cell["submission_identity_matches"] = False
                     _match_submission_identity(raw, submission, submitted_job)
                     cell["submission_identity_matches"] = True
+                    # CellRunner serializes the actual exception type in error.
+                    # A deadline can terminate the child with generic SystemExit;
+                    # free-form reason/child text must not acquire this priority.
+                    controller_error = raw.get("error")
+                    if isinstance(controller_error, str):
+                        exception_type, separator, _ = controller_error.partition(": ")
+                        if (raw["source"].get("snapshot_verified") is True and separator
+                                and exception_type in ("TimeoutExpired", "TimeoutError")):
+                            cell["primary_error_origin"] = "parent_timeout"
+                            reason = ("cell phase exceeded remaining time budget (TimeoutExpired)"
+                                      if exception_type == "TimeoutExpired" else
+                                      "cell controller timed out or was interrupted (TimeoutError)")
+                            raise ValueError(reason)
                 if failure is not None:
+                    cell["primary_error_origin"] = "child_measurement"
                     raise ValueError(f"{failure.get('status', 'failed')} at {failure.get('stage', 'unknown')}: {failure['error']}")
                 if raw.get("status") not in ("complete", "completed"):
                     raise ValueError(raw.get("reason") or f"benchmark status is {raw.get('status', 'missing')}")
@@ -761,6 +780,11 @@ def _failure_measurement_lines(cell: Mapping[str, Any]) -> list[str]:
     details = failure.get("diagnostics", {})
     worst = details.get("worst_positions", [])
     lines = []
+    if cell.get("parent_error") and cell.get("child_error"):
+        if cell.get("primary_error_origin") == "parent_timeout":
+            lines.append(f"Child measurement error: {_markdown_value(cell['child_error'])}.")
+        else:
+            lines.append(f"Parent controller error: {_markdown_value(cell['parent_error'])}.")
     if failure.get("optimizer_updates_completed") is False:
         lines.append("The rejected iteration completed no optimizer updates. Partial timings are excluded from the training runtime estimate.")
     if worst:

@@ -523,6 +523,88 @@ def test_old_failed_phases_surface_actual_error_without_new_diagnostic_fields(tm
     assert measured["estimate"] is None
 
 
+@pytest.mark.parametrize("exception_type,detail", [
+    ("TimeoutExpired", "Command '['python', '-m', 'verl.trainer.main_ppo', 'full_private_cli']' exceeded the cell deadline"),
+    ("TimeoutError", "trainer exceeded the cell allocation deadline"),
+    ("TimeoutError", "received signal 15; no additional allocation requested"),
+])
+def test_authenticated_parent_timeout_keeps_child_shutdown_error_separate(tmp_path, exception_type, detail):
+    cell = complete_cell("hybrid", 1)
+    parent_error = f"{exception_type}: {detail}"
+    cell.update(status="incomplete", error=parent_error, reason=parent_error, iterations=[],
+                jobs={"slurm_job_id": "102"})
+    del cell["startup_seconds"]
+    cell["phases"].append({"phase": "calibration", "status": "incomplete", "authenticated": True,
+                           "measurement": {"phase": "calibration", "status": "failed", "error": "SystemExit: 1",
+                                           "startup_seconds": 51, "failed_iterations": [{"stage": "calibration"}]}})
+    atomic_write_json(tmp_path / "submission.json", submission_record())
+    atomic_write_json(tmp_path / "cell.json", cell)
+
+    report = aggregate_cells(tmp_path)
+    measured = report["cells"][2]
+    assert measured["submission_identity_matches"] is True
+    assert measured["parent_error"] == parent_error
+    expected_reason = ("cell phase exceeded remaining time budget (TimeoutExpired)"
+                       if exception_type == "TimeoutExpired" else
+                       "cell controller timed out or was interrupted (TimeoutError)")
+    assert measured["reason"] == expected_reason
+    assert measured["primary_error_origin"] == "parent_timeout"
+    assert measured["child_error"] == measured["failure"]["error"] == "SystemExit: 1"
+    assert measured["status"] == "incomplete" and measured["estimate"] is None
+    assert measured["iterations"] == []
+    assert measured.get("startup_seconds") is None
+    assert "failed_iterations" not in measured
+    assert measured["phases"][-1]["measurement"]["startup_seconds"] == 51
+    assert measured["phases"][-1]["measurement"]["failed_iterations"] == [{"stage": "calibration"}]
+    markdown = render_markdown(report)
+    assert expected_reason in markdown
+    if exception_type == "TimeoutError":
+        assert "exceeded remaining time budget" not in markdown
+    assert "full_private_cli" not in markdown
+    assert "Child measurement error: SystemExit: 1" in markdown
+
+
+@pytest.mark.parametrize("change", [
+    "reason_only", "nested_type", "different_type", "no_separator",
+    "unverified_snapshot", "no_submission", "job_mismatch", "invalid_submission",
+])
+def test_timeout_text_cannot_override_child_error_without_exact_type_and_identity(tmp_path, change):
+    cell = complete_cell("hybrid", 1)
+    parent_error = "TimeoutExpired: trainer exceeded the cell allocation deadline"
+    cell.update(status="incomplete", error=parent_error, reason=parent_error, iterations=[],
+                jobs={"slurm_job_id": "102"})
+    cell["phases"].append({"phase": "calibration", "status": "incomplete", "authenticated": True,
+                           "measurement": {"status": "failed", "error": "SystemExit: 1"}})
+    submission = submission_record()
+    if change == "reason_only":
+        del cell["error"]
+    elif change == "nested_type":
+        cell["error"] = "RuntimeError: nested TimeoutExpired: deadline text"
+    elif change == "different_type":
+        cell["error"] = "CustomTimeoutError: deadline text"
+    elif change == "no_separator":
+        cell["error"] = "TimeoutExpired"
+    elif change == "unverified_snapshot":
+        cell["source"]["snapshot_verified"] = False
+    elif change == "job_mismatch":
+        cell["jobs"]["slurm_job_id"] = "999"
+    elif change == "invalid_submission":
+        submission["fork_commit"] = "invalid"
+    if change != "no_submission":
+        atomic_write_json(tmp_path / "submission.json", submission)
+    atomic_write_json(tmp_path / "cell.json", cell)
+
+    measured = aggregate_cells(tmp_path)["cells"][2]
+    assert measured["primary_error_origin"] != "parent_timeout"
+    assert measured["parent_error"] == cell.get("error", cell["reason"])
+    assert measured["child_error"] == "SystemExit: 1"
+    assert measured["estimate"] is None
+    if change in ("job_mismatch", "invalid_submission"):
+        assert "submission identity" in measured["reason"]
+    else:
+        assert measured["reason"] == "failed at calibration: SystemExit: 1"
+
+
 def repair_submission(tmp_path):
     return {"schema_version": 1, "role": "repair_validation", "state": "submitted", "submission_id": "repair-123",
             "job_id": 123, "objective": "standalone", "gpus": 2, "time_limit_seconds": 1800,
