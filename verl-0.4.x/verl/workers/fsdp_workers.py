@@ -677,6 +677,13 @@ class ActorRolloutRefWorker(Worker):
         data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
+        # Recompute runs in a separate RPC.  Its input metadata mutations do
+        # not reach this call, and standalone OPD intentionally discards its
+        # old-policy output.  Set the sampling contract at the update boundary,
+        # using the same authoritative rollout config as compute_log_prob.
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["add_noise_dirichlet"] = self.config.rollout.add_noise_dirichlet
+        data.meta_info["add_noise_gumbel_softmax"] = self.config.rollout.add_noise_gumbel_softmax
         data.meta_info["continuous_replay"] = bool(
             self.config.rollout.get("enable_soft_thinking", True)
         )
