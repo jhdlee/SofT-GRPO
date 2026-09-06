@@ -2374,6 +2374,9 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         iterations_this_invocation = 0
+        # Capacity checks persist the last stage before an expensive RPC. The
+        # ordinary trainer and existing three-iteration benchmark have no hook.
+        capacity_stage = getattr(self, "record_capacity_stage", lambda *args, **kwargs: None)
         invocation_limit = self.config.trainer.get("max_rollout_iterations_per_invocation", None)
         if invocation_limit is not None:
             invocation_limit = int(invocation_limit)
@@ -2417,6 +2420,7 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 iteration_started_at = time.perf_counter()
+                capacity_stage("generation", rollout_iteration, timing_raw, metrics, gen_batch.meta_info)
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
@@ -2427,6 +2431,7 @@ class RayPPOTrainer:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
 
+                    capacity_stage("tensor_assembly", rollout_iteration, timing_raw, metrics, gen_batch_output.meta_info)
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -2455,6 +2460,8 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    if hasattr(self, "record_capacity_stage"):
+                        batch.meta_info["capacity_rollout_trajectory_count"] = int(batch.batch["responses"].shape[0])
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -2468,6 +2475,7 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    capacity_stage("reward", rollout_iteration, timing_raw, metrics, batch.meta_info)
                     with _timer("reward", timing_raw):
                         # compute reward model score
                         if self.use_rm:
@@ -2489,6 +2497,7 @@ class RayPPOTrainer:
                         batch.meta_info["collect_replay_diagnostics"] = True
                         batch.meta_info["replay_diagnostics_close_tag_id"] = self.close_tag_token_id
                     replay_started_at = time.perf_counter()
+                    capacity_stage("old_log_prob", rollout_iteration, timing_raw, metrics, batch.meta_info)
                     with _timer("old_log_prob", timing_raw):
                         try:
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -2617,6 +2626,7 @@ class RayPPOTrainer:
                             )
                         raise error
 
+                    capacity_stage("replay_acceptance", rollout_iteration, timing_raw, metrics, batch.meta_info)
                     self._validate_benchmark_before_update(
                         batch=batch, diagnostics=rollout_diagnostics,
                         replay_error=replay_error, actor_log_probs=actor_old_log_probs,
@@ -2626,6 +2636,7 @@ class RayPPOTrainer:
                     )
 
                     if self.use_reference_policy:
+                        capacity_stage("reference_scoring", rollout_iteration, timing_raw, metrics, batch.meta_info)
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
                             if not self.ref_in_actor:
@@ -2640,6 +2651,7 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    capacity_stage("advantages", rollout_iteration, timing_raw, metrics, batch.meta_info)
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -2728,6 +2740,7 @@ class RayPPOTrainer:
                                     config=self.rollout_integrity_config,
                                 )
                         # update actor
+                        capacity_stage("update_actor", rollout_iteration, timing_raw, metrics, batch.meta_info, update_state="outcome_unknown")
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             batch.meta_info['add_noise_dirichlet'] = self.config.actor_rollout_ref.rollout.add_noise_dirichlet
@@ -2737,6 +2750,7 @@ class RayPPOTrainer:
                             batch.meta_info["actor_update_timing"] = actor_output.meta_info["actor_update_timing"]
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        capacity_stage("full_dose_gradient_gate", rollout_iteration, timing_raw, metrics, batch.meta_info, update_state="completed")
                         validate_full_dose_gradient_integrity(
                             actor_output_metrics,
                             self.rollout_integrity_config,
@@ -2816,6 +2830,7 @@ class RayPPOTrainer:
                                 selection_tiebreak_metric_value = float(
                                     candidate_tiebreak
                                 )
+                        capacity_stage("checkpoint", rollout_iteration, timing_raw, metrics, batch.meta_info)
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint(
                                 rollout_batch=batch,
@@ -2850,6 +2865,7 @@ class RayPPOTrainer:
                             _consume_requeue_request(requeue_signal_file)
 
                 # training metrics
+                capacity_stage("iteration_metrics", rollout_iteration, timing_raw, metrics, batch.meta_info)
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
