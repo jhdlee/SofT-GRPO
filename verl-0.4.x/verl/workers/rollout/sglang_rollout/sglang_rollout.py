@@ -235,10 +235,24 @@ def _post_process_outputs(tokenizer, output, *, require_retained_support=False):
         output_token_logprobs = resp["meta_info"]["output_token_logprobs"]
         output_topk_gumbel_list = resp["meta_info"]["output_topk_gumbel_list"]
         output_topk_idx_list = resp["meta_info"]["output_topk_idx_list"]
+        if not output_token_logprobs:
+            raise RuntimeError("rollout completion contains no response actions")
         log_probs, output_token_ids = zip(*[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs])
-        # print(torch.tensor(output_token_ids).size(), torch.tensor(log_probs).size(), torch.tensor(output_topk_idx_list).size(), torch.tensor(output_topk_gumbel_list).size())
-        return torch.tensor(output_token_ids), torch.tensor(log_probs), torch.tensor(
-            output_topk_idx_list), torch.tensor(output_topk_gumbel_list)
+        response = torch.tensor(output_token_ids)
+        supports = torch.tensor(output_topk_idx_list)
+        perturbations = torch.tensor(output_topk_gumbel_list)
+        if (response.ndim != 1 or supports.ndim != 2 or supports.shape[1] < 1
+                or supports.shape[0] != response.numel() or perturbations.shape != supports.shape):
+            raise RuntimeError("response IDs, supports, and perturbations must align for every action")
+        if response.dtype != torch.int64 or supports.dtype != torch.int64:
+            raise RuntimeError("response and support IDs must be integers")
+        # The native sampler sorts by action weight, then reports the first
+        # support ID as its response token (also for categorical rewrites).
+        if not torch.equal(response, supports[:, 0]):
+            raise RuntimeError("response IDs disagree with the native action support")
+        if "output_ids" in resp and resp["output_ids"] != list(output_token_ids):
+            raise RuntimeError("response IDs disagree with the native output IDs")
+        return response, torch.tensor(log_probs), supports, perturbations
 
     out_map = map(lambda x: _map_each_response(x), output)
     batched_output_topk_ids = []

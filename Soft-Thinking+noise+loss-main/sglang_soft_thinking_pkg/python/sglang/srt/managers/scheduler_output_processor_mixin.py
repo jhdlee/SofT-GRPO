@@ -265,7 +265,9 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_logprobs_val.append(next_token_gumbel_logprobs[i])
                 else:
                     req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
+                # Entropy stopping may have rewritten this action to </think>.
+                # Export its emitted ID while retaining the released density.
+                req.output_token_logprobs_idx.append(req.output_ids[-1])
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs_val.append(
                         logits_output.next_token_top_logprobs_val[i]
@@ -454,7 +456,8 @@ class SchedulerOutputProcessorMixin:
             req.output_token_logprobs_val.append(output.next_token_gumbel_logprobs[i])
         else:
             req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        # The prefill caller also applies any close-token rewrite first.
+        req.output_token_logprobs_idx.append(req.output_ids[-1])
 
         self.add_input_logprob_return_values(
             i, req, output, pt, num_input_logprobs, last_prefill_chunk=True

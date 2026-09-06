@@ -448,6 +448,50 @@ def test_required_filter_metadata_failure_retires_entire_rollout(field):
 
 
 @pytest.mark.parametrize("mode", dispatch.DISPATCH_MODES)
+@pytest.mark.parametrize("defect", [
+    "response_support_disagreement", "output_id_disagreement", "support_length",
+    "perturbation_length", "noninteger_ids", "empty_response",
+])
+def test_contradictory_action_metadata_retires_entire_rollout(mode, defect):
+    class MalformedActions(Engine):
+        async def async_generate(self, **kwargs):
+            output = await super().async_generate(**kwargs)
+            row = output[0] if isinstance(output, list) else output
+            metadata = row["meta_info"]
+            if defect == "response_support_disagreement":
+                metadata["output_topk_idx_list"][0][0] += 1
+            elif defect == "output_id_disagreement":
+                row["output_ids"] = [999]
+            elif defect == "support_length":
+                metadata["output_topk_idx_list"].pop()
+            elif defect == "perturbation_length":
+                metadata["output_topk_gumbel_list"].pop()
+            elif defect == "noninteger_ids":
+                metadata["output_topk_idx_list"][0][0] += 0.5
+            else:
+                metadata["output_token_logprobs"] = []
+            return output
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        adapter = load_adapter()
+        adapter.config.dispatch_mode = mode
+        adapter.config.require_retained_support = True
+        adapter._engine = MalformedActions()
+        with pytest.raises(RuntimeError, match="collective tensor assembly"):
+            adapter._batch_level_generate_sequences(prompts())
+        assert not adapter._engine._opd_batch_outstanding
+        assert adapter._engine.shutdown_calls == 1
+        assert adapter._engine.flush_calls == 0
+        with pytest.raises(RuntimeError, match="poisoned"):
+            dispatch.require_idle_engine(adapter._engine)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+@pytest.mark.parametrize("mode", dispatch.DISPATCH_MODES)
 def test_actual_engine_transitions_reject_outstanding_dispatch(mode):
     tree = ast.parse((ROLLOUT / "sglang_rollout.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AsyncEngine")
