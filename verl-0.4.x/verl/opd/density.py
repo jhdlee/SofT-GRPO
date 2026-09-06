@@ -41,7 +41,17 @@ def fixed_support_gumbel_log_probs(
     # SGLang promotes logits to FP32 before sampling. Work on just the recorded
     # support: the full-vocabulary normalizer cancels, and arbitrary filler
     # logits must have neither probability mass nor a gradient.
-    support_logits = logits.float().gather(-1, rollout_topk_ids)
+    # Gather before promotion: casting the packed full-vocabulary matrix first
+    # creates a multi-GiB FP32 temporary for long Qwen responses. Recorded top-k
+    # IDs are unique on retained entries; repeated padding IDs are masked out.
+    # Preserve the previous FP32 gradient accumulation for callers supplying
+    # duplicate *retained* IDs, which do not occur in generated top-k supports.
+    sorted_retained = rollout_topk_ids.masked_fill(~rollout_topk_retained_mask, -1).sort(dim=-1).values
+    duplicate_retained = (sorted_retained[..., 1:] == sorted_retained[..., :-1]) & (sorted_retained[..., 1:] >= 0)
+    if bool(duplicate_retained.any()):
+        support_logits = logits.float().gather(-1, rollout_topk_ids)
+    else:
+        support_logits = logits.gather(-1, rollout_topk_ids).float()
     support_logits = support_logits.masked_fill(~rollout_topk_retained_mask, -torch.inf)
     support_log_probs = (torch.softmax(support_logits, dim=-1) + 1e-6).log()
     reparameterized = (rollout_topk_gumbels.detach().float() - support_log_probs).clamp(-1.5, 3.0)

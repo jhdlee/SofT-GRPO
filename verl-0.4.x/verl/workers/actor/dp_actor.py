@@ -493,11 +493,15 @@ class DataParallelPPOActor(BasePPOActor):
                         latent_query_indices = torch.tensor(
                             latent_query_indices, dtype=torch.long, device=logits_rmpad.device
                         )
-                        selected_logits = logits_rmpad.index_select(0, latent_query_indices)
                         latent_support_ids = response_support[latent_mask]
                         gradient_info = {
                             "latent_mask": latent_mask,
-                            "support_logits": selected_logits.gather(-1, latent_support_ids).detach(),
+                            # Diagnostics need only the recorded support.  A
+                            # whole-vocabulary row selection duplicates GiBs
+                            # of actor logits for long replay microbatches.
+                            "support_logits": logits_rmpad.detach()[
+                                latent_query_indices.unsqueeze(-1), latent_support_ids
+                            ],
                             "support_gumbels": micro_batch["rollout_topk_gumbels"][:, -response_length:][latent_mask].detach(),
                             "retained_support_mask": (
                                 rollout_topk_retained_mask[:, -response_length:][latent_mask].detach()
@@ -508,6 +512,14 @@ class DataParallelPPOActor(BasePPOActor):
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
+                    # Standalone OPD differentiates its KL only.  Preserve
+                    # density values for the return contract without retaining
+                    # a second, unused policy-density autograd graph.
+                    density_logits = (
+                        logits_rmpad.detach()
+                        if compute_opd and self.opd_config.mode is ObjectiveMode.STANDALONE
+                        else logits_rmpad
+                    )
                     # log_probs = logprobs_from_logits(
                     #     logits=logits_rmpad,
                     #     labels=input_ids_rmpad_rolled,
@@ -515,13 +527,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # )
                     if not continuous_replay:
                         log_probs = logprobs_from_logits(
-                            logits=logits_rmpad,
+                            logits=density_logits,
                             labels=input_ids_rmpad_rolled,
                             inplace_backward=inplace_backward,
                         )
                     elif add_noise_gumbel_softmax:
                         log_probs = logprobs_from_logits_topk_gumbel(
-                            logits=logits_rmpad,
+                            logits=density_logits,
                             rollout_topk_ids=topk_ids_rmpad_rolled,
                             rollout_topk_gumbels=topk_gumbels_rmpad_rolled,
                             labels=input_ids_rmpad_rolled,
@@ -530,7 +542,7 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     elif add_noise_dirichlet:
                         log_probs = logprobs_from_logits_topk_dirichlet(
-                            logits=logits_rmpad,
+                            logits=density_logits,
                             rollout_topk_ids=topk_ids_rmpad_rolled,
                             rollout_topk_gumbels=topk_gumbels_rmpad_rolled,
                             labels=input_ids_rmpad_rolled,
@@ -538,7 +550,7 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     else:
                         log_probs = logprobs_from_logits_topk_normal(
-                            logits=logits_rmpad,
+                            logits=density_logits,
                             rollout_topk_ids=topk_ids_rmpad_rolled,
                             rollout_topk_gumbels=topk_gumbels_rmpad_rolled,
                             labels=input_ids_rmpad_rolled,

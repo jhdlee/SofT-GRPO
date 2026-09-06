@@ -12,7 +12,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from .config import OPDConfig
 from .chat import render_training_prompt, validate_training_reasoning_tokens
-from .losses import full_vocab_kl
+from .losses import full_vocab_kl_with_statistics
 from .prompts import render_privileged_prompt
 from .chat import QWEN3_TRAINING_PROFILE
 
@@ -294,7 +294,7 @@ class PrivilegedReplay:
                 "student/teacher latent-query alignment differs: "
                 f"student={tuple(selected_student.shape)}, teacher={tuple(teacher_logits.shape)}"
             )
-        token_kl = full_vocab_kl(
+        token_kl, student_normalizer, teacher_normalizer, entropy = full_vocab_kl_with_statistics(
             selected_student,
             teacher_logits,
             direction=self.config.kl_direction,
@@ -307,29 +307,36 @@ class PrivilegedReplay:
         flat_answer = answer_mask[replay_mask]
         if latent_support_ids.ndim != 2 or latent_support_ids.shape[0] != int(flat_latent.sum().item()):
             raise ValueError("latent_support_ids must provide one support row per latent query")
+        if latent_support_ids.dtype != torch.long:
+            raise TypeError("latent_support_ids must use torch.long token IDs")
+        if bool(((latent_support_ids < 0) | (latent_support_ids >= selected_student.shape[-1])).any().item()):
+            raise ValueError("latent_support_ids contain an out-of-vocabulary token ID")
         if latent_support_ids.device != selected_student.device:
             latent_support_ids = latent_support_ids.to(selected_student.device)
-        latent_student = selected_student[flat_latent]
-        latent_teacher = teacher_logits[flat_latent]
-        latent_token_kl = token_kl[flat_latent]
-        student_logp = torch.log_softmax(
-            latent_student.float() / self.config.temperature,
-            dim=-1,
-        )
-        teacher_logp = torch.log_softmax(
-            latent_teacher.float() / self.config.temperature,
-            dim=-1,
-        )
-        support_student_logp = student_logp.gather(-1, latent_support_ids)
-        support_teacher_logp = teacher_logp.gather(-1, latent_support_ids)
-        if self.config.kl_direction.value == "teacher_to_student":
-            opd_support_gradient = (
-                support_student_logp.exp() - support_teacher_logp.exp()
-            ) / self.config.temperature
-        else:
-            opd_support_gradient = support_student_logp.exp() * (
-                support_student_logp - support_teacher_logp - latent_token_kl.unsqueeze(-1)
-            ) / self.config.temperature
+        # Gather only the small continuous-action supports.  Advanced row
+        # selection followed by a dense log_softmax would copy latent×vocab
+        # logits and retain FP32 diagnostic graphs until the update finishes.
+        # These diagnostics are deliberately detached from the training loss.
+        with torch.no_grad():
+            latent_rows = torch.nonzero(flat_latent, as_tuple=False).flatten()
+            support_student_logits = selected_student[latent_rows.unsqueeze(-1), latent_support_ids]
+            support_teacher_logits = teacher_logits[latent_rows.unsqueeze(-1), latent_support_ids]
+            support_student_logp = (
+                support_student_logits.float() / self.config.temperature
+                - student_normalizer[flat_latent].unsqueeze(-1)
+            )
+            support_teacher_logp = (
+                support_teacher_logits.float() / self.config.temperature
+                - teacher_normalizer[flat_latent].unsqueeze(-1)
+            )
+            if self.config.kl_direction.value == "teacher_to_student":
+                opd_support_gradient = (
+                    support_student_logp.exp() - support_teacher_logp.exp()
+                ) / self.config.temperature
+            else:
+                opd_support_gradient = support_student_logp.exp() * (
+                    support_student_logp - support_teacher_logp - token_kl[flat_latent].unsqueeze(-1)
+                ) / self.config.temperature
         flat_gate = torch.ones_like(token_kl, dtype=torch.bool)
         if self.config.trajectory_gate.value == "positive_advantage":
             detached_advantages = advantages.detach()
@@ -367,8 +374,6 @@ class PrivilegedReplay:
             flat_gate = torch.repeat_interleave(row_gate, latent_counts)
             if flat_gate.shape != token_kl.shape:
                 raise RuntimeError("trajectory gate did not align with latent queries")
-        teacher_logp = torch.log_softmax(teacher_logits.float() / self.config.temperature, dim=-1)
-        entropy = -(teacher_logp.exp() * teacher_logp).sum(dim=-1)
         selected_kl = token_kl.masked_fill(~flat_gate, 0.0)
         latent_gate = flat_gate[flat_latent]
         return OPDReplayResult(
@@ -378,7 +383,7 @@ class PrivilegedReplay:
             teacher_entropy_sum=float(entropy.masked_fill(~flat_gate, 0.0).sum().item()),
             teacher_seconds=teacher_seconds,
             opd_support_gradient=opd_support_gradient.masked_fill(~latent_gate.unsqueeze(-1), 0.0).detach(),
-            student_support_logits=latent_student.gather(-1, latent_support_ids).detach(),
+            student_support_logits=support_student_logits.detach(),
             latent_kl_sum=selected_kl[flat_latent].sum(),
             answer_kl_sum=selected_kl[flat_answer].sum(),
             latent_slots=int(latent_mask.sum().item()),

@@ -110,6 +110,74 @@ def test_updated_policy_keeps_behavior_support_and_remains_differentiable():
         torch.testing.assert_close(current_logits.grad[token_id], (high - low) / 2e-3, rtol=0.02, atol=1e-4)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("duplicate_retained", [False, True])
+def test_support_only_promotion_matches_dense_fp32_values_and_gradients(dtype, duplicate_retained):
+    """Preserve soft, filtered and hard actions, including repeated padding IDs."""
+
+    torch.manual_seed(17)
+    actual_logits = (torch.randn(3, 257) * 0.4).to(dtype).requires_grad_()
+    reference_logits = actual_logits.detach().clone().requires_grad_()
+    ids = torch.tensor([[3, 11, 17, 25, 41], [7, 0, 19, 7, 0], [0, 0, 0, 0, 0]])
+    retained = torch.tensor(
+        [[True] * 5, [True, False, True, False, False], [True, False, False, False, False]]
+    )
+    if duplicate_retained:
+        ids[0, 1] = ids[0, 0]
+    base = actual_logits.detach().float().gather(-1, ids).masked_fill(~retained, -torch.inf)
+    action = ((base.softmax(-1) + 1e-6).log() + torch.tensor([0.3, -0.2, 0.1, 0.5, -0.4])).requires_grad_()
+
+    # Independent dense-promotion oracle preserves the previous arithmetic and
+    # checks the FP32-to-BF16 backward boundary, not just the scalar score.
+    reference_support = reference_logits.float().gather(-1, ids)
+    reference_support = reference_support.masked_fill(~retained, -torch.inf)
+    reference_base = (reference_support.softmax(-1) + 1e-6).log()
+    noise = (action.detach().float() - reference_base).clamp(-1.5, 3.0)
+    selected = (reference_base > -3).float()
+    reference = ((-noise - (-noise).exp()) * selected).sum(-1) / selected.sum(-1)
+    actual = fixed_support_gumbel_log_probs(actual_logits, ids, action, retained)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    weights = torch.tensor([1.7, -0.3, 0.9])
+    (reference * weights).sum().backward()
+    (actual * weights).sum().backward()
+    torch.testing.assert_close(actual_logits.grad, reference_logits.grad, rtol=0, atol=0)
+    assert actual_logits.grad[:2].abs().sum() > 0
+    assert actual_logits.grad[1, 0] == 0  # Repeated masked fillers have no gradient.
+    assert actual_logits.grad[2].abs().sum() == 0  # Hard singleton support is constant.
+    assert action.grad is None
+
+
+def test_support_density_never_materializes_full_vocabulary_fp32_storage():
+    """Catch full-logit casts in either the forward or the backward path."""
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    class RecordFP32Allocations(TorchDispatchMode):
+        def __init__(self):
+            self.sizes = []
+
+        def __torch_dispatch__(self, function, types, args=(), kwargs=None):
+            result = function(*args, **(kwargs or {}))
+            for value in tree_flatten(result)[0]:
+                if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
+                    self.sizes.append(value.numel())
+            return result
+
+    torch.manual_seed(32)
+    logits = torch.randn(4, 4096, dtype=torch.bfloat16, requires_grad=True)
+    ids = torch.arange(5).expand(4, -1)
+    retained = torch.ones_like(ids, dtype=torch.bool)
+    action = torch.randn(4, 5)
+    allocations = RecordFP32Allocations()
+    with allocations:
+        fixed_support_gumbel_log_probs(logits, ids, action, retained).sum().backward()
+    assert allocations.sizes
+    assert max(allocations.sizes) <= ids.numel()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
 def test_mixed_continuous_and_categorical_wrapper_preserves_legacy():
     # Execute the actual wrapper without importing unrelated TensorDict or GPU
     # dependencies. This test must also run by itself in the CPU environment.
