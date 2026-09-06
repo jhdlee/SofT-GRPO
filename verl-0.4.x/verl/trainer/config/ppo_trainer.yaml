@@ -338,6 +338,9 @@ trainer:
   rollout_integrity:
     enabled: false
     gate_first_n_iterations: 0
+    # Legacy completion thresholds remain opt-out independently of replay
+    # correctness. The Qwen3 training benchmark records these rates only.
+    completion_gate_enabled: true
     max_cap_rate: 0.05
     max_all_soft_rate: 0.05
     min_close_tag_rate: 0.95

@@ -1,3 +1,5 @@
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,87 @@ def _valid_transition_diagnostics():
         close_tag_token_id=99,
         decode=lambda ids: r"</think>\boxed{1}" if ids == [99, 7, 8] else "",
     )
+
+
+def _qwen_completion_rate_diagnostics():
+    # Short trajectories reproduce the observed 469159 population counts,
+    # without loading private rollout artifacts or allocating 8192-token rows.
+    # Twelve unclosed soft caps, two unboxed hard caps, and fifty boxed answers.
+    responses = torch.tensor([[4, 99, 7, 8, 0]] * 64)
+    responses[:12] = torch.tensor([4, 5, 6, 7, 8])
+    responses[12:14] = torch.tensor([4, 99, 17, 18, 19])
+    supports = torch.stack((responses, torch.zeros_like(responses), torch.zeros_like(responses)), dim=-1)
+    supports[:, 0, 1:] = torch.tensor([10, 11])
+    supports[:12, :, 1:] = torch.tensor([10, 11])
+    actions = torch.zeros_like(supports, dtype=torch.float32)
+    actions[:, 0, 0] = 4
+    actions[:12, :, 0] = 4
+    return compute_rollout_diagnostics(
+        responses=responses, response_mask=responses.ne(0),
+        rollout_topk_ids=supports, rollout_topk_gumbels=actions,
+        gumbel_temperature=0.1, close_tag_token_id=99,
+        decode=lambda ids: r"</think>\boxed{1}" if 7 in ids else "",
+    )
+
+
+def test_disabled_completion_gate_accepts_observed_qwen_rates_without_changing_diagnostics():
+    diagnostics = _qwen_completion_rate_diagnostics()
+    before = deepcopy(diagnostics)
+    assert diagnostics.metrics["latent/cap_rate"] == 14 / 64
+    assert diagnostics.all_soft_rate == 12 / 64
+    assert diagnostics.metrics["latent/close_tag_rate"] == 52 / 64
+    assert diagnostics.metrics["latent/soft_to_hard_rate"] == 52 / 64
+    assert diagnostics.categorical_boxed_answer_rate == 50 / 64
+    assert sum(diagnostics.boundary_valid_mask) == 50
+    assert diagnostics.metrics["replay/fallback_count"] == 0
+    config = RolloutIntegrityConfig.from_mapping({
+        "enabled": True, "gate_first_n_iterations": 1, "completion_gate_enabled": False,
+    })
+    assert config.max_replay_ratio_abs_error == 1e-4
+    validate_rollout_integrity(diagnostics, replay_error=2.2649765014648438e-6,
+                               config=config, rollout_iteration=0)
+    assert diagnostics == before
+    assert diagnostics.boundary_valid_mask[:14] == (False,) * 14
+
+
+def test_legacy_completion_gate_still_rejects_observed_qwen_rates():
+    config = RolloutIntegrityConfig(enabled=True, gate_first_n_iterations=1)
+    assert config.completion_gate_enabled is True
+    with pytest.raises(RuntimeError, match="cap rate=0.21875") as error:
+        validate_rollout_integrity(_qwen_completion_rate_diagnostics(), replay_error=0,
+                                   config=config, rollout_iteration=0)
+    for field in ("all-soft rate=0.1875", "close-tag rate=0.8125",
+                  "soft-to-hard rate=0.8125", "categorical boxed-answer rate=0.78125"):
+        assert field in str(error.value)
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "false", "true", None, []])
+def test_completion_gate_configuration_requires_an_actual_boolean(invalid):
+    with pytest.raises(TypeError, match="completion_gate_enabled"):
+        RolloutIntegrityConfig.from_mapping({"completion_gate_enabled": invalid})
+
+
+@pytest.mark.parametrize("failure,match", [
+    ("ratio", "ratio error"), ("nan_ratio", "ratio error"), ("infinite_ratio", "ratio error"),
+    ("nonfinite_metric", "non-finite"), ("nonfinite_all_soft", "non-finite"),
+    ("nonfinite_boxed", "non-finite"), ("fallback", "categorical replay fallback"),
+    ("inactive", "replay is not active"),
+])
+def test_disabled_completion_gate_keeps_numerical_replay_and_metadata_checks(failure, match):
+    diagnostics = _qwen_completion_rate_diagnostics()
+    replay_error = 0.0
+    if failure == "ratio": replay_error = 1.0001e-4
+    elif failure == "nan_ratio": replay_error = float("nan")
+    elif failure == "infinite_ratio": replay_error = float("inf")
+    elif failure == "nonfinite_metric": diagnostics.metrics["latent/cap_rate"] = float("nan")
+    elif failure == "nonfinite_all_soft": diagnostics = replace(diagnostics, all_soft_rate=float("inf"))
+    elif failure == "nonfinite_boxed": diagnostics = replace(diagnostics, categorical_boxed_answer_rate=float("nan"))
+    elif failure == "fallback": diagnostics.metrics["replay/fallback_count"] = 1.0
+    elif failure == "inactive": diagnostics.metrics["integrity/continuous_replay_active"] = 0.0
+    with pytest.raises(RuntimeError, match=match):
+        validate_rollout_integrity(diagnostics, replay_error=replay_error,
+            config=RolloutIntegrityConfig(enabled=True, completion_gate_enabled=False, gate_first_n_iterations=1),
+            rollout_iteration=0)
 
 
 def test_training_and_validation_use_distinct_exact_rollout_axes():
@@ -196,7 +279,8 @@ def test_rollout_diagnostics_counts_support_head_mismatch_as_fallback():
     assert diagnostics.metrics["replay/fallback_count"] == 1.0
 
 
-def test_integrity_gate_is_fail_closed_for_an_all_soft_cap():
+@pytest.mark.parametrize("completion_gate_enabled", [True, False])
+def test_all_soft_cap_diagnostics_are_preserved_with_optional_completion_gate(completion_gate_enabled):
     responses = torch.tensor([[4, 5]])
     topk_ids = torch.tensor([[[4, 7], [5, 8]]])
     diagnostics = compute_rollout_diagnostics(
@@ -208,13 +292,22 @@ def test_integrity_gate_is_fail_closed_for_an_all_soft_cap():
         close_tag_token_id=99,
         decode=lambda ids: "",
     )
-    with pytest.raises(RuntimeError, match="integrity gate failed"):
+    before = deepcopy(diagnostics)
+    config = RolloutIntegrityConfig(enabled=True, gate_first_n_iterations=1,
+                                    completion_gate_enabled=completion_gate_enabled)
+    if completion_gate_enabled:
+        with pytest.raises(RuntimeError, match="integrity gate failed"):
+            validate_rollout_integrity(diagnostics, replay_error=0.0, config=config, rollout_iteration=0)
+    else:
+        # An all-soft prefix is replayable even when the policy has not emitted
+        # a close tag. Its incompleteness remains visible, not fabricated away.
         validate_rollout_integrity(
-            diagnostics,
-            replay_error=0.0,
-            config=RolloutIntegrityConfig(enabled=True, gate_first_n_iterations=1),
-            rollout_iteration=0,
+            diagnostics, replay_error=1e-4, config=config, rollout_iteration=0,
         )
+    assert diagnostics == before
+    assert diagnostics.all_soft_rate == diagnostics.metrics["latent/cap_rate"] == 1.0
+    assert diagnostics.metrics["latent/soft_to_hard_rate"] == diagnostics.categorical_boxed_answer_rate == 0.0
+    assert diagnostics.boundary_valid_mask == (False,)
 
 
 def test_integrity_gate_always_enforces_exact_replay():
@@ -247,6 +340,14 @@ def test_full_dose_gradient_gate_accepts_inclusive_ratio_and_clip_boundaries():
             },
             config,
             schedule_multiplier=1.0,
+        )
+
+
+def test_disabling_completion_gate_does_not_disable_full_dose_gradient_gate():
+    with pytest.raises(RuntimeError, match="support-gradient ratio"):
+        validate_full_dose_gradient_integrity(
+            {"grad/grpo_norm": 1.0, "grad/opd_norm": 100.0, "actor/gradient_clipfrac": 0.0},
+            _gradient_gate_config(completion_gate_enabled=False), schedule_multiplier=1.0,
         )
 
 

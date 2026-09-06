@@ -120,15 +120,17 @@ def _load_failure_methods():
     return type("FailureTrainer", (namespace["QwenTrainingBenchmarkTrainer"], namespace["RayPPOTrainer"]), {})
 
 
-@pytest.mark.parametrize("failure_kind", ["ratio", "cap"])
-def test_real_pre_update_gate_persists_failure_before_update_and_retains_partial_timing(tmp_path, failure_kind):
+@pytest.mark.parametrize("failure_kind,completion_gate_enabled", [("ratio", True), ("ratio", False), ("cap", True)])
+def test_real_pre_update_gate_persists_failure_before_update_and_retains_partial_timing(tmp_path, failure_kind, completion_gate_enabled):
     trainer = _load_failure_methods()()
     inputs = replay_inputs()
     if failure_kind == "cap":
         inputs["actor_log_probs"] = inputs["rollout_log_probs"].clone()
     trainer.measurement_path = tmp_path / "measurement.json"
     trainer.measurement = {"status": "running", "iterations": [], "startup_seconds": 3.5}
-    trainer.rollout_integrity_config = RolloutIntegrityConfig(enabled=True, gate_first_n_iterations=1)
+    trainer.rollout_integrity_config = RolloutIntegrityConfig(
+        enabled=True, gate_first_n_iterations=1, completion_gate_enabled=completion_gate_enabled,
+    )
     trainer.continuous_replay = True
     trainer.close_tag_token_id = 99
     diagnostics = compute_rollout_diagnostics(responses=inputs["responses"], response_mask=inputs["response_mask"], rollout_topk_ids=inputs["rollout_topk_ids"], rollout_topk_gumbels=inputs["rollout_topk_gumbels"], gumbel_temperature=0.1, close_tag_token_id=99, decode=lambda ids: r"\boxed{1}")
@@ -159,6 +161,53 @@ def test_real_pre_update_gate_persists_failure_before_update_and_retains_partial
     assert failure["diagnostics"]["rollout_metrics"]["latent/cap_rate"] == 0.5
     assert "SECRET" not in trainer.measurement_path.read_text()
     assert trainer.rollout_integrity_config.max_replay_ratio_abs_error == 1e-4
+
+
+def test_real_pre_update_gate_allows_replayable_unfinished_prefix_without_erasing_metrics(tmp_path):
+    trainer = _load_failure_methods()()
+    inputs = replay_inputs()
+    # One unfinished soft prefix and one genuine soft-to-hard response. Neither
+    # their 50% completion rate nor the second response's cap blocks replay.
+    inputs["responses"][0] = torch.tensor([4, 5, 6, 7, 0])
+    inputs["rollout_topk_ids"][0, :, 0] = inputs["responses"][0]
+    inputs["rollout_topk_ids"][0, :4, 1:] = torch.tensor([10, 11])
+    inputs["rollout_topk_gumbels"][0, :4] = torch.tensor([4.0, 0.0, 0.0])
+    inputs["actor_log_probs"] = inputs["rollout_log_probs"].clone()
+    inputs["comparison_mask"] = replay_integrity_mask(
+        response_mask=inputs["response_mask"], continuous_replay=True,
+        rollout_topk_ids=inputs["rollout_topk_ids"], responses=inputs["responses"], close_tag_token_id=99,
+    )
+    comparison_before = inputs["comparison_mask"].clone()
+    assert comparison_before.tolist() == [[True, True, True, True, False], [True, False, True, True, True]]
+    trainer.measurement_path = tmp_path / "measurement.json"
+    trainer.measurement = {"status": "running", "iterations": [], "startup_seconds": 3.5}
+    trainer.rollout_integrity_config = RolloutIntegrityConfig(
+        enabled=True, gate_first_n_iterations=1, completion_gate_enabled=False,
+    )
+    trainer.continuous_replay, trainer.close_tag_token_id = True, 99
+    diagnostics = compute_rollout_diagnostics(
+        responses=inputs["responses"], response_mask=inputs["response_mask"],
+        rollout_topk_ids=inputs["rollout_topk_ids"], rollout_topk_gumbels=inputs["rollout_topk_gumbels"],
+        gumbel_temperature=0.1, close_tag_token_id=99, decode=lambda ids: r"\boxed{1}" if ids else "",
+    )
+    metrics_before = dict(diagnostics.metrics)
+    assert diagnostics.all_soft_rate == diagnostics.metrics["latent/cap_rate"] == 0.5
+    assert diagnostics.categorical_boxed_answer_rate == diagnostics.metrics["latent/soft_to_hard_rate"] == 0.5
+    assert diagnostics.metrics["replay/fallback_count"] == 0.0
+    assert diagnostics.boundary_valid_mask == (False, True)
+    tensors = {key: inputs[key] for key in ("responses", "response_mask", "rollout_log_probs", "rollout_topk_ids", "rollout_topk_gumbels")}
+    batch = SimpleNamespace(batch=tensors, non_tensor_batch={}, meta_info={})
+    trainer._validate_benchmark_before_update(
+        batch=batch, diagnostics=diagnostics, replay_error=0.0,
+        actor_log_probs=inputs["actor_log_probs"], comparison_mask=inputs["comparison_mask"], iteration=0,
+        timing={"gen": 20, "old_log_prob": 5}, metrics=diagnostics.metrics, started_at=time.perf_counter(),
+    )
+    # Returning permits the caller's next stage; this test runs no optimizer.
+    assert not trainer.measurement_path.exists()
+    assert trainer.measurement == {"status": "running", "iterations": [], "startup_seconds": 3.5}
+    assert diagnostics.metrics == metrics_before
+    assert diagnostics.boundary_valid_mask == (False, True)
+    assert torch.equal(inputs["comparison_mask"], comparison_before)
 
 
 def test_diagnostic_gate_precedes_worker_updates_and_legacy_without_hook_is_unchanged():

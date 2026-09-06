@@ -115,14 +115,16 @@ def validate_pilot_metrics(objective, iteration, metrics, *, actor_update_timing
         return value
 
     active = objective == "standalone" or iteration > 0
+    # EMA follows the completed policy update, including hybrid iteration zero.
+    # The effective OPD dose controls teacher KL and OPD gradients, not EMA.
     exact = {
         "integrity/continuous_replay_active": 1,
         "replay/fallback_count": 0,
         "trainer/rollout_iteration": iteration,
         "trainer/optimizer_steps_this_iteration": 2,
         "trainer/optimizer_step": 2 * (iteration + 1),
-        "opd/ema_updates_this_iteration": int(active),
-        "opd/ema_update_count": iteration + int(objective == "standalone"),
+        "opd/ema_updates_this_iteration": 1,
+        "opd/ema_update_count": iteration + 1,
     }
     for name, expected in exact.items():
         if number(name) != expected:
@@ -163,8 +165,8 @@ def validate_pilot_metrics(objective, iteration, metrics, *, actor_update_timing
             label = f"pilot rank {row['rank']} metric"
             for name, expected in (
                 ("optimizer_steps", 2),
-                ("ema_updates_this_iteration", int(active)),
-                ("ema_update_count", iteration + int(objective == "standalone")),
+                ("ema_updates_this_iteration", 1),
+                ("ema_update_count", iteration + 1),
             ):
                 if number(name, row, evidence, label) != expected:
                     raise ValueError(f"{label} {name} must equal {expected}")

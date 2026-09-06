@@ -73,6 +73,7 @@ class RolloutIntegrityConfig:
 
     enabled: bool = False
     gate_first_n_iterations: int = 0
+    completion_gate_enabled: bool = True
     max_cap_rate: float = 0.05
     max_all_soft_rate: float = 0.05
     min_close_tag_rate: float = 0.95
@@ -92,6 +93,8 @@ class RolloutIntegrityConfig:
         result = cls(**dict(values))
         if type(result.enabled) is not bool:
             raise TypeError("rollout_integrity.enabled must be bool")
+        if type(result.completion_gate_enabled) is not bool:
+            raise TypeError("completion_gate_enabled must be bool")
         if type(result.full_dose_gradient_gate_enabled) is not bool:
             raise TypeError("full_dose_gradient_gate_enabled must be bool")
         if isinstance(result.gate_first_n_iterations, bool) or not isinstance(result.gate_first_n_iterations, int):
@@ -676,7 +679,10 @@ def validate_rollout_integrity(
             f"rollout/replay ratio error {replay_error:.6g} exceeds "
             f"{config.max_replay_ratio_abs_error:.6g}"
         )
-    if rollout_iteration >= config.gate_first_n_iterations:
+    # Completion rates describe policy behavior, not replay validity. Qwen3
+    # training keeps these diagnostics without rejecting unfinished responses;
+    # all numerical, finite-value and fallback checks above still apply.
+    if not config.completion_gate_enabled or rollout_iteration >= config.gate_first_n_iterations:
         return
 
     checks = {

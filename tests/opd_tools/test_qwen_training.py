@@ -166,6 +166,8 @@ def test_profile_overrides_preserve_recipe_horizon_and_use_isolated_qwen_identit
     assert values["actor_rollout_ref.rollout.tensor_model_parallel_size"] == 1
     assert values["algorithm.opd.prompt_profile"] == values["data.prompt_profile"] == training.PROFILE_ID
     assert values["trainer.training_profile"] == training.PROFILE_ID
+    assert values["trainer.rollout_integrity.enabled"] is True
+    assert values["trainer.rollout_integrity.completion_gate_enabled"] is False
     assert "qwen3_0p6b" in values["trainer.experiment_name"]
 
 
@@ -210,3 +212,6 @@ def test_full_profiles_compose_with_real_hydra_and_phase_overrides(tmp_path, obj
     assert config.trainer.max_rollout_iterations_per_invocation == 3
     assert config.trainer.training_benchmark_mode == phase
     assert config.trainer.n_gpus_per_node == gpus
+    assert config.trainer.rollout_integrity.enabled is True
+    assert config.trainer.rollout_integrity.completion_gate_enabled is False
+    assert config.trainer.rollout_integrity.max_replay_ratio_abs_error == 1e-4

@@ -339,6 +339,7 @@ def profile_overrides(objective: str, gpus: int, root: Path | str, run_dir: Path
         "trainer.val_before_train": True, "trainer.total_epochs": 1, "trainer.total_training_steps": None, "trainer.max_rollout_iterations_per_invocation": 3,
         "trainer.n_gpus_per_node": gpus, "trainer.nnodes": 1, "trainer.default_local_dir": str(run_dir), "trainer.save_freq": 25, "trainer.test_freq": 25, "trainer.checkpoint_keep_latest": 2,
         "trainer.rollout_integrity.enabled": True, "trainer.rollout_integrity.gate_first_n_iterations": 1,
+        "trainer.rollout_integrity.completion_gate_enabled": False,
         "algorithm.opd.prompt_profile": PROFILE_ID,
         "actor_rollout_ref.rollout.require_retained_support": True,
         "ray_init.num_cpus": 16 * gpus,

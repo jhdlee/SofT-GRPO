@@ -467,6 +467,27 @@ def test_historical_profile_does_not_require_new_repair_only_support_flag(tmp_pa
     assert "Measurement-only aggregation" in render_markdown(report)
 
 
+@pytest.mark.parametrize("policy", ["missing", True, False])
+def test_study_completion_policy_preserves_historical_and_explicit_configs(tmp_path, policy):
+    from verl.opd.provenance import build_checkpoint_provenance
+
+    cell = complete_cell()
+    measured = cell["phases"][0]["measurement"]
+    integrity = measured["configuration"]["trainer"]["rollout_integrity"]
+    assert "completion_gate_enabled" not in integrity
+    if policy != "missing":
+        integrity["completion_gate_enabled"] = policy
+        measured["checkpoint_provenance"] = build_checkpoint_provenance(
+            measured["configuration"], source_commit="b" * 40,
+            environment_identity=measured["checkpoint_provenance"]["environment"])
+    seal_fixture_phases(cell)
+    original = copy.deepcopy(cell)
+    atomic_write_json(tmp_path / "cell.json", cell)
+    report = aggregate_cells(tmp_path)
+    assert report["cells"][0]["status"] == "complete", report["cells"][0].get("reason")
+    assert json.loads((tmp_path / "cell.json").read_text()) == original
+
+
 def test_cli_atomic_json_and_markdown_with_empty_or_invalid_input(tmp_path):
     root = tmp_path / "input"
     bad = root / "broken" / "cell.json"
@@ -991,6 +1012,105 @@ def test_native_repair_pending_retains_requested_backend(tmp_path):
     assert not report.get("measurement_authenticated")
 
 
+def _set_recorded_completion_gate(measured, policy):
+    from verl.opd.provenance import build_checkpoint_provenance
+
+    integrity = measured["configuration"]["trainer"]["rollout_integrity"]
+    if policy == "missing":
+        integrity.pop("completion_gate_enabled", None)
+    else:
+        integrity["completion_gate_enabled"] = policy
+    measured["checkpoint_provenance"] = build_checkpoint_provenance(
+        measured["configuration"], source_commit="b" * 40,
+        environment_identity=measured["checkpoint_provenance"]["environment"])
+
+
+@pytest.mark.parametrize("policy", ["missing", True, False])
+def test_repair_completion_gate_uses_authenticated_policy_with_legacy_default(repair_evidence, policy):
+    from opd_tools.training_benchmark import validate_pilot_metrics
+
+    registry, _, measured, persist = repair_evidence
+    _set_recorded_completion_gate(measured, policy)
+    row = measured["iterations"][0]
+    row["metrics"].update({"latent/cap_rate": 0.75, "latent/close_tag_rate": 0.25,
+                           "latent/soft_to_hard_rate": 0.25})
+    row["pilot_acceptance"] = validate_pilot_metrics(
+        "standalone", 0, row["metrics"], actor_update_timing=row["actor_update_timing"], expected_ranks=2)
+    persist()
+    raw_before = (registry.parent / "run/standalone-gpu2/cell.json").read_bytes()
+    report = aggregate_repair_validation(registry)
+    assert report["measurement_authenticated"] is True
+    assert report["completion_gate_enabled"] is (policy is not False)
+    if policy is False:
+        assert report["status"] == "repair_validation_complete", report["reason"]
+        assert not report["input_errors"] and len(report["pilot_gates"]) == 3
+        assert "completion-rate gate: **disabled**" in render_repair_markdown(report)
+    else:
+        assert report["status"] == "incomplete"
+        assert "first-iteration integrity gate rejected latent/cap_rate" in report["reason"]
+    assert (registry.parent / "run/standalone-gpu2/cell.json").read_bytes() == raw_before
+
+
+@pytest.mark.parametrize("requested,recorded,accepted", [
+    (False, False, True), (True, True, True),
+    (False, "missing", False), (False, True, False),
+    (True, "missing", False), (True, False, False),
+])
+def test_repair_completion_policy_is_bound_to_new_receipt(repair_evidence, requested, recorded, accepted):
+    registry, _, measured, persist = repair_evidence
+    submission = json.loads(registry.read_text())
+    submission["completion_gate_enabled"] = requested
+    atomic_write_json(registry, submission)
+    _set_recorded_completion_gate(measured, recorded)
+    persist()
+    report = aggregate_repair_validation(registry)
+    if accepted:
+        assert report["status"] == "repair_validation_complete", report["reason"]
+        assert report["completion_gate_enabled"] is requested
+    else:
+        assert report["status"] == "incomplete" and report["input_errors"]
+        assert "requested completion_gate_enabled" in report["reason"]
+        assert not report.get("measurement_authenticated")
+
+
+@pytest.mark.parametrize("policy", [None, 0, 1, "false", [], {}])
+def test_repair_completion_gate_rejects_nonboolean_config(repair_evidence, policy):
+    registry, _, measured, persist = repair_evidence
+    _set_recorded_completion_gate(measured, policy)
+    persist()
+    report = aggregate_repair_validation(registry)
+    assert report["status"] == "incomplete" and report["input_errors"]
+    assert "completion_gate_enabled must be a boolean" in report["reason"]
+    assert not report.get("measurement_authenticated")
+
+
+def test_repair_completion_gate_change_requires_full_configuration_hash(repair_evidence):
+    registry, _, measured, persist = repair_evidence
+    measured["configuration"]["trainer"]["rollout_integrity"]["completion_gate_enabled"] = False
+    persist()  # Phase hash matches, but the checkpoint's full config hash does not.
+    report = aggregate_repair_validation(registry)
+    assert report["status"] == "incomplete" and report["input_errors"]
+    assert "resolved configuration does not match checkpoint provenance" in report["reason"]
+    assert not report.get("measurement_authenticated")
+
+
+@pytest.mark.parametrize("key,value", [
+    ("replay/ratio_abs_error_max", 0.0002), ("replay/fallback_count", 1),
+    ("latent/soft_to_hard_rate", 0), ("opd/answer_slot_count", 0),
+    ("grad/opd_norm", 0), ("opd/ema_update_count", 7),
+])
+def test_disabled_completion_gate_preserves_pilot_acceptance(repair_evidence, key, value):
+    registry, _, measured, persist = repair_evidence
+    _set_recorded_completion_gate(measured, False)
+    measured["iterations"][0]["metrics"][key] = value
+    persist()
+    report = aggregate_repair_validation(registry)
+    assert report["measurement_authenticated"] is True
+    assert report["completion_gate_enabled"] is False
+    assert report["status"] == "incomplete" and report["input_errors"]
+    assert report["full_training_estimate"] is None
+
+
 @pytest.mark.parametrize("old_format", [False, True])
 def test_repair_failure_preserves_exact_preupdate_reason_and_partial_timings(repair_evidence, old_format):
     registry, cell, measured, persist = repair_evidence
@@ -1029,6 +1149,9 @@ def test_repair_failure_preserves_exact_preupdate_reason_and_partial_timings(rep
     ("jobs", []), ("maximum_repair_gpu_hours", 2),
     ("qwen_replay_backend", "native_fa3"), ("qwen_replay_backend", None),
     ("qwen_replay_backend", True), ("qwen_replay_backend", {}),
+    ("completion_gate_enabled", None), ("completion_gate_enabled", 0),
+    ("completion_gate_enabled", 1), ("completion_gate_enabled", "false"),
+    ("completion_gate_enabled", []), ("completion_gate_enabled", {}),
 ])
 def test_repair_manifest_rejects_wrong_scope_types_pins_or_allocation(tmp_path, key, value):
     submission = repair_submission(tmp_path)

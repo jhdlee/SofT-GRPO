@@ -336,6 +336,7 @@ def _authenticate_study_measurements(cell: Mapping[str, Any], objective: str, gp
         validate_phase_measurement(measured, phase=kind, variant=variant, batches=batches,
                                    overrides=_study_phase_overrides(objective, gpus, kind, variant, batches),
                                    source=cell["source"], assets=cell["assets"], run_id=run_id)
+        _completion_gate_enabled(measured["configuration"])
         if phase.get("authenticated") is not True:
             raise ValueError("study phase was not authenticated by its controller")
         if phase.get("status") == "complete" and (measured.get("status") != "complete" or measured.get("wandb_online") is not True or measured.get("wandb_finished") is not True):
@@ -632,6 +633,8 @@ def _read_repair_submission(path: Path) -> dict[str, Any]:
     if not any(_canonical_sha256(record.get("dispatch")) == _canonical_sha256(value) for value in VARIANTS.values()):
         raise ValueError("repair dispatch must exactly match an allowed variant")
     _repair_backend(record)
+    if "completion_gate_enabled" in record and type(record["completion_gate_enabled"]) is not bool:
+        raise ValueError("repair completion_gate_enabled must be a boolean")
     return {**record, "input_path": str(path), "file_sha256": hashlib.sha256(encoded).hexdigest(),
             "validation_note": "Validated single-job request metadata; execution and source verification require authenticated measurements."}
 
@@ -653,12 +656,30 @@ def _validate_repair_backend(configuration: Mapping[str, Any], submission: Mappi
             raise ValueError(f"repair phase configuration differs at actor_rollout_ref.{section}.qwen_replay_backend")
 
 
+def _completion_gate_enabled(configuration: Mapping[str, Any], submission: Mapping[str, Any] | None = None) -> bool:
+    """Read the hash-bound policy without adding fields to historical configs."""
+    integrity = configuration.get("trainer", {}).get("rollout_integrity", {})
+    observed = integrity.get("completion_gate_enabled", True)
+    if type(observed) is not bool:
+        raise ValueError("phase trainer.rollout_integrity.completion_gate_enabled must be a boolean")
+    if submission is not None and "completion_gate_enabled" in submission:
+        expected = submission["completion_gate_enabled"]
+        if type(expected) is not bool:
+            raise ValueError("repair completion_gate_enabled must be a boolean")
+        if "completion_gate_enabled" not in integrity or observed is not expected:
+            raise ValueError("repair phase configuration differs from requested completion_gate_enabled")
+    return observed
+
+
 def _profile_phase_overrides(objective: str, gpus: int, phase: str, variant: str, batches: list[int], *, historical: bool = False, replay_backend: str = "disabled") -> list[str]:
     """Recheck the recipe without reading model files or rebasing remote paths."""
     from .qwen_training import profile_overrides
 
     dynamic_paths = {"data.train_files", "data.val_files", "actor_rollout_ref.model.path",
-                     "custom_reward_function.path", "trainer.default_local_dir"}
+                     "custom_reward_function.path", "trainer.default_local_dir",
+                     # This versioned policy is checked separately against the
+                     # authenticated config and, for new repairs, the receipt.
+                     "trainer.rollout_integrity.completion_gate_enabled"}
     if historical:
         dynamic_paths.add("actor_rollout_ref.rollout.require_retained_support")
     overrides = [item for item in profile_overrides(objective, gpus, "/unused-assets", "/unused-run", replay_backend=replay_backend)
@@ -760,6 +781,7 @@ def aggregate_repair_validation(submission_path: Path | str, input_root: Path | 
             validate_phase_measurement(measured, phase="pilot", variant=variant, batches=[],
                                        overrides=_repair_overrides(submission, variant), source=raw["source"],
                                        assets=raw.get("assets", {}), run_id=phase.get("wandb_run_id"))
+            report["completion_gate_enabled"] = _completion_gate_enabled(measured["configuration"], submission)
             report["measurement_authenticated"] = True
         if failure:
             report["reason"] = f"{failure.get('status', 'failed')} at {failure.get('stage', 'unknown')}: {failure['error']}"
@@ -785,10 +807,11 @@ def aggregate_repair_validation(submission_path: Path | str, input_root: Path | 
             if row.get("pilot_acceptance") != accepted:
                 raise ValueError("repair stored pilot acceptance differs from recomputed evidence")
             report["pilot_gates"].append(accepted)
-        for key, threshold, maximum in (("latent/cap_rate", 0.05, True), ("latent/close_tag_rate", 0.95, False), ("latent/soft_to_hard_rate", 0.95, False)):
-            value = _number(rows[0]["metrics"].get(key), key)
-            if value > 1 or (value > threshold if maximum else value < threshold):
-                raise ValueError("repair first-iteration integrity gate rejected " + key)
+        if report["completion_gate_enabled"]:
+            for key, threshold, maximum in (("latent/cap_rate", 0.05, True), ("latent/close_tag_rate", 0.95, False), ("latent/soft_to_hard_rate", 0.95, False)):
+                value = _number(rows[0]["metrics"].get(key), key)
+                if value > 1 or (value > threshold if maximum else value < threshold):
+                    raise ValueError("repair first-iteration integrity gate rejected " + key)
         _number(measured.get("startup_seconds"), "startup_seconds")
         _number(measured.get("validation_seconds"), "validation_seconds", positive=True)
         checkpoint = _number(measured.get("checkpoint_seconds"), "checkpoint_seconds", positive=True)
@@ -814,6 +837,9 @@ def render_repair_markdown(report: Mapping[str, Any]) -> str:
         lines += [f"Submission registry SHA-256: `{report['submission']['file_sha256']}`.", ""]
     if report.get("reporter"):
         lines += [f"Reporter source (separate from benchmark): `{_markdown_value(report['reporter'])}`.", ""]
+    if "completion_gate_enabled" in report:
+        policy = "enabled" if report["completion_gate_enabled"] else "disabled"
+        lines += [f"Authenticated completion-rate gate: **{policy}**. Replay, mask, gradient, optimizer, and EMA acceptance checks remain required.", ""]
     lines += [f"Revalidated pilot iterations: {len(report.get('pilot_gates', []))}/3. Recorded W&B run IDs: `{_markdown_value(report.get('wandb_run_ids', []))}`.", ""]
     view = report.get("measurements", {})
     try:

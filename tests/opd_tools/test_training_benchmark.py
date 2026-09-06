@@ -71,8 +71,8 @@ def pilot_metrics(objective="standalone", iteration=0):
         "trainer/rollout_iteration": iteration,
         "trainer/optimizer_steps_this_iteration": 2.0,
         "trainer/optimizer_step": 2 * (iteration + 1),
-        "opd/ema_updates_this_iteration": float(active),
-        "opd/ema_update_count": iteration + (objective == "standalone"),
+        "opd/ema_updates_this_iteration": 1.0,
+        "opd/ema_update_count": iteration + 1,
         "opd/beta_effective": 1.0 if objective == "standalone" else 0.001 * (iteration / 11),
         "opd/latent_slot_count": 120.0 if active else 0.0,
         "opd/answer_slot_count": 48.0 if active else 0.0,
@@ -136,10 +136,9 @@ def test_pilot_requires_every_evidence_metric_to_be_finite_numeric(name, invalid
 
 
 @pytest.mark.parametrize("name", [
-    "opd/beta_effective", "opd/ema_updates_this_iteration", "opd/ema_update_count",
-    "opd/latent_slot_count", "opd/answer_slot_count", "grad/opd_norm",
+    "opd/beta_effective", "opd/latent_slot_count", "opd/answer_slot_count", "grad/opd_norm",
 ])
-def test_hybrid_zero_dose_is_a_strict_opd_noop(name):
+def test_hybrid_zero_dose_keeps_teacher_kl_and_opd_gradients_inactive(name):
     metrics = pilot_metrics("hybrid", 0)
     metrics[name] = 1e-12
     with pytest.raises(ValueError, match=name):
@@ -147,8 +146,10 @@ def test_hybrid_zero_dose_is_a_strict_opd_noop(name):
 
 
 @pytest.mark.parametrize("iteration", [1, 2])
-def test_hybrid_pilot_rejects_shortened_warmup_or_premature_ema(iteration):
-    for name, value in (("opd/beta_effective", 0.001), ("opd/ema_update_count", iteration + 1)):
+def test_hybrid_pilot_rejects_shortened_warmup_or_wrong_ema_count(iteration):
+    for name, value in (("opd/beta_effective", 0.001),
+                        ("opd/ema_update_count", iteration),
+                        ("opd/ema_update_count", iteration + 2)):
         metrics = pilot_metrics("hybrid", iteration)
         metrics[name] = value
         with pytest.raises(ValueError, match=name):
@@ -169,8 +170,8 @@ def pilot_actor_timing(objective="standalone", iteration=0, ranks=2):
     return {"ranks": [
         {"rank": rank, "teacher_seconds": 0.5 if active else 0.0,
          "policy_update_seconds": 1.0, "worker_update_seconds": 1.2,
-         "optimizer_steps": 2.0, "ema_updates_this_iteration": float(active),
-         "ema_update_count": iteration + (objective == "standalone")}
+         "optimizer_steps": 2.0, "ema_updates_this_iteration": 1.0,
+         "ema_update_count": iteration + 1}
         for rank in reversed(range(ranks))
     ]}
 
@@ -218,14 +219,68 @@ def test_pilot_requires_complete_rank_evidence(name):
         )
 
 
-@pytest.mark.parametrize("name", ["teacher_seconds", "ema_updates_this_iteration", "ema_update_count"])
-def test_hybrid_zero_dose_is_a_noop_on_every_rank(name):
+def test_hybrid_zero_dose_keeps_teacher_replay_inactive_on_every_rank():
     timing = pilot_actor_timing("hybrid", 0)
-    timing["ranks"][0][name] = 1e-12
-    with pytest.raises(ValueError, match=f"rank 1 metric {name}"):
+    timing["ranks"][0]["teacher_seconds"] = 1e-12
+    with pytest.raises(ValueError, match="rank 1 metric teacher_seconds"):
         benchmark.validate_pilot_metrics(
             "hybrid", 0, pilot_metrics("hybrid", 0), actor_update_timing=timing, expected_ranks=2,
         )
+
+
+@pytest.mark.parametrize("field", ["ema_updates_this_iteration", "ema_update_count"])
+@pytest.mark.parametrize("value", [0, 2])
+@pytest.mark.parametrize("scope", ["canonical", "rank_one"])
+def test_hybrid_zero_dose_rejects_missing_or_duplicate_ema(field, value, scope):
+    metrics = pilot_metrics("hybrid", 0)
+    timing = pilot_actor_timing("hybrid", 0)
+    if scope == "canonical":
+        metrics["opd/" + field] = value
+        expected_error = "pilot metric opd/" + field
+    else:
+        timing["ranks"][0][field] = value
+        expected_error = "rank 1 metric " + field
+    with pytest.raises(ValueError, match=expected_error):
+        benchmark.validate_pilot_metrics(
+            "hybrid", 0, metrics, actor_update_timing=timing, expected_ranks=2,
+        )
+
+
+def test_hybrid_acceptance_follows_real_ema_state_across_zero_and_active_doses():
+    import torch
+    from verl.opd.ema import EMAUpdateState, freeze_teacher_, update_ema_once_
+
+    student = torch.nn.Linear(1, 1, bias=False)
+    teacher = copy.deepcopy(student)
+    freeze_teacher_(teacher)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    state = EMAUpdateState()
+    optimizer_steps = 0
+    for iteration in range(3):
+        # The zero-dose iteration still performs its two policy optimizer steps.
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            student(torch.ones(1, 1)).sum().backward()
+            optimizer.step()
+            optimizer_steps += 1
+        before = state.update_count
+        update_ema_once_(teacher, student, 0.99, iteration, state)
+        metrics = pilot_metrics("hybrid", iteration)
+        metrics.update({"trainer/optimizer_step": optimizer_steps,
+                        "opd/ema_updates_this_iteration": state.update_count - before,
+                        "opd/ema_update_count": state.update_count})
+        timing = pilot_actor_timing("hybrid", iteration, ranks=1)
+        timing["ranks"][0].update(ema_updates_this_iteration=state.update_count - before,
+                                  ema_update_count=state.update_count)
+        accepted = benchmark.validate_pilot_metrics(
+            "hybrid", iteration, metrics, actor_update_timing=timing, expected_ranks=1,
+        )
+        assert accepted["opd_active"] is (iteration > 0)
+        assert accepted["metrics"]["opd/ema_update_count"] == iteration + 1
+        if iteration == 0:
+            assert accepted["metrics"]["opd/beta_effective"] == 0
+            assert accepted["metrics"]["grad/opd_norm"] == 0
+            assert accepted["ranks"][0]["teacher_seconds"] == 0
 
 
 @pytest.mark.parametrize("rank_ids", [[0], [0, 0], [0, 2], [0, "1"], [0, True], [0, 1, 2]])
