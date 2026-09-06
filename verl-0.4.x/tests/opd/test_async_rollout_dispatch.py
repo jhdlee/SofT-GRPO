@@ -530,6 +530,7 @@ def test_native_scheduler_busy_ack_prevents_memory_pause(success):
 
     engine = SimpleNamespace(tokenizer_manager=SimpleNamespace(
         flush_cache=flush, release_memory_occupation=release,
+        auto_create_handle_loop=lambda: None,
     ))
     engine.flush_cache = lambda: namespace["flush_cache"](engine)
     if success:

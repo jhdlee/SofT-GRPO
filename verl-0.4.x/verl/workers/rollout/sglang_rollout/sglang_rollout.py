@@ -199,6 +199,10 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
 
     async def flush_cache(self):
         require_idle_engine(self)
+        # Unlike native release/resume, the pinned flush_cache does not start
+        # its reply receiver. The first resume flushes before either native
+        # memory method runs, so bootstrap the receiver before sending it.
+        self.tokenizer_manager.auto_create_handle_loop()
         result = await self.tokenizer_manager.flush_cache()
         if getattr(result, "success", None) is not True:
             raise RuntimeError("SGLang cache flush rejected; scheduler requests may remain outstanding")
