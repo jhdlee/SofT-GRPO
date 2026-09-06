@@ -34,12 +34,15 @@ if triton is not None:
     )
     def _linear_kernel(X, W, B, Y, M, N, K, HAS_BIAS: tl.constexpr):
         # Keep both the tile and launch settings fixed across every shape.
-        rows = tl.program_id(0) * 32 + tl.arange(0, 32)
-        columns = tl.program_id(1) * 64 + tl.arange(0, 64)
-        reduction = tl.arange(0, 32)
+        # Widen before multiplication: packed Qwen vocabulary outputs can
+        # exceed 2**31 elements although M, N and K each fit in int32. Pointer
+        # addition cannot repair an already-wrapped row/column stride product.
+        rows = tl.program_id(0).to(tl.int64) * 32 + tl.arange(0, 32).to(tl.int64)
+        columns = tl.program_id(1).to(tl.int64) * 64 + tl.arange(0, 64).to(tl.int64)
+        reduction = tl.arange(0, 32).to(tl.int64)
         accumulator = tl.zeros((32, 64), dtype=tl.float32)
         for block in range(tl.cdiv(K, 32)):
-            indices = block * 32 + reduction
+            indices = block.to(tl.int64) * 32 + reduction
             x = tl.load(
                 X + rows[:, None] * K + indices[None, :],
                 mask=(rows[:, None] < M) & (indices[None, :] < K),
