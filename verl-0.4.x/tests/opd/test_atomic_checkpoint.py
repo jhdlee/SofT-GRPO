@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -445,6 +446,100 @@ def test_categorical_rollout_digest_requires_no_continuous_support_metadata(
     checkpoint_helpers["_verify_rollout_integrity_record"](
         record, expected_rollout_iteration=0
     )
+
+
+def _rollout_integrity_batch(*, continuous):
+    tensors = {
+        "prompts": torch.tensor([[1, 2], [1, 2]]),
+        "responses": torch.tensor([[3, 4], [5, 6]]),
+        "response_mask": torch.ones((2, 2), dtype=torch.bool),
+        "attention_mask": torch.ones((2, 4), dtype=torch.bool),
+        "rollout_log_probs": torch.tensor([[-0.1, -0.2], [-0.3, -0.4]]),
+        "rollout_sampling_seed": torch.tensor([101, 102]),
+    }
+    if continuous:
+        tensors.update(
+            rollout_topk_ids=torch.tensor(
+                [[[1, 0], [2, 0], [3, 7], [4, 8]], [[1, 0], [2, 0], [5, 9], [6, 10]]]
+            ),
+            rollout_topk_gumbels=torch.arange(16, dtype=torch.float32).reshape(2, 4, 2) / 10,
+            gumbel_temperature=torch.tensor([0.1, 0.1]),
+        )
+    return tensors
+
+
+def _checkpoint_tensor_container(tensors, container):
+    if container == "tensordict":
+        # Other dependency-light tests install a TensorDict=object import stub
+        # when this optional package is absent. Check the installed package,
+        # so that stub cannot turn these tests into false failures or passes.
+        try:
+            importlib.metadata.version("tensordict")
+        except importlib.metadata.PackageNotFoundError:
+            pytest.skip("actual TensorDict checkpoint regression requires tensordict")
+        from tensordict import TensorDict
+
+        assert TensorDict is not object, "installed TensorDict was replaced by a test stub"
+        return TensorDict(tensors, batch_size=[2])
+
+    class RowIteratingBatch(dict):
+        """Exercise the TensorDict iteration contract without GPU extras."""
+
+        def __iter__(self):
+            return iter([{name: tensor[row] for name, tensor in self.items()} for row in range(2)])
+
+        def clone(self):
+            return type(self)({name: tensor.clone() for name, tensor in self.items()})
+
+    return RowIteratingBatch(tensors)
+
+
+@pytest.mark.parametrize("container", ["row_iterating", "tensordict"])
+@pytest.mark.parametrize("continuous", [False, True])
+def test_tensordict_rollout_inventory_matches_dict_and_authenticates(checkpoint_helpers, continuous, container):
+    """Use the actual worker container, whose iterator yields rows, not keys."""
+
+    tensors = _rollout_integrity_batch(continuous=continuous)
+    batch = _checkpoint_tensor_container(tensors, container)
+    identity = {
+        "group_ids": ["rollout-00000002-prompt-000000"] * 2,
+        "example_identities": [17, 17],
+        "rollout_iteration": 2,
+    }
+    expected = checkpoint_helpers["_build_rollout_integrity_record"](tensors, **identity)
+    actual = checkpoint_helpers["_build_rollout_integrity_record"](batch, **identity)
+    assert actual == expected
+    assert actual["replay_mode"] == ("continuous" if continuous else "categorical")
+    assert checkpoint_helpers["_verify_rollout_integrity_record"](
+        actual, expected_rollout_iteration=2
+    ) == actual
+    assert set(actual["fields"]) == set(tensors)
+    if continuous:
+        assert actual["fields"]["rollout_topk_ids"]["shape"] == [2, 2, 2]
+
+    # The container repair must retain authentication sensitivity to the actual
+    # trajectory bytes rather than just accepting the tensor field names.
+    changed = batch.clone()
+    changed["rollout_log_probs"][0, 0] += 0.25
+    changed_record = checkpoint_helpers["_build_rollout_integrity_record"](changed, **identity)
+    assert changed_record["trajectory_sha256"] != actual["trajectory_sha256"]
+
+
+@pytest.mark.parametrize("missing,match", [
+    ("response_mask", "without fields.*response_mask"),
+    ("rollout_topk_gumbels", "incomplete continuous replay inventory.*rollout_topk_gumbels"),
+])
+@pytest.mark.parametrize("container", ["row_iterating", "tensordict"])
+def test_tensordict_rollout_inventory_still_rejects_missing_fields(checkpoint_helpers, missing, match, container):
+    tensors = _rollout_integrity_batch(continuous=True)
+    del tensors[missing]
+    with pytest.raises(RuntimeError, match=match):
+        checkpoint_helpers["_build_rollout_integrity_record"](
+            _checkpoint_tensor_container(tensors, container),
+            group_ids=["rollout-00000002-prompt-000000"] * 2,
+            example_identities=[17, 17],
+            rollout_iteration=2,
+        )
 
 
 def test_tensor_digest_supports_bfloat16_without_numpy_conversion(checkpoint_helpers):

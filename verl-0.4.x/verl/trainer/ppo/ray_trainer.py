@@ -275,10 +275,13 @@ def _build_rollout_integrity_record(
     distinguishing every action, mask, request-local seed, and trajectory.
     """
 
-    missing = sorted(set(_CHECKPOINT_COMMON_ROLLOUT_FIELDS) - set(batch_tensors))
+    # TensorDict iteration yields batch rows, unlike a dict's key iterator.
+    # The checkpoint inventory must inspect field names for both containers.
+    batch_fields = set(batch_tensors.keys())
+    missing = sorted(set(_CHECKPOINT_COMMON_ROLLOUT_FIELDS) - batch_fields)
     if missing:
         raise RuntimeError(f"cannot checkpoint rollout without fields: {missing}")
-    continuous_present = set(_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS) & set(batch_tensors)
+    continuous_present = set(_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS) & batch_fields
     if continuous_present and continuous_present != set(
         _CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS
     ):

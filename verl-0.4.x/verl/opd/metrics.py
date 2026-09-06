@@ -140,9 +140,10 @@ def validate_resource_limits(
 ) -> None:
     """Fail a study worker as soon as its local resource ceiling is crossed.
 
-    This check intentionally operates on each worker's local CUDA high-water
-    mark before Ray aggregates metrics.  The driver separately logs the maximum
-    rank because VERL reduces the source ``perf/max_*`` metric with ``MAX``.
+    This check intentionally operates on each worker's local PyTorch CUDA
+    high-water mark. Qwen benchmark workers separately gather and maximize these
+    peaks before returning metadata; ordinary DataProto concatenation retains
+    only the first worker's metadata. These peaks exclude other GPU processes.
     """
 
     values = {

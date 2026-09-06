@@ -84,11 +84,13 @@ def test_worker_preserves_sampling_contract_and_rank_timing(profile, standalone,
             **local, "rank": 1, "teacher_seconds": 0.2,
             "policy_update_seconds": local["policy_update_seconds"] + 0.3,
             "worker_update_seconds": local["worker_update_seconds"] + 0.5,
+            "max_memory_allocated_gib": 17.0,
+            "max_memory_reserved_gib": 19.0,
         }]
 
     device = SimpleNamespace(
-        current_device=lambda: "cpu", max_memory_allocated=lambda: 1,
-        max_memory_reserved=lambda: 2,
+        current_device=lambda: "cpu", max_memory_allocated=lambda: 11 * 1024**3,
+        max_memory_reserved=lambda: 13 * 1024**3,
     )
     namespace = {
         "torch": torch, "Timer": Timer, "DataProto": Data,
@@ -164,6 +166,8 @@ def test_worker_preserves_sampling_contract_and_rank_timing(profile, standalone,
         assert not gathered
         assert "actor_update_timing" not in result.meta_info
         assert "perf/teacher_seconds_max" not in result.meta_info["metrics"]
+        assert result.meta_info["metrics"]["perf/max_memory_allocated_gb"] == 11.0
+        assert result.meta_info["metrics"]["perf/max_memory_reserved_gb"] == 13.0
     else:
         timing = result.meta_info["actor_update_timing"]
         assert len(gathered) == 1
@@ -174,3 +178,12 @@ def test_worker_preserves_sampling_contract_and_rank_timing(profile, standalone,
         assert result.meta_info["metrics"]["perf/teacher_seconds_max"] == 0.2
         assert timing["worker_update_seconds_max"] == timing["ranks"][1]["worker_update_seconds"]
         assert timing["timing_method"] == "cpu_wall"
+        # Keep the raw rank inventory while publishing the actual larger
+        # rank-one peaks before DataProto.concat discards its metadata.
+        assert [row["max_memory_allocated_gib"] for row in timing["ranks"]] == [11.0, 17.0]
+        assert [row["max_memory_reserved_gib"] for row in timing["ranks"]] == [13.0, 19.0]
+        assert timing["max_memory_allocated_gib"] == 17.0
+        assert timing["max_memory_reserved_gib"] == 19.0
+        assert result.meta_info["metrics"]["perf/max_memory_allocated_gb"] == 17.0
+        assert result.meta_info["metrics"]["perf/max_memory_reserved_gb"] == 19.0
+        assert "PyTorch process-lifetime" in timing["memory_scope"]

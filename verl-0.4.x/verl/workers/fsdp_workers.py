@@ -749,6 +749,8 @@ class ActorRolloutRefWorker(Worker):
                 "optimizer_steps": float(metrics["trainer/optimizer_steps_this_iteration"]),
                 "ema_updates_this_iteration": float(metrics.get("opd/ema_updates_this_iteration", 0.0)),
                 "ema_update_count": float(metrics.get("opd/ema_update_count", 0.0)),
+                "max_memory_allocated_gib": float(metrics["perf/max_memory_allocated_gb"]),
+                "max_memory_reserved_gib": float(metrics["perf/max_memory_reserved_gb"]),
             }
             rank_timings = [None] * self.world_size
             dist.all_gather_object(rank_timings, rank_timing)
@@ -757,6 +759,12 @@ class ActorRolloutRefWorker(Worker):
                 "teacher_seconds_max": max(item["teacher_seconds"] for item in rank_timings),
                 "policy_update_seconds_max": max(item["policy_update_seconds"] for item in rank_timings),
                 "worker_update_seconds_max": max(item["worker_update_seconds"] for item in rank_timings),
+                "max_memory_allocated_gib": max(item["max_memory_allocated_gib"] for item in rank_timings),
+                "max_memory_reserved_gib": max(item["max_memory_reserved_gib"] for item in rank_timings),
+                "memory_scope": (
+                    "Per-rank PyTorch process-lifetime CUDA peaks; summary values are maxima "
+                    "across participating ranks, not GPU-wide device usage."
+                ),
                 "timing_method": "cuda_synchronized_wall" if torch.cuda.is_available() else "cpu_wall",
                 "timing_note": (
                     "Teacher time sums completed teacher spans per rank. Policy/worker times "
@@ -766,6 +774,10 @@ class ActorRolloutRefWorker(Worker):
             }
             output.meta_info["actor_update_timing"] = timing
             output.meta_info["metrics"]["perf/teacher_seconds_max"] = timing["teacher_seconds_max"]
+            # DataProto.concat retains the first worker's metadata, so reduce
+            # these rank-local peaks before the driver's metric reduction.
+            output.meta_info["metrics"]["perf/max_memory_allocated_gb"] = timing["max_memory_allocated_gib"]
+            output.meta_info["metrics"]["perf/max_memory_reserved_gb"] = timing["max_memory_reserved_gib"]
 
         return output
 
