@@ -803,9 +803,15 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if data.meta_info.get("collect_replay_diagnostics", False):
+                    output, entropys, replay_diagnostics = self.actor.compute_log_prob(
+                        data=data, calculate_entropy=True, collect_replay_diagnostics=True,
+                    )
+                else:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    replay_diagnostics = {}
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors={"old_log_probs": output, "entropys": entropys, **replay_diagnostics},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)

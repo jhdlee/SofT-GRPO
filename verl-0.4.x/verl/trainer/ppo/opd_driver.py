@@ -393,6 +393,7 @@ def build_replay_failure_diagnostics(
     rollout_topk_gumbel_noise: torch.Tensor | None = None,
     rollout_topk_retained_mask: torch.Tensor | None = None,
     rollout_topk_probs: torch.Tensor | None = None,
+    actor_replay_diagnostics: Mapping[str, torch.Tensor] | None = None,
     max_records: int = 8,
 ) -> dict[str, Any]:
     """Summarize a rejected replay without serializing prompts, gold, or traces.
@@ -415,6 +416,22 @@ def build_replay_failure_diagnostics(
     for tensor in (rollout_topk_ids, rollout_topk_gumbels, rollout_topk_gumbel_noise, rollout_topk_retained_mask, rollout_topk_probs):
         if tensor is not None and (tensor.ndim != 3 or tensor.shape[:2] != shape or tensor.shape[-1] > 8):
             raise ValueError("replay diagnostics require bounded aligned support metadata")
+    observed = {}
+    if actor_replay_diagnostics:
+        captured = {key: value.detach().cpu() for key, value in actor_replay_diagnostics.items()}
+        captured_positions = captured["actor_replay_positions"]
+        if captured_positions.shape != (rows, 16):
+            raise ValueError("actor replay capture must retain sixteen bounded slots per response")
+        for value in captured.values():
+            if value.shape[:2] != (rows, 16) or value.ndim not in (2, 3) or (value.ndim == 3 and value.shape[-1] > 8):
+                raise ValueError("actor replay observations are not bounded and row-aligned")
+        for row, slots in enumerate(captured_positions.tolist()):
+            for slot, position in enumerate(slots):
+                if position < 0:
+                    continue
+                if position >= length or (row, position) in observed:
+                    raise ValueError("actor replay observation position is duplicated or out of range")
+                observed[row, position] = {key.removeprefix("actor_replay_"): value[row, slot] for key, value in captured.items()}
     def number(value):
         value = float(value)
         return value if math.isfinite(value) else None
@@ -450,9 +467,7 @@ def build_replay_failure_diagnostics(
     scores = errors[compared].clone()
     scores[~torch.isfinite(scores)] = float("inf")
     ranked = torch.argsort(scores, descending=True, stable=True)[:max_records]
-    worst = []
-    for index in ranked.tolist():
-        row, position = positions[index].tolist()
+    def record(row, position):
         identity = prompt_indices[row] if prompt_indices is not None else None
         # Dataset source indices are integers. Never serialize arbitrary prompt
         # metadata strings if a caller accidentally supplies the wrong field.
@@ -473,7 +488,40 @@ def build_replay_failure_diagnostics(
             if tensor is not None:
                 values = tensor[row, position].detach().cpu().tolist()
                 item[key] = [bool(value) for value in values] if key == "retained_mask" else [int(value) for value in values] if key == "support_ids" else [number(value) for value in values]
-        worst.append(item)
+        if actor_replay_diagnostics is not None:
+            evidence = observed.get((row, position))
+            if evidence is None:
+                item["actor_replay"] = {"available": False}
+            else:
+                if rollout_topk_ids is not None and not torch.equal(evidence["support_ids"], rollout_topk_ids[row, position].detach().cpu()):
+                    raise ValueError("captured actor support IDs do not match the joined response position")
+                if not (torch.equal(evidence["log_density"], actor[row, position]) or (
+                    bool(torch.isnan(evidence["log_density"])) and bool(torch.isnan(actor[row, position]))
+                )):
+                    raise ValueError("captured actor density does not match the joined response position")
+                categorical = bool(evidence["is_categorical"])
+                actual = {
+                    "available": True, "source": "existing_actor_replay_forward",
+                    "density_kind": "categorical" if categorical else "continuous",
+                    "support_logits": [number(value) for value in evidence["support_logits"].tolist()],
+                    "log_density": number(evidence["log_density"]),
+                }
+                if categorical:
+                    actual["selected_token_logit"] = number(evidence["categorical_selected_logit"])
+                    actual["log_normalizer_derived_from_selected_logit_minus_log_p"] = number(evidence["categorical_log_normalizer"])
+                else:
+                    for key in ("support_probabilities", "support_log_probs", "inferred_gumbels"):
+                        actual[key] = [number(value) for value in evidence[key].tolist()]
+                    actual["score_mask"] = [bool(value) for value in evidence["score_mask"].tolist()]
+                item["actor_replay"] = actual
+        return item
+
+    worst = [record(*positions[index].tolist()) for index in ranked.tolist()]
+    hard_positions = (compared & after_close).nonzero(as_tuple=False)
+    hard_scores = errors[compared & after_close].clone()
+    hard_scores[~torch.isfinite(hard_scores)] = float("inf")
+    hard_ranked = torch.argsort(hard_scores, descending=True, stable=True)[:max_records]
+    worst_hard = [record(*hard_positions[index].tolist()) for index in hard_ranked.tolist()]
     return {
         "schema_version": 1, "ratio_equation": "abs(exp(actor_log_density - rollout_log_density) - 1)",
         "density_note": "Both density fields are log densities: continuous-action density for soft positions and token log probability for categorical positions. Stored support probabilities describe the next embedding, not the action density.",
@@ -484,6 +532,8 @@ def build_replay_failure_diagnostics(
         "close_tag_response_count": int(close.any(dim=-1).sum()),
         "segments": summaries, "worst_positions": worst,
         "positions_retained": len(worst), "position_limit": max_records,
+        "worst_hard_positions": worst_hard, "hard_positions_retained": len(worst_hard),
+        "actor_replay_note": "Captured support logits come from the existing actor forward. Continuous support probabilities are normalized over the fixed retained support; support_log_probs include the released 1e-6 epsilon. The categorical full-vocabulary normalizer is derived from the chosen logit minus its existing token log probability.",
     }
 
 

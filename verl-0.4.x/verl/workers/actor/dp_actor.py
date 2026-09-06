@@ -231,6 +231,13 @@ class DataParallelPPOActor(BasePPOActor):
             raise RuntimeError("OPD currently requires Ulysses sequence parallel size 1")
         if compute_opd and float(temperature) != 1.0:
             raise RuntimeError("OPD production study requires released LM temperature 1.0")
+        collect_replay_diagnostics = bool(micro_batch.get("_collect_replay_diagnostics", False))
+        if collect_replay_diagnostics and (
+            self.opd_config.prompt_profile != "qwen3-training-benchmark-v1"
+            or not continuous_replay or not add_noise_gumbel_softmax or self.use_ulysses_sp or self.use_fused_kernels
+            or compute_opd or collect_gradient_info
+        ):
+            raise RuntimeError("replay capture requires Qwen3 unfused continuous replay with sequence parallel size 1")
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -574,6 +581,18 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1: -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1: -1]  # (bsz, response_length)
+                if collect_replay_diagnostics:
+                    from verl.opd.replay_diagnostics import capture_replay_diagnostics
+
+                    gradient_info = capture_replay_diagnostics(
+                        logits=logits_rmpad, packed_indices=indices,
+                        attention_mask=attention_mask, responses=micro_batch["responses"],
+                        actor_log_probs=log_probs, rollout_log_probs=micro_batch["rollout_log_probs"],
+                        support_ids=rollout_topk_ids[:, -response_length:],
+                        retained_mask=rollout_topk_retained_mask[:, -response_length:],
+                        perturbed_logits=rollout_topk_gumbels[:, -response_length:],
+                        close_tag_token_id=micro_batch["_replay_diagnostics_close_tag_id"],
+                    )
                 # print(log_probs)
             else:  # not using rmpad and no ulysses sp
                 if compute_opd:
@@ -625,7 +644,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, *, collect_replay_diagnostics=False):
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -653,8 +672,12 @@ class DataParallelPPOActor(BasePPOActor):
         add_noise_dirichlet = data.meta_info['add_noise_dirichlet']
         add_noise_gumbel_softmax = data.meta_info['add_noise_gumbel_softmax']
         continuous_replay = bool(data.meta_info.get("continuous_replay", True))
+        if collect_replay_diagnostics and not continuous_replay:
+            raise RuntimeError("replay capture requires continuous replay")
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if collect_replay_diagnostics:
+            select_keys.append("rollout_log_probs")
         if continuous_replay:
             select_keys.extend(
                 ["rollout_topk_ids", "rollout_topk_gumbels", "gumbel_temperature"]
@@ -679,16 +702,23 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        replay_diagnostics_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            if collect_replay_diagnostics:
+                micro_batch = dict(micro_batch)
+                micro_batch["_collect_replay_diagnostics"] = True
+                micro_batch["_replay_diagnostics_close_tag_id"] = data.meta_info["replay_diagnostics_close_tag_id"]
             with torch.no_grad():
-                entropy, log_probs, _, _ = self._forward_micro_batch(micro_batch, temperature=temperature,
+                entropy, log_probs, _, replay_info = self._forward_micro_batch(micro_batch, temperature=temperature,
                                                                calculate_entropy=calculate_entropy,
                                                                add_noise_dirichlet=add_noise_dirichlet,
                                                                add_noise_gumbel_softmax=add_noise_gumbel_softmax,
                                                                continuous_replay=continuous_replay)
             log_probs_lst.append(log_probs)
+            if collect_replay_diagnostics:
+                replay_diagnostics_lst.append(replay_info)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
@@ -696,12 +726,22 @@ class DataParallelPPOActor(BasePPOActor):
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        replay_diagnostics = {
+            key: torch.cat([item[key] for item in replay_diagnostics_lst], dim=0)
+            for key in replay_diagnostics_lst[0]
+        } if collect_replay_diagnostics else None
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
+            if entropys is not None:
+                entropys = entropys[revert_indices]
+            if replay_diagnostics is not None:
+                replay_diagnostics = {key: value[revert_indices] for key, value in replay_diagnostics.items()}
 
+        if collect_replay_diagnostics:
+            return log_probs, entropys, replay_diagnostics
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)

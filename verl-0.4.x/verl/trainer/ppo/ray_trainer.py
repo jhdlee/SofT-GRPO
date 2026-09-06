@@ -2238,6 +2238,7 @@ class RayPPOTrainer:
     def _validate_benchmark_before_update(
         self, *, batch, diagnostics, replay_error, actor_log_probs,
         comparison_mask, iteration, timing, metrics, started_at,
+        actor_replay_diagnostics=None,
     ):
         """Persist rejected benchmark replay before any worker update starts."""
         if not hasattr(self, "record_benchmark_failure") or not self.rollout_integrity_config.enabled:
@@ -2266,6 +2267,7 @@ class RayPPOTrainer:
                     prompt_indices=batch.non_tensor_batch.get("index"),
                     rollout_ranks=batch.batch.get("rollout_rank"),
                     rollout_sampling_seeds=batch.batch.get("rollout_sampling_seed"),
+                    actor_replay_diagnostics=actor_replay_diagnostics,
                     **support,
                 )
             except Exception as diagnostic_error:
@@ -2475,6 +2477,14 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
+                    collect_replay_diagnostics = (
+                        hasattr(self, "record_benchmark_failure")
+                        and self.opd_config.prompt_profile == "qwen3-training-benchmark-v1"
+                        and self.continuous_replay and self.rollout_integrity_config.enabled
+                    )
+                    if collect_replay_diagnostics:
+                        batch.meta_info["collect_replay_diagnostics"] = True
+                        batch.meta_info["replay_diagnostics_close_tag_id"] = self.close_tag_token_id
                     replay_started_at = time.perf_counter()
                     with _timer("old_log_prob", timing_raw):
                         try:
@@ -2489,6 +2499,14 @@ class RayPPOTrainer:
                                     {"diagnostics_unavailable": "actor replay forward did not return log densities"},
                                 )
                             raise
+                        finally:
+                            if collect_replay_diagnostics:
+                                batch.meta_info.pop("collect_replay_diagnostics", None)
+                                batch.meta_info.pop("replay_diagnostics_close_tag_id", None)
+                        actor_replay_diagnostics = {
+                            key: old_log_prob.batch.pop(key)
+                            for key in list(old_log_prob.batch.keys()) if key.startswith("actor_replay_")
+                        } if collect_replay_diagnostics else None
                         actor_old_log_probs = old_log_prob.batch["old_log_probs"]
                         if not self.standalone_opd:
                             entropys = old_log_prob.batch["entropys"]
@@ -2601,6 +2619,7 @@ class RayPPOTrainer:
                         replay_error=replay_error, actor_log_probs=actor_old_log_probs,
                         comparison_mask=density_comparison_mask, iteration=rollout_iteration,
                         timing=timing_raw, metrics=metrics, started_at=iteration_started_at,
+                        actor_replay_diagnostics=actor_replay_diagnostics,
                     )
 
                     if self.use_reference_policy:
