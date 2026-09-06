@@ -343,6 +343,40 @@ def runner(tmp_path, monkeypatch):
     return instance
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_explicit_repair_pilot_never_becomes_a_dispatch_study_estimate(runner, monkeypatch, fails):
+    from opd_tools import icl_resource_monitor
+    calls = []
+    runner.args.repair_pilot = "bounded_async32"
+
+    def phase(*args):
+        calls.append(args)
+        if fails:
+            raise RuntimeError("strict replay gate rejected")
+
+    monkeypatch.setattr(runner, "phase", phase)
+    monkeypatch.setattr(benchmark.signal, "signal", lambda *args: None)
+    monitor = SimpleNamespace(start=lambda: monitor, stop=lambda: SimpleNamespace(to_dict=lambda: {}))
+    monkeypatch.setattr(icl_resource_monitor, "ResourceMonitor", lambda **kwargs: monitor)
+    if fails:
+        with pytest.raises(RuntimeError, match="strict replay gate"):
+            runner.run()
+    else:
+        runner.run()
+    assert calls == [("pilot", "bounded_async32", [])]
+    assert runner.cell["role"] == "repair_validation"
+    assert runner.cell["status"] == ("incomplete" if fails else "repair_validation_complete")
+    assert "estimate" not in runner.cell
+    assert "dispatch_selection" not in runner.cell
+
+
+def test_repair_pilot_cli_requires_explicit_thirty_minute_cap(monkeypatch, tmp_path):
+    monkeypatch.setattr(benchmark, "CellRunner", lambda args: pytest.fail("oversized repair allocation initialized"))
+    with pytest.raises(SystemExit):
+        benchmark.main(["--root", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+                        "--objective", "standalone", "--gpus", "2", "--repair-pilot", "bounded_async32"])
+
+
 @pytest.mark.parametrize("outcome", ["complete", "timeout", "exit_failure", "bad_json", "wrong_identity"])
 def test_phase_preserves_partial_rows_authenticates_results_and_keeps_invocation_horizon(runner, monkeypatch, outcome):
     captured = {}

@@ -358,6 +358,16 @@ class CellRunner:
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
         try:
+            repair_variant = getattr(self.args, "repair_pilot", None)
+            if repair_variant is not None:
+                # Explicit repair validation is separate from the four-cell
+                # dispatch study and cannot stand in for its runtime report.
+                self.cell["role"] = "repair_validation"
+                self.cell["requested_dispatch"] = repair_variant
+                self._persist()
+                self.phase("pilot", repair_variant, [])
+                self.cell["status"] = "repair_validation_complete"
+                return
             for variant in VARIANT_CONFIGS:
                 self.phase("calibration", variant, [0])
             screening = select_dispatch(self.cell["screen_rows"], [])
@@ -402,9 +412,13 @@ def main(argv=None):
     parser.add_argument("--objective", choices=("standalone", "hybrid"), required=True)
     parser.add_argument("--gpus", type=int, choices=(1, 2), required=True)
     parser.add_argument("--time-limit-seconds", type=int, default=7100)
+    parser.add_argument("--repair-pilot", choices=tuple(VARIANT_CONFIGS), default=None,
+                        help="Run only the strict three-iteration pilot; no dispatch-study estimate")
     args = parser.parse_args(argv)
     if not 60 <= args.time_limit_seconds <= 7200:
         parser.error("benchmark time limit must remain within two hours")
+    if args.repair_pilot is not None and args.time_limit_seconds > 1800:
+        parser.error("repair validation must be explicitly capped at thirty minutes")
     CellRunner(args).run()
 
 
