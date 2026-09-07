@@ -49,6 +49,48 @@ def test_disabled_backend_preserves_existing_launch_options():
     assert validate_qwen_replay_worker(config, **options) == "disabled"
 
 
+@pytest.mark.parametrize("rollout,rank", [("sglang", 0), ("sglang", 32), ("vllm", 0), ("vllm", 32)])
+def test_v2_supports_full_and_lora_for_soft_and_categorical_actors(rollout, rank):
+    from verl.opd.qwen_lora import QWEN_LORA_TARGET_MODULES
+    config, options = _settings()
+    config.model.qwen_replay_backend = config.rollout.qwen_replay_backend = "native_fa3_v2"
+    config.rollout.name = rollout
+    config.rollout.enable_soft_thinking = rollout == "sglang"
+    config.model.lora_rank = rank
+    config.model.lora_alpha = 64
+    config.model.target_modules = list(QWEN_LORA_TARGET_MODULES)
+    assert validate_qwen_replay_worker(config, **options) == "native_fa3_v2"
+
+
+@pytest.mark.parametrize("change", [
+    {"model.lora_rank": True}, {"model.lora_rank": -1}, {"model.lora_rank": 257},
+    {"model.lora_rank": 32, "model.target_modules": ["lm_head"]},
+    {"rollout.name": "vllm", "rollout.enable_soft_thinking": True},
+])
+def test_v2_rejects_unsupported_parameterizations_and_soft_vllm(change):
+    config, options = _settings()
+    config.model.qwen_replay_backend = config.rollout.qwen_replay_backend = "native_fa3_v2"
+    for key, value in change.items(): OmegaConf.update(config, key, value)
+    with pytest.raises(ValueError): validate_qwen_replay_worker(config, **options)
+
+
+def test_v2_identity_and_runtime_pin_native_backward_and_merge(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from verl.opd.qwen_replay_backend import QWEN_REPLAY_RUNTIME_V2
+    calls = []
+    monkeypatch.setitem(sys.modules, "opd_fa3", SimpleNamespace(validate_build=lambda: calls.append(True)))
+    assert validate_qwen_replay_runtime(lambda key: QWEN_REPLAY_RUNTIME_V2[key], backend="native_fa3_v2") == QWEN_REPLAY_RUNTIME_V2
+    assert calls == [True]
+    identity = qwen_replay_arithmetic_identity(backend="native_fa3_v2")
+    assert identity["attention_backward"] == "native_fa3"
+    assert identity["master_dtype"] == "float32"
+    assert {"qwen_lora.py", "qwen_lora_ema.py"} <= identity["implementation_sha256"].keys()
+    assert "qwen_lora.py" not in qwen_replay_arithmetic_identity()["implementation_sha256"]
+    with pytest.raises(RuntimeError):
+        validate_qwen_replay_runtime(lambda key: "wrong" if key == "opd-fa3" else QWEN_REPLAY_RUNTIME_V2[key], backend="native_fa3_v2")
+
+
 def test_native_rollout_cannot_be_paired_with_ordinary_actor_arithmetic():
     config, options = _settings()
     config.model.qwen_replay_backend = "disabled"

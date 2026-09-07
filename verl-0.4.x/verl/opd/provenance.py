@@ -104,7 +104,9 @@ def _resolved_config_identity(resolved_config: Mapping[str, Any]) -> dict[str, o
     if not isinstance(trainer, dict):
         raise RuntimeError("resolved Hydra config has no trainer mapping")
     invocation_fields = RESUME_INVOCATION_ONLY_CONFIG_FIELDS
-    if trainer.get("production_mode") is True and trainer.get("training_profile") == "qwen3-math-seven-arm-v1":
+    if trainer.get("production_mode") is True and trainer.get("training_profile") in (
+        "qwen3-math-seven-arm-v1", "qwen3-math-seven-arm-lora-fa3-v1",
+    ):
         invocation_fields = PRODUCTION_RESUME_INVOCATION_ONLY_CONFIG_FIELDS
     for dotted_path in invocation_fields:
         _, field = dotted_path.split(".", 1)
@@ -311,7 +313,18 @@ def build_checkpoint_provenance(
 
     if source_commit is None:
         if source_root is None:
-            source_root = Path(__file__).resolve().parents[3]
+            trainer_config = config.get("trainer", {})
+            if trainer_config.get("training_profile") == "qwen3-math-seven-arm-lora-fa3-v1":
+                source = trainer_config.get("runtime_source_root")
+                if not isinstance(source, str) or not Path(source).is_absolute():
+                    raise RuntimeError("installed production wheels require an explicit committed source root")
+                source_root = Path(source)
+                runtime_path = Path(trainer_config.get("runtime_manifest_path", ""))
+                runtime, runtime_hash = _read_sealed_manifest(runtime_path, "runtime build")
+                if runtime_hash != trainer_config.get("runtime_manifest_sha256"):
+                    raise RuntimeError("runtime build manifest changed from the sealed configuration")
+            else:
+                source_root = Path(__file__).resolve().parents[3]
         source_commit = _resolve_source_commit(source_root)
     if _GIT_COMMIT_RE.fullmatch(source_commit) is None:
         raise RuntimeError("nested source commit must be a full 40-character Git SHA")

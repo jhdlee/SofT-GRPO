@@ -442,7 +442,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
-                if getattr(self, "qwen_replay_backend", "disabled") == "native_fa3_v1":
+                if getattr(self, "qwen_replay_backend", "disabled") in ("native_fa3_v1", "native_fa3_v2"):
                     extra_args.update(opd_cu_seqlens=packed_cu_seqlens, opd_max_seqlen=int(packed_max_seqlen))
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
@@ -643,6 +643,13 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        from verl.opd.qwen_lora import adapter_gradient_statistics, has_qwen_lora
+        self._last_lora_gradient_statistics = None
+        if has_qwen_lora(self.actor_module):
+            self._last_lora_gradient_statistics = adapter_gradient_statistics(self.actor_module)
+            if not self._last_lora_gradient_statistics["lora/grad_finite"]:
+                self.actor_optimizer.zero_grad()
+                raise FloatingPointError("native LoRA has non-finite adapter gradients")
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -820,6 +827,10 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        from verl.opd.qwen_lora import has_qwen_lora, lora_diagnostics
+        native_lora = has_qwen_lora(self.actor_module)
+        lora_previous = lora_diagnostics(self.actor_module)[1] if native_lora else None
+        lora_step_statistics = []
         optimizer_steps = 0
         local_pg_sum = 0.0
         local_native_kl_sum = 0.0
@@ -1126,6 +1137,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 optimizer_steps += 1
+                if native_lora:
+                    step_statistics = self._last_lora_gradient_statistics
+                    if step_statistics is None:
+                        raise RuntimeError("native LoRA optimizer step omitted gradient diagnostics")
+                    lora_step_statistics.append(step_statistics)
+                    metrics.update({f"lora/optimizer_{optimizer_steps}/" + key.removeprefix("lora/"): float(value) if isinstance(value, bool) else value
+                                    for key, value in step_statistics.items()})
                 grad_norm_value = float(grad_norm.detach().item())
                 grad_norm_sum += grad_norm_value
                 grad_clip_count += float(grad_norm_value > float(self.config.grad_clip))
@@ -1153,7 +1171,13 @@ class DataParallelPPOActor(BasePPOActor):
                     f"update: requires_grad_parameters={requires_grad_count}, "
                     f"accumulated_gradients={accumulated_grad_count}"
                 )
-            squared_sum, parameter_count = parameter_squared_distance_sum_and_count(
+            from verl.opd.qwen_lora import has_qwen_lora
+            if has_qwen_lora(self.actor_module):
+                from verl.opd.qwen_lora_ema import effective_parameter_squared_distance_sum_and_count
+                distance_function = effective_parameter_squared_distance_sum_and_count
+            else:
+                distance_function = parameter_squared_distance_sum_and_count
+            squared_sum, parameter_count = distance_function(
                 self.opd_teacher_module, self.actor_module
             )
             if torch.distributed.is_initialized():
@@ -1167,7 +1191,13 @@ class DataParallelPPOActor(BasePPOActor):
         # after every step in the outer rollout iteration has succeeded.
         ema_updates_this_iteration = 0
         if opd_active and self.opd_config.teacher.type is TeacherType.EMA:
-            update_ema_once_(
+            from verl.opd.qwen_lora import has_qwen_lora
+            if has_qwen_lora(self.actor_module):
+                from verl.opd.qwen_lora_ema import update_dense_ema_once_
+                update_teacher = update_dense_ema_once_
+            else:
+                update_teacher = update_ema_once_
+            update_teacher(
                 teacher=self.opd_teacher_module,
                 student=self.actor_module,
                 decay=self.opd_config.teacher.ema_decay,
@@ -1345,5 +1375,18 @@ class DataParallelPPOActor(BasePPOActor):
                 }
             )
 
+        if native_lora:
+            effective_metrics, lora_current = lora_diagnostics(self.actor_module, lora_previous)
+            baseline = effective_metrics.pop("lora/effective_change_baseline")
+            if baseline != "previous_actor_version":
+                raise RuntimeError("native LoRA update diagnostics used the wrong baseline")
+            metrics.update(effective_metrics)
+            metrics["lora/effective_change_since_previous_actor_version"] = 1.0
+            norms = [item["lora/grad_norm"] for item in lora_step_statistics]
+            metrics["lora/optimizer_grad_norm_mean"] = float(sum(norms) / len(norms))
+            metrics["lora/optimizer_grad_norm_max"] = float(max(norms))
+            metrics["lora/optimizer_nonzero_gradient_fraction"] = float(sum(norm > 0 for norm in norms) / len(norms))
+            # Snapshots never persist on the actor or occupy GPU memory.
+            del lora_previous, lora_current
         self.actor_optimizer.zero_grad()
         return metrics

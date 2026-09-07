@@ -99,10 +99,11 @@ def provenance_inputs(tmp_path):
     return config, environment, model_manifest, data_manifest
 
 
+@pytest.mark.parametrize("profile", ["qwen3-math-seven-arm-v1", "qwen3-math-seven-arm-lora-fa3-v1"])
 @pytest.mark.parametrize("production", [False, True])
-def test_production_phase_and_output_are_invocation_only_in_the_production_profile(provenance_inputs, production):
+def test_production_phase_and_output_are_invocation_only_in_the_production_profile(provenance_inputs, production, profile):
     config, environment, *_ = provenance_inputs
-    config["trainer"].update(training_profile="qwen3-math-seven-arm-v1", production_mode=production,
+    config["trainer"].update(training_profile=profile, production_mode=production,
                              production_phase="split", production_output="/run/split.json",
                              production_arm_id="softgrpo_math_opd_s11")
     first = build_checkpoint_provenance(config, source_commit="1" * 40, environment_identity=environment)
@@ -145,6 +146,28 @@ def test_changing_replay_arithmetic_rejects_exact_resume(provenance_inputs):
     after = build_checkpoint_provenance(changed, source_commit="a" * 40, environment_identity=environment)
     with pytest.raises(RuntimeError):
         assert_checkpoint_provenance_matches(before, after)
+
+
+def test_installed_wheel_provenance_binds_explicit_source_and_runtime_manifest(provenance_inputs, tmp_path, monkeypatch):
+    from verl.opd import provenance as module
+    config, environment, *_ = provenance_inputs
+    source = tmp_path / "committed-fork"
+    runtime = tmp_path / "opd-runtime-manifest.json"
+    _write_sealed_manifest(runtime, {"schema_version": 1, "dependency_lock_sha256": "a" * 64})
+    config["trainer"].update(training_profile="qwen3-math-seven-arm-lora-fa3-v1",
+                             runtime_source_root=str(source), runtime_manifest_path=str(runtime),
+                             runtime_manifest_sha256=hashlib.sha256(runtime.read_bytes()).hexdigest())
+    called = []
+    monkeypatch.setattr(module, "_resolve_source_commit", lambda root: called.append(root) or "b" * 40)
+    result = build_checkpoint_provenance(config, environment_identity=environment)
+    assert called == [source] and result["source"]["commit"] == "b" * 40
+    _write_sealed_manifest(runtime, {"schema_version": 1, "dependency_lock_sha256": "c" * 64})
+    with pytest.raises(RuntimeError, match="runtime build manifest changed"):
+        build_checkpoint_provenance(config, environment_identity=environment)
+    assert called == [source]
+    config["trainer"].pop("runtime_source_root")
+    with pytest.raises(RuntimeError, match="explicit committed source"):
+        build_checkpoint_provenance(config, environment_identity=environment)
 
 
 def test_builder_records_all_required_job_start_identities(provenance_inputs):

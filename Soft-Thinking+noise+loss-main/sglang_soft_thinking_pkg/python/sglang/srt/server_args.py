@@ -852,7 +852,7 @@ class ServerArgs:
         # Kernel backend
         parser.add_argument(
             "--opd-qwen-replay-backend",
-            choices=["disabled", "native_fa3_v1"],
+            choices=["disabled", "native_fa3_v1", "native_fa3_v2"],
             default=ServerArgs.opd_qwen_replay_backend,
             help="Explicit versioned Qwen3 replay arithmetic; requires TP1 BF16 CUDA FA3 and disabled graph/overlap/radix caching.",
         )

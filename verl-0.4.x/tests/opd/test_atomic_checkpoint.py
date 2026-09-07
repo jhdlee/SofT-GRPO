@@ -192,6 +192,7 @@ def _stage_checkpoint(
     tiebreak_metric: float | None = None,
     provenance=None,
     with_opd_teacher: bool = False,
+    semantic_state: bool = False,
 ) -> Path:
     temporary = root / f".global_step_{step}.incomplete.test"
     (temporary / "actor").mkdir(parents=True)
@@ -208,6 +209,15 @@ def _stage_checkpoint(
         )
     (temporary / "data.pt").write_bytes(f"data-{step}".encode())
     (temporary / "driver_state.pt").write_bytes(f"driver-{step}".encode())
+    if semantic_state:
+        from verl.opd.checkpoint_semantics import write_record
+        write_record(temporary / "driver_semantic.json", {'rng_sha256': 'a' * 64, 'dataloader_sha256': 'b' * 64})
+        for rank in range(2):
+            write_record(temporary / 'actor' / f'semantic_state_world_size_2_rank_{rank}.json',
+                         {'rank': rank, 'world_size': 2, 'model_sha256': 'c' * 64,
+                          'optimizer_sha256': 'd' * 64, 'scheduler_sha256': 'e' * 64})
+            write_record(temporary / 'actor' / f'worker_rng_world_size_2_rank_{rank}.json',
+                         {'rank': rank, 'world_size': 2, 'state': {'seed': rank}})
     rollout_record = helpers["_build_rollout_integrity_record"](
         {
             "prompts": torch.tensor([[1, 2], [1, 2]]),
@@ -256,6 +266,7 @@ def _stage_checkpoint(
             else None
         ),
         selection_tiebreak_metric_value=tiebreak_metric,
+        semantic_state=semantic_state,
     )
     assert manifest["dataloader_state_sha256"]
     assert manifest["actor_model_optimizer_tree_sha256"]
@@ -269,6 +280,32 @@ def _stage_checkpoint(
     committed = root / f"global_step_{step}"
     os.replace(temporary, committed)
     return committed
+
+
+def test_semantic_checkpoint_keeps_byte_authentication_and_rejects_downgrade(tmp_path, checkpoint_helpers):
+    checkpoint = _stage_checkpoint(checkpoint_helpers, tmp_path, 1, semantic_state=True)
+    verify = checkpoint_helpers['_verify_checkpoint']
+    assert verify(str(checkpoint), require_semantic=True)['semantic_identity']['schema'] == 'qwen_semantic_v1'
+    path = checkpoint / 'checkpoint_manifest.json'
+    manifest = json.loads(path.read_text())
+    del manifest['semantic_identity']
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match='semantic identity'):
+        verify(str(checkpoint))
+
+
+def test_semantic_sidecars_are_part_of_authenticated_payload(tmp_path, checkpoint_helpers):
+    checkpoint = _stage_checkpoint(checkpoint_helpers, tmp_path, 1, semantic_state=True)
+    (checkpoint / 'actor/worker_rng_world_size_2_rank_1.json').write_text('{}')
+    with pytest.raises(RuntimeError, match='(size|hash) mismatch'):
+        checkpoint_helpers['_verify_checkpoint'](str(checkpoint), require_semantic=True)
+
+
+def test_old_archives_authenticate_but_cannot_admit_semantic_profile(tmp_path, checkpoint_helpers):
+    checkpoint = _stage_checkpoint(checkpoint_helpers, tmp_path, 1)
+    checkpoint_helpers['_verify_checkpoint'](str(checkpoint))
+    with pytest.raises(RuntimeError, match='required semantic'):
+        checkpoint_helpers['_verify_checkpoint'](str(checkpoint), require_semantic=True)
 
 
 def test_atomic_manifest_commit_and_stale_tracker_recovery(tmp_path, checkpoint_helpers):

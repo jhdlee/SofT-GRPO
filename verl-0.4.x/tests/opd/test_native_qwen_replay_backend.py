@@ -167,7 +167,7 @@ def test_server_args_default_and_cli_enum_use_the_actual_dataclass_definition():
     assert ast.literal_eval(field.value) == "disabled"
     cli = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "add_cli_args")
     call = next(node for node in ast.walk(cli) if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == "--opd-qwen-replay-backend")
-    assert ast.literal_eval(next(x.value for x in call.keywords if x.arg == "choices")) == ["disabled", "native_fa3_v1"]
+    assert ast.literal_eval(next(x.value for x in call.keywords if x.arg == "choices")) == ["disabled", "native_fa3_v1", "native_fa3_v2"]
     init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__post_init__")
     assert isinstance(init.body[0], ast.If) and "validate_qwen_replay_server_args" in ast.unparse(init.body[0])
 
@@ -185,3 +185,28 @@ def test_model_install_precedes_pool_and_graph_initialization_and_all_fa3_calls_
                          or (isinstance(node.func, ast.Attribute) and node.func.attr.startswith("_flash_attn_")))]
     assert len(native_calls) == 12
     assert all(isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self" for node in native_calls)
+
+
+def test_v2_rollout_calls_only_authenticated_rebuilt_forward(monkeypatch):
+    calls = []
+    def rebuilt(*values, **kwargs):
+        calls.append(kwargs)
+        return values
+    def old(*values, **kwargs):
+        raise AssertionError("v2 must not fall back to the legacy binary")
+    monkeypatch.setitem(sys.modules, "opd_fa3", SimpleNamespace(
+        validate_build=lambda: calls.append("validated"),
+        flash_attn_varlen_func=rebuilt, flash_attn_with_kvcache=rebuilt))
+    selected = backend.fa3_replay_callables(args(opd_qwen_replay_backend="native_fa3_v2"), old, old)
+    assert selected[0]("packed", causal=True) == ("packed",)
+    assert selected[1]("paged", causal=True) == ("paged",)
+    assert calls == ["validated", {"num_splits": 1, "causal": True}, {"num_splits": 1, "causal": True}]
+
+
+def test_v2_rollout_rejects_invalid_kernel_build_without_fallback(monkeypatch):
+    def reject():
+        raise ValueError("kernel identity changed")
+    monkeypatch.setitem(sys.modules, "opd_fa3", SimpleNamespace(
+        validate_build=reject, flash_attn_varlen_func=object(), flash_attn_with_kvcache=object()))
+    with pytest.raises(ValueError, match="kernel identity"):
+        backend.fa3_replay_callables(args(opd_qwen_replay_backend="native_fa3_v2"), object(), object())

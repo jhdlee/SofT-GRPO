@@ -14,6 +14,7 @@ from opd_tools.training_capacity import CapacityRecorder, finite_snapshot
 
 
 PRODUCTION_PROFILE = "qwen3-math-seven-arm-v1"
+PRODUCTION_PROFILES = (PRODUCTION_PROFILE, "qwen3-math-seven-arm-lora-fa3-v1")
 PRODUCTION_PHASES = ("production", "uninterrupted", "split", "resume", "full_dose", "zero_dose")
 
 
@@ -77,7 +78,7 @@ class ProductionRecorder:
     def __init__(self, trainer):
         self.trainer = trainer
         config = trainer.config
-        if config.trainer.get("training_profile") != PRODUCTION_PROFILE:
+        if config.trainer.get("training_profile") not in PRODUCTION_PROFILES:
             raise ValueError("production mode requires the Qwen seven-arm profile")
         if config.trainer.get("training_benchmark_mode") is not None or config.trainer.get("training_capacity_mode", False):
             raise ValueError("production, benchmark and capacity modes are exclusive")

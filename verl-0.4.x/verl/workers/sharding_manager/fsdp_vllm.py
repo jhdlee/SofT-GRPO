@@ -53,6 +53,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer initialized in vLLMAsyncRollout.load_model
         self.inference_engine = inference_engine
+        self._frozen_batch_guard = bool(getattr(inference_engine, "_qwen_frozen_batch_guard", False))
+        self._opd_rng_switched = False
+        self.last_rollout_timing = {}
         # self.model_runner = inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner if inference_engine else None
 
         if "vllm_v_0_6_3" in str(type(self.inference_engine)) or "vllm_v_0_5_4" in str(type(self.inference_engine)):
@@ -99,6 +102,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
+        entered_at = time.perf_counter()
+        if self._frozen_batch_guard:
+            from verl.opd.vllm_lifecycle import require_idle_vllm
+            self.last_rollout_timing = {}
+            self._guard_stage("entry readiness", lambda: require_idle_vllm(self.inference_engine))
+            return self._enter_native(entered_at)
         def __collect_lora_params() -> OrderedDict:
             """
             collect lora params or full params if base model is not ready in vllm
@@ -164,10 +173,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             params = __collect_lora_params()
         else:
             params = self.module.state_dict()
+            from verl.opd.qwen_lora import has_qwen_lora, qwen_lora_config
+            if has_qwen_lora(self.module):
+                from verl.opd.qwen_weight_export import dense_rollout_weights
+                params = dense_rollout_weights(params, qwen_lora_config(self.module))
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
         # Copy, not share memory
         load_format = "hf" if self.full_params else "dtensor"
+        transfer_started = time.perf_counter()
 
         if vllm_version in (
             "0.5.4",
@@ -199,9 +213,106 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.torch_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.gen_random_states)
+            self._opd_rng_switched = True
+        if self._frozen_batch_guard:
+            get_torch_device().synchronize()
+            self.last_rollout_timing = {"weight_transfer_seconds": time.perf_counter() - transfer_started,
+                                       "sharding_enter_seconds": time.perf_counter() - entered_at}
+
+    def _enter_native(self, entered_at):
+        """Prepare TP1 native weights through matched, fail-closed phases.
+
+        Tensor materialization has its own checked collectives. It must not
+        sit inside an outer guard, and vLLM's local loader must receive only
+        dense tensors so a loader failure cannot compete with a peer's gather.
+        """
+        from verl.opd.qwen_lora import has_qwen_lora, qwen_lora_config
+        from verl.opd.qwen_weight_export import dense_rollout_weights
+
+        def prepare_local():
+            if self.tp_size != 1 or vllm_version != "0.8.5":
+                raise ValueError("guarded native vLLM entry requires TP1 and vLLM 0.8.5")
+            get_torch_device().empty_cache()
+            if self.offload_param:
+                load_fsdp_model_to_gpu(self.module)
+            return "tags" in inspect.signature(self.inference_engine.wake_up).parameters
+
+        tagged_wakeup = self._guard_stage("entry local preparation", prepare_local)
+        state = self._guard_stage("state dict", self.module.state_dict)
+
+        def actor_configuration():
+            model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            if hasattr(model, "peft_config") or not getattr(model, "_opd_qwen_replay_arithmetic", False):
+                raise ValueError("guarded vLLM transfer requires a native dense or merged-LoRA actor")
+            return qwen_lora_config(self.module) if has_qwen_lora(self.module) else None
+
+        config = self._guard_stage("native actor configuration", actor_configuration)
+        transfer_started = time.perf_counter()
+        params = dense_rollout_weights(state, config, stage=self._guard_stage)
+        del state
+        self._guard_stage("wake weights", lambda: self.inference_engine.wake_up(tags=["weights"])
+                          if tagged_wakeup else self.inference_engine.wake_up())
+
+        def update_local():
+            if any(hasattr(value, "full_tensor") or hasattr(value, "local_shards") for value in params.values()):
+                raise ValueError("native vLLM local weight loading received a distributed tensor")
+            self.update_params(params, peft_config=None)
+
+        self._guard_stage("dense weight update", update_local)
+        del params
+        self._guard_stage("actor offload", lambda: offload_fsdp_model_to_cpu(self.module) if self.offload_param else None)
+        self._guard_stage("entry cache release", lambda: get_torch_device().empty_cache())
+        self._guard_stage("wake KV cache", lambda: self.inference_engine.wake_up(tags=["kv_cache"]) if tagged_wakeup else None)
+
+        def switch_rng():
+            if self.device_mesh is not None:
+                self.torch_random_states = get_torch_device().get_rng_state()
+                # Restore even when set_rng_state fails after touching state.
+                self._opd_rng_switched = True
+                get_torch_device().set_rng_state(self.gen_random_states)
+
+        self._guard_stage("entry RNG switch", switch_rng)
+        self._guard_stage("entry synchronization", lambda: get_torch_device().synchronize())
+        self.last_rollout_timing = {"weight_transfer_seconds": time.perf_counter() - transfer_started,
+                                   "sharding_enter_seconds": time.perf_counter() - entered_at}
+
+    def _guard_stage(self, stage, operation):
+        from verl.opd.vllm_lifecycle import finish_vllm_stage
+        result, error = None, None
+        try:
+            result = operation()
+        except BaseException as failure:
+            error = failure
+        try:
+            finish_vllm_stage(self.inference_engine, torch.distributed, error, stage)
+        except BaseException:
+            if self._opd_rng_switched:
+                get_torch_device().set_rng_state(self.torch_random_states)
+                self._opd_rng_switched = False
+            raise
+        return result
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
+        if self._frozen_batch_guard:
+            from verl.opd.vllm_lifecycle import require_idle_vllm
+
+            def completed():
+                if exc_value is not None:
+                    raise exc_value
+                require_idle_vllm(self.inference_engine)
+
+            # This is the sole generation completion collective. Generation
+            # and TP1 postprocessing contain no competing world collectives.
+            # Even a fast healthy rank must wait here before sleeping its engine.
+            self._guard_stage("rollout completion", completed)
+            started = time.perf_counter()
+            self._guard_stage("memory release", self._release_after_rollout)
+            self.last_rollout_timing["release_memory_seconds"] = time.perf_counter() - started
+            return
+        self._release_after_rollout()
+
+    def _release_after_rollout(self):
         # TODO(ZSL): check this
         if vllm_version in (
             "0.5.4",
@@ -220,6 +331,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
+        self._opd_rng_switched = False
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def preprocess_data(self, data: DataProto) -> DataProto:

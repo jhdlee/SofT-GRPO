@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Union
 
@@ -129,6 +130,8 @@ class ActorRolloutRefWorker(Worker):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
+        self._is_native_lora = self._is_lora and self.config.model.get("qwen_replay_backend", "disabled") == "native_fa3_v2"
+        self._semantic_checkpoint = self.config.get("checkpoint_semantics") == "qwen_semantic_v1"
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -199,6 +202,8 @@ class ActorRolloutRefWorker(Worker):
             enable_activation_offload=enable_activation_offload, use_liger=use_liger,
             sequence_parallel_size=self.ulysses_sequence_parallel_size,
         )
+        native_v2 = qwen_replay_backend == "native_fa3_v2"
+        native_lora = native_v2 and self._is_lora and role == "actor"
 
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
@@ -213,6 +218,8 @@ class ActorRolloutRefWorker(Worker):
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        if native_v2:
+            torch_dtype = torch.float32
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
@@ -265,19 +272,27 @@ class ActorRolloutRefWorker(Worker):
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
-            if qwen_replay_backend == "native_fa3_v1":
+            if native_lora:
+                from verl.opd.qwen_lora import install_qwen_lora
+                install_qwen_lora(
+                    actor_module, rank=self._lora_rank, alpha=self.config.model.lora_alpha,
+                    target_modules=convert_to_regular_types(self.config.model.target_modules),
+                    seed=int(self.config.get("training_seed", 11)),
+                )
+            if qwen_replay_backend in ("native_fa3_v1", "native_fa3_v2"):
                 from verl.opd.qwen_native_arithmetic import install_qwen_replay_arithmetic
                 from verl.opd.qwen_replay_backend import qwen_replay_arithmetic_identity, validate_qwen_replay_runtime
-                validate_qwen_replay_runtime()
+                validate_qwen_replay_runtime(backend=qwen_replay_backend)
                 torch.backends.cuda.matmul.allow_tf32 = False
                 install_qwen_replay_arithmetic(
                     actor_module, cache_device=torch.device("cuda", get_torch_device().current_device()),
+                    backend=qwen_replay_backend,
                 )
-                logger.info("Qwen replay arithmetic role=%s identity=%s", role, qwen_replay_arithmetic_identity())
+                logger.info("Qwen replay arithmetic role=%s identity=%s", role, qwen_replay_arithmetic_identity(backend=qwen_replay_backend))
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            if self._is_lora:
+            if self._is_lora and not native_v2:
                 print("Applying LoRA to actor module")
                 actor_module.enable_input_require_grads()
                 # Convert config to regular Python types before creating PEFT model
@@ -301,11 +316,16 @@ class ActorRolloutRefWorker(Worker):
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        if native_v2:
+            # Native LoRA merges FP32 masters inside decoder wrappers, then
+            # explicitly casts effective weights and activations to BF16.
+            param_dtype = reduce_dtype = buffer_dtype = torch.float32
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype,
+                                         cast_forward_inputs=False, cast_root_forward_inputs=not native_v2)
         if qwen_replay_backend == "native_fa3_v1" and (param_dtype != torch.bfloat16 or buffer_dtype != torch.float32):
             raise ValueError("native_fa3_v1 requires BF16 FSDP forward parameters and FP32 buffers")
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get("wrap_policy", None), is_lora=self.config.model.get("lora_rank", 0) > 0)
+        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get("wrap_policy", None), is_lora=self._is_lora and not native_v2)
 
         if self._is_rollout and self.config.rollout.name == "hf":
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
@@ -329,7 +349,7 @@ class ActorRolloutRefWorker(Worker):
                 actor_module,
                 cpu_offload=cpu_offload,
                 param_init_fn=init_fn,
-                use_orig_params=False,
+                use_orig_params=native_v2,
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_torch_device().current_device(),
                 sharding_strategy=sharding_strategy,  # zero3
@@ -371,7 +391,7 @@ class ActorRolloutRefWorker(Worker):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
+                (parameter for parameter in actor_module_fsdp.parameters() if parameter.requires_grad),
                 lr=optim_config.lr,
                 betas=optim_config.get("betas", (0.9, 0.999)),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
@@ -426,7 +446,7 @@ class ActorRolloutRefWorker(Worker):
 
             log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
             local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
-            lora_kwargs = {"lora_kwargs": {"enable_lora": True, "max_loras": 1, "max_lora_rank": self._lora_rank}} if self._is_lora else {}
+            lora_kwargs = {"lora_kwargs": {"enable_lora": True, "max_loras": 1, "max_lora_rank": self._lora_rank}} if self._is_lora and not self._is_native_lora else {}
             # lora_kwargs = {}
             if vllm_mode == "customized":
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer, model_hf_config=self.actor_model_config, trust_remote_code=trust_remote_code, **lora_kwargs)
@@ -501,6 +521,10 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
+        from verl.opd.rng_state import preserve_training_rng, seed_training_rng
+
+        if self._semantic_checkpoint:
+            seed_training_rng(int(self.config.get("training_seed", 11)), self.rank)
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -563,28 +587,35 @@ class ActorRolloutRefWorker(Worker):
                 and self.opd_config.active
                 and self.opd_config.teacher.type is not TeacherType.CURRENT_ACTOR
             ):
-                self.opd_teacher_module_fsdp = self._build_model_optimizer(
-                    model_path=local_path,
-                    fsdp_config=fsdp_config,
-                    optim_config=None,
-                    override_model_config=override_model_config,
-                    use_remove_padding=use_remove_padding,
-                    use_fused_kernels=False,
-                    enable_gradient_checkpointing=False,
-                    trust_remote_code=self.config.model.get("trust_remote_code", False),
-                    use_liger=False,
-                    role="ref",
-                    enable_activation_offload=False,
-                    cpu_offload_params=False,
-                )[0]
+                with preserve_training_rng() if self._semantic_checkpoint else nullcontext():
+                    self.opd_teacher_module_fsdp = self._build_model_optimizer(
+                        model_path=local_path,
+                        fsdp_config=fsdp_config,
+                        optim_config=None,
+                        override_model_config=override_model_config,
+                        use_remove_padding=use_remove_padding,
+                        use_fused_kernels=False,
+                        enable_gradient_checkpointing=False,
+                        trust_remote_code=self.config.model.get("trust_remote_code", False),
+                        use_liger=False,
+                        role="ref",
+                        enable_activation_offload=False,
+                        cpu_offload_params=False,
+                    )[0]
                 freeze_teacher_(self.opd_teacher_module_fsdp)
-                if self.config.model.get("qwen_replay_backend", "disabled") == "native_fa3_v1":
+                if self.config.model.get("qwen_replay_backend", "disabled") in ("native_fa3_v1", "native_fa3_v2"):
                     actor_buffers = dict(self.actor_module_fsdp.named_buffers())
                     teacher_buffers = dict(self.opd_teacher_module_fsdp.named_buffers())
                     cache_names = [name for name in actor_buffers if name.endswith("_opd_native_rope_cache")]
                     if not cache_names or any(name not in teacher_buffers or not torch.equal(actor_buffers[name], teacher_buffers[name]) for name in cache_names):
                         raise RuntimeError("actor and privileged teacher native RoPE caches differ")
-                squared_distance, parameter_count = parameter_squared_distance_sum_and_count(
+                if self._is_native_lora:
+                    from verl.opd.qwen_lora_ema import initialize_dense_teacher_, effective_parameter_squared_distance_sum_and_count
+                    initialize_dense_teacher_(self.opd_teacher_module_fsdp, self.actor_module_fsdp)
+                    distance_function = effective_parameter_squared_distance_sum_and_count
+                else:
+                    distance_function = parameter_squared_distance_sum_and_count
+                squared_distance, parameter_count = distance_function(
                     self.opd_teacher_module_fsdp,
                     self.actor_module_fsdp,
                 )
@@ -619,7 +650,8 @@ class ActorRolloutRefWorker(Worker):
             )
 
         if self._is_rollout:
-            self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            with preserve_training_rng() if self._semantic_checkpoint else nullcontext():
+                self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
@@ -649,6 +681,7 @@ class ActorRolloutRefWorker(Worker):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
+                semantic_state=self._semantic_checkpoint, restore_rng=not self._semantic_checkpoint,
             )
             if (
                 self.opd_teacher_module_fsdp is not None
@@ -660,11 +693,22 @@ class ActorRolloutRefWorker(Worker):
                     lr_scheduler=None,
                     processing_class=self.processor if self.processor is not None else self.tokenizer,
                     checkpoint_contents=["model", "optimizer", "extra"],
+                    semantic_state=self._semantic_checkpoint, restore_rng=not self._semantic_checkpoint,
                 )
+
+        if self._semantic_checkpoint:
+            # Library/model/engine startup is outside the training RNG stream.
+            # Checkpoint resume replaces this seed after all state is loaded.
+            seed_training_rng(int(self.config.get("training_seed", 11)), self.rank)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         from verl.opd.chat import QWEN3_TRAINING_PROFILE
+
+        if getattr(self, "_semantic_checkpoint", False) and self.config.rollout.name == "vllm":
+            from verl.opd.vllm_lifecycle import require_idle_vllm
+
+            require_idle_vllm(self.rollout.inference_engine)
 
         benchmark_timing = self.opd_config.prompt_profile == QWEN3_TRAINING_PROFILE
         if benchmark_timing:
@@ -832,7 +876,11 @@ class ActorRolloutRefWorker(Worker):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        if is_lora and self._is_native_lora:
+            from verl.opd.qwen_lora import disable_qwen_lora
+            adapter_ctx = disable_qwen_lora(self.actor.actor_module)
+        else:
+            adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         data = data.to(get_torch_device().current_device())
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
@@ -916,11 +964,23 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        from verl.opd.rng_state import preserve_training_rng, save_worker_rng
+        with preserve_training_rng() if self._semantic_checkpoint else nullcontext():
+            self._save_checkpoint_impl(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+        if self._semantic_checkpoint:
+            save_worker_rng(local_path, self.rank, self.world_size, getattr(self, "rollout_sharding_manager", None))
+            dist.barrier()
+
+    def _save_checkpoint_impl(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         # only support save and load ckpt for actor
         assert self._is_actor
 
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            if self._semantic_checkpoint:
+                from verl.opd.checkpoint_semantics import collective_checkpoint_stage
+                collective_checkpoint_stage("actor save materialization", lambda: load_fsdp_model_to_gpu(self.actor_module_fsdp))
+            else:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         if self.opd_checkpoint_manager is not None:
@@ -935,15 +995,24 @@ class ActorRolloutRefWorker(Worker):
                 teacher_path,
                 f"ema_state_world_size_{self.world_size}_rank_{self.rank}.json",
             )
-            temporary_state_path = f"{state_path}.tmp"
-            with open(temporary_state_path, "w", encoding="utf-8") as handle:
-                json.dump(self.actor.ema_state.state_dict(), handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_state_path, state_path)
+            def publish_ema_state():
+                temporary_state_path = f"{state_path}.tmp"
+                with open(temporary_state_path, "w", encoding="utf-8") as handle:
+                    json.dump(self.actor.ema_state.state_dict(), handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_state_path, state_path)
+            if self._semantic_checkpoint:
+                from verl.opd.checkpoint_semantics import collective_checkpoint_stage
+                collective_checkpoint_stage("EMA state publication", publish_ema_state)
+            else:
+                publish_ema_state()
         dist.barrier()
 
-        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+        if self._is_native_lora:
+            from verl.opd.qwen_weight_export import save_native_adapter
+            save_native_adapter(self.actor_module_fsdp, local_path, base_model_path=self.config.model.path)
+        elif self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
             lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
             peft_config = {}
@@ -953,6 +1022,7 @@ class ActorRolloutRefWorker(Worker):
                 peft_config["task_type"] = peft_config["task_type"].value
                 peft_config["peft_type"] = peft_config["peft_type"].value
                 peft_config["target_modules"] = list(peft_config["target_modules"])
+            export_error = None
             try:
                 if fsdp_version(self.actor_module_fsdp) > 0:
                     self.actor_module_fsdp = self.actor_module_fsdp.cuda()
@@ -962,20 +1032,37 @@ class ActorRolloutRefWorker(Worker):
                         with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                             json.dump(peft_config, f, ensure_ascii=False, indent=4)
             except Exception as e:
-                if dist.get_rank() == 0:
-                    print(f"[rank-{self.rank}]: Save LoRA Adapter Error ({e})")
-
-            dist.barrier()
+                export_error = f"{type(e).__name__}: {e}"
+            export_errors = [None] * self.world_size
+            dist.all_gather_object(export_errors, export_error)
+            if any(error is not None for error in export_errors):
+                raise RuntimeError(f"collective adapter checkpoint export failed: {export_errors}")
             if dist.get_rank() == 0:
                 print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}")
 
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._semantic_checkpoint:
+                from verl.opd.checkpoint_semantics import collective_checkpoint_stage
+                collective_checkpoint_stage("actor save offload", lambda: offload_fsdp_model_to_cpu(self.actor_module_fsdp))
+            else:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        from verl.opd.rng_state import preserve_training_rng, restore_worker_rng
+        with preserve_training_rng() if self._semantic_checkpoint else nullcontext():
+            self._load_checkpoint_impl(local_path, hdfs_path, del_local_after_load)
+        if self._semantic_checkpoint:
+            restore_worker_rng(local_path, self.rank, self.world_size, getattr(self, "rollout_sharding_manager", None))
+            dist.barrier()
+
+    def _load_checkpoint_impl(self, local_path, hdfs_path=None, del_local_after_load=False):
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            if self._semantic_checkpoint:
+                from verl.opd.checkpoint_semantics import collective_checkpoint_stage
+                collective_checkpoint_stage("actor load materialization", lambda: load_fsdp_model_to_gpu(self.actor_module_fsdp))
+            else:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
         if self.opd_checkpoint_manager is not None:
@@ -984,21 +1071,37 @@ class ActorRolloutRefWorker(Worker):
                 teacher_path,
                 f"ema_state_world_size_{self.world_size}_rank_{self.rank}.json",
             )
-            if not os.path.isdir(teacher_path) or not os.path.isfile(state_path):
-                raise RuntimeError(f"EMA checkpoint is incomplete under {teacher_path}")
+            def require_teacher_state():
+                if not os.path.isdir(teacher_path) or not os.path.isfile(state_path):
+                    raise RuntimeError(f"EMA checkpoint is incomplete under {teacher_path}")
+            if self._semantic_checkpoint:
+                from verl.opd.checkpoint_semantics import collective_checkpoint_stage
+                collective_checkpoint_stage("EMA state readiness", require_teacher_state)
+            else:
+                require_teacher_state()
             self.opd_checkpoint_manager.load_checkpoint(
                 local_path=teacher_path,
                 hdfs_path=None,
                 del_local_after_load=del_local_after_load,
             )
-            with open(state_path, encoding="utf-8") as handle:
-                self.actor.ema_state.load_state_dict(json.load(handle))
+            def restore_ema_state():
+                with open(state_path, encoding="utf-8") as handle:
+                    self.actor.ema_state.load_state_dict(json.load(handle))
+            if self._semantic_checkpoint:
+                collective_checkpoint_stage("EMA state restoration", restore_ema_state)
+            else:
+                restore_ema_state()
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(self.actor_optimizer)
+        def restore_offload():
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(self.actor_optimizer)
+        if self._semantic_checkpoint:
+            from verl.opd.checkpoint_semantics import collective_checkpoint_stage
+            collective_checkpoint_stage("actor loaded state offload", restore_offload)
+        else:
+            restore_offload()
 
 
 class CriticWorker(Worker):

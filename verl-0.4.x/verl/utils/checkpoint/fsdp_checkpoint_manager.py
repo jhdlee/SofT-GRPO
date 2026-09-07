@@ -23,6 +23,7 @@ from torch.distributed.fsdp import FullStateDictConfig, ShardedOptimStateDictCon
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
 
+from verl.opd.checkpoint_semantics import collective_checkpoint_stage
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_state_ctx
@@ -55,6 +56,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
         processing_class: Union[PreTrainedTokenizer, ProcessorMixin] = None,
         checkpoint_contents: Optional[list] = None,
+        semantic_state: bool = False,
+        restore_rng: bool = True,
         **kwargs,
     ):
         if checkpoint_contents is None:
@@ -72,6 +75,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             processing_class=processing_class,
             checkpoint_contents=checkpoint_contents,
         )
+        self.semantic_state = semantic_state
+        self.restore_rng = restore_rng
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
         """
@@ -94,23 +99,36 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
         remote_extra_state_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
         print(f"[rank-{self.rank}]: Loading from {remote_model_path} and {remote_optim_path} and {remote_extra_state_path}")
-        local_model_path = copy_to_local(remote_model_path)
-        local_optim_path = copy_to_local(remote_optim_path)
-        local_extra_state_path = copy_to_local(remote_extra_state_path)
+        def deserialize_local():
+            local_model_path = copy_to_local(remote_model_path)
+            local_optim_path = copy_to_local(remote_optim_path)
+            local_extra_state_path = copy_to_local(remote_extra_state_path)
 
-        model_state_dict = torch.load(local_model_path, weights_only=False)
-        optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
-        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+            model_state_dict = torch.load(local_model_path, weights_only=False)
+            optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+            extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
 
-        if del_local_after_load:
-            try:
-                os.remove(local_model_path) if is_non_local(local_model_path) else None
-                os.remove(local_optim_path) if is_non_local(local_optim_path) else None
-                os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
-            except Exception as e:
-                print(f"[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored")
+            if del_local_after_load:
+                try:
+                    os.remove(local_model_path) if is_non_local(local_model_path) else None
+                    os.remove(local_optim_path) if is_non_local(local_optim_path) else None
+                    os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
+                except Exception as e:
+                    print(f"[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored")
 
-        lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
+            lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
+            if self.semantic_state:
+                from verl.opd.checkpoint_semantics import verify_model_state
+                verify_model_state(
+                    os.path.join(local_path, f"semantic_state_world_size_{self.world_size}_rank_{self.rank}.json"),
+                    model_state_dict, optimizer_state_dict, lr_scheduler_state_dict,
+                    rank=self.rank, world_size=self.world_size,
+                )
+            return model_state_dict, optimizer_state_dict, lr_scheduler_state_dict, extra_state_dict
+
+        loaded = (collective_checkpoint_stage("FSDP local load", deserialize_local)
+                  if self.semantic_state else deserialize_local())
+        model_state_dict, optimizer_state_dict, lr_scheduler_state_dict, extra_state_dict = loaded
 
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
@@ -119,7 +137,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if self.optimizer is not None:
                 self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state
-        if "rng" in extra_state_dict:
+        if self.restore_rng and "rng" in extra_state_dict:
             # 'rng' may not exist for backward compatibility
             self.load_rng_state(extra_state_dict["rng"])
 
@@ -156,7 +174,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
             self.previous_saved_paths = self.previous_saved_paths[keep_start:]
 
-        local_path = self.local_mkdir(local_path)
+        local_path = (collective_checkpoint_stage("FSDP directory preparation", lambda: self.local_mkdir(local_path))
+                      if self.semantic_state else self.local_mkdir(local_path))
         torch.distributed.barrier()
 
         # every rank will save its own model and optim shard
@@ -180,27 +199,46 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 print(f"[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}")
                 print(f"[rank-{self.rank}]: Saving optim to {os.path.abspath(optim_path)}")
                 print(f"[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}")
-                torch.save(model_state_dict, model_path)
-                torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
-                torch.save(extra_state_dict, extra_path)
+                def serialize_local():
+                    torch.save(model_state_dict, model_path)
+                    torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
+                    torch.save(extra_state_dict, extra_path)
+                    if self.semantic_state:
+                        from verl.opd.checkpoint_semantics import model_state_record, write_record
+                        write_record(
+                            os.path.join(local_path, f"semantic_state_world_size_{self.world_size}_rank_{self.rank}.json"),
+                            model_state_record(model_state_dict, optimizer_state_dict, lr_scheduler_state_dict,
+                                               rank=self.rank, world_size=self.world_size),
+                        )
+                if self.semantic_state:
+                    collective_checkpoint_stage("FSDP rank state publication", serialize_local)
+                else:
+                    serialize_local()
 
-        if self.rank == 0:
-            if fsdp_version(self.model) == 1:
-                unwrap_model = self.model._fsdp_wrapped_module
-            else:
-                unwrap_model = self.model
+        model_config, generation_config = None, None
+        def metadata_local():
+            nonlocal model_config, generation_config
+            if self.rank == 0:
+                if fsdp_version(self.model) == 1:
+                    unwrap_model = self.model._fsdp_wrapped_module
+                else:
+                    unwrap_model = self.model
 
-            model_config = unwrap_model.config
-            if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
-                # Some model's name_or_path is empty if not initialized from pretrained,
-                # in this cases, we don't save generation config.
-                generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
-                generation_config.save_pretrained(local_path)
-            else:
-                generation_config = None
+                model_config = unwrap_model.config
+                if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
+                    # Some model's name_or_path is empty if not initialized from pretrained,
+                    # in this cases, we don't save generation config.
+                    generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
+                    generation_config.save_pretrained(local_path)
+                else:
+                    generation_config = None
 
-            model_config.save_pretrained(local_path)
-            self.processing_class.save_pretrained(local_path)
+                model_config.save_pretrained(local_path)
+                self.processing_class.save_pretrained(local_path)
+        if self.semantic_state:
+            collective_checkpoint_stage("FSDP metadata publication", metadata_local)
+        else:
+            metadata_local()
 
         # wait for everyone to dump to local
         torch.distributed.barrier()

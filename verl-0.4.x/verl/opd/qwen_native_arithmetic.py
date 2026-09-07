@@ -190,12 +190,18 @@ def _replay_cache_device(cache_device):
     return torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
 
 
-def _packed_linear(value, modules, linear=F.linear):
-    weight = torch.cat([module.weight for module in modules], 0)
+def _packed_linear(value, modules, linear=F.linear, *, fp32_masters=False):
+    if fp32_masters:
+        from verl.opd.qwen_lora import effective_projection_weight
+        weight = torch.cat([effective_projection_weight(module, dtype=value.dtype) for module in modules], 0)
+    else:
+        weight = torch.cat([module.weight for module in modules], 0)
     biases = [module.bias for module in modules]
     if any(bias is None for bias in biases) and not all(bias is None for bias in biases):
         raise ValueError("mixed packed-projection bias settings are unsupported")
     bias = None if biases[0] is None else torch.cat(biases, 0)
+    if bias is not None and fp32_masters:
+        bias = bias.to(value.dtype)
     return linear(value, weight, bias)
 
 
@@ -210,29 +216,42 @@ def install_probe_candidate(model, *, emit=None, linear=F.linear, attention=None
     return _install_native_arithmetic(model, emit=emit, linear=linear, attention=attention)
 
 
-def install_qwen_replay_arithmetic(model, *, cache_device, emit=None):
+def install_qwen_replay_arithmetic(model, *, cache_device, emit=None, backend="native_fa3_v1"):
     """Install replay arithmetic before FSDP wrapping without replacing weights.
 
     ``cache_device`` must be the rank's actual CUDA execution device even when
-    model parameters are still FP32 on CPU. Workers must enforce FSDP1 with
-    BF16 parameters, FP32 buffers, TP/SP=1, and disabled gradient checkpointing.
-    Both actor and teacher must install this before EMA or checkpoint loading.
+    model parameters are still FP32 on CPU. Version one retains BF16 FSDP
+    forward parameters; version two gathers FP32 masters and casts explicitly
+    for BF16 arithmetic. Both require FSDP1, FP32 buffers, TP/SP=1, and disabled
+    gradient checkpointing. Install actor and teacher before checkpoint loading.
     """
     from verl.opd.batch_invariant_linear import batch_invariant_linear
     from verl.opd.native_fa3_attention import native_fa3_attention
 
+    if backend not in ("native_fa3_v1", "native_fa3_v2"):
+        raise ValueError("Qwen replay installer requires native_fa3_v1 or native_fa3_v2")
+    if backend == "native_fa3_v2":
+        from verl.opd.native_fa3_attention import native_fa3_attention_v2
+        native_fa3_attention = native_fa3_attention_v2
+        if model.config.head_dim != 128:
+            raise ValueError("native_fa3_v2 requires head dimension 128")
+
     return _install_native_arithmetic(
         model, emit=emit, linear=batch_invariant_linear, attention=native_fa3_attention,
-        cache_device=cache_device, production=True,
+        cache_device=cache_device, production=True, fp32_masters=backend == "native_fa3_v2",
     )
 
 
 def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=None,
-                               cache_device=None, production=False):
+                               cache_device=None, production=False, fp32_masters=False):
     if model.config.model_type != "qwen3" or getattr(model.config, "rope_scaling", None):
         raise ValueError("candidate supports unscaled dense Qwen3 only")
     if getattr(model, "_opd_native_arithmetic_candidate", False):
         raise ValueError("candidate already installed")
+    if getattr(model, "_opd_qwen_lora_config", None) is not None and not fp32_masters:
+        raise ValueError("native LoRA requires the v2 FP32-master arithmetic")
+    if fp32_masters and any(parameter.dtype != torch.float32 for parameter in model.parameters()):
+        raise ValueError("native_fa3_v2 requires FP32 model and adapter masters")
     core = model.model
     config = model.config
     if getattr(core, "gradient_checkpointing", False):
@@ -269,6 +288,17 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
         if emit is not None:
             emit(name, tensor.detach().reshape(-1, tensor.shape[-1]))
 
+    def norm_weight(module, dtype):
+        return module.weight.to(dtype) if fp32_masters else module.weight
+
+    def projection(value, module):
+        if fp32_masters:
+            from verl.opd.qwen_lora import effective_projection_weight
+            weight = effective_projection_weight(module, dtype=value.dtype)
+            bias = None if module.bias is None else module.bias.to(value.dtype)
+            return linear(value, weight, bias)
+        return linear(value, module.weight, module.bias)
+
     def layer_forward(layer, hidden_states, *, residual=None, attention_mask=None, position_ids=None, rope_cache=None,
                       _opd_rope_positions_validated=False, **kwargs):
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -277,17 +307,17 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
         prefix = f"layer.{layer.self_attn.layer_idx}."
         if residual is None:
             residual = hidden_states
-            normalized = native_rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
+            normalized = native_rms_norm(hidden_states, norm_weight(layer.input_layernorm, hidden_states.dtype), layer.input_layernorm.variance_epsilon)
         else:
-            normalized, residual = native_rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon, residual)
+            normalized, residual = native_rms_norm(hidden_states, norm_weight(layer.input_layernorm, hidden_states.dtype), layer.input_layernorm.variance_epsilon, residual)
         record(prefix + "norm_in", normalized)
         attn = layer.self_attn
-        qkv = _packed_linear(normalized, (attn.q_proj, attn.k_proj, attn.v_proj), linear)
+        qkv = _packed_linear(normalized, (attn.q_proj, attn.k_proj, attn.v_proj), linear, fp32_masters=fp32_masters)
         record(prefix + "qkv", qkv)
         shape = normalized.shape[:-1]
         query, key, value = qkv.split((attn.q_proj.out_features, attn.k_proj.out_features, attn.v_proj.out_features), -1)
-        query = native_rms_norm(query.reshape(-1, head_dim), attn.q_norm.weight, attn.q_norm.variance_epsilon).reshape(-1, config.num_attention_heads, head_dim)
-        key = native_rms_norm(key.reshape(-1, head_dim), attn.k_norm.weight, attn.k_norm.variance_epsilon).reshape(-1, config.num_key_value_heads, head_dim)
+        query = native_rms_norm(query.reshape(-1, head_dim), norm_weight(attn.q_norm, query.dtype), attn.q_norm.variance_epsilon).reshape(-1, config.num_attention_heads, head_dim)
+        key = native_rms_norm(key.reshape(-1, head_dim), norm_weight(attn.k_norm, key.dtype), attn.k_norm.variance_epsilon).reshape(-1, config.num_key_value_heads, head_dim)
         record(prefix + "q_norm", query.flatten(1)); record(prefix + "k_norm", key.flatten(1))
         query, key = native_rope(query, key, position_ids, rope_cache,
                                 _positions_validated=_opd_rope_positions_validated)
@@ -300,14 +330,14 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
                                 scaling=attn.scaling, sliding_window=attn.sliding_window, position_ids=position_ids, **kwargs)
         attended = attended.reshape(*shape, -1).contiguous()
         record(prefix + "attention", attended)
-        projected = linear(attended, attn.o_proj.weight, attn.o_proj.bias)
+        projected = projection(attended, attn.o_proj)
         record(prefix + "attention_projected", projected)
-        normalized, residual = native_rms_norm(projected, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.variance_epsilon, residual)
+        normalized, residual = native_rms_norm(projected, norm_weight(layer.post_attention_layernorm, projected.dtype), layer.post_attention_layernorm.variance_epsilon, residual)
         record(prefix + "norm_post", normalized)
-        gate_up = _packed_linear(normalized, (layer.mlp.gate_proj, layer.mlp.up_proj), linear)
+        gate_up = _packed_linear(normalized, (layer.mlp.gate_proj, layer.mlp.up_proj), linear, fp32_masters=fp32_masters)
         record(prefix + "gate_up", gate_up)
-        hidden_states = linear(native_silu_mul(gate_up.reshape(-1, gate_up.shape[-1])).reshape(*shape, -1),
-                               layer.mlp.down_proj.weight, layer.mlp.down_proj.bias)
+        hidden_states = projection(native_silu_mul(gate_up.reshape(-1, gate_up.shape[-1])).reshape(*shape, -1),
+                                   layer.mlp.down_proj)
         record(prefix + "mlp", hidden_states)
         if emit is not None:
             record(prefix + "block_total", (hidden_states.float() + residual.float()).to(hidden_states.dtype))
@@ -328,6 +358,8 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("provide exactly one of input_ids or inputs_embeds")
         hidden_states = core_self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        if fp32_masters:
+            hidden_states = hidden_states.to(torch.bfloat16)
         if hidden_states.ndim != 3 or (production and hidden_states.shape[0] != 1):
             raise ValueError("Qwen replay requires hidden states [1, total_tokens, hidden_dim]")
         if position_ids is None:
@@ -368,13 +400,13 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
             hidden_states, residual = layer(hidden_states, residual=residual, attention_mask=mask, position_ids=position_ids,
                                             rope_cache=core_self._opd_native_rope_cache,
                                             _opd_rope_positions_validated=True, **kwargs)
-        hidden_states, _ = native_rms_norm(hidden_states, core_self.norm.weight, core_self.norm.variance_epsilon, residual)
+        hidden_states, _ = native_rms_norm(hidden_states, norm_weight(core_self.norm, hidden_states.dtype), core_self.norm.variance_epsilon, residual)
         record("final_norm", hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 
     core.forward = types.MethodType(model_forward, core)
-    if linear is not F.linear:
+    if linear is not F.linear or fp32_masters:
         def head_forward(head, hidden_states):
-            return linear(hidden_states, head.weight, head.bias)
+            return projection(hidden_states, head)
         model.lm_head.forward = types.MethodType(head_forward, model.lm_head)
     return model

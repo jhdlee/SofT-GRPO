@@ -491,6 +491,7 @@ def _write_checkpoint_manifest(
     selection_metric_value: Optional[float] = None,
     selection_tiebreak_metric_name: Optional[str] = None,
     selection_tiebreak_metric_value: Optional[float] = None,
+    semantic_state: bool = False,
 ) -> dict[str, object]:
     """Hash every payload file and make the manifest durable in the temp tree."""
 
@@ -563,6 +564,11 @@ def _write_checkpoint_manifest(
         manifest["opd_teacher_tree_sha256"] = _inventory_digest(
             opd_teacher_entries
         )
+    if semantic_state:
+        from verl.opd.checkpoint_semantics import checkpoint_semantic_identity
+        manifest["semantic_identity"] = checkpoint_semantic_identity(
+            checkpoint_dir, world_size=world_size, require=True,
+        )
     manifest_path = os.path.join(checkpoint_dir, _CHECKPOINT_MANIFEST)
     temporary_path = f"{manifest_path}.{uuid.uuid4().hex}.tmp"
     try:
@@ -584,6 +590,7 @@ def _verify_checkpoint(
     *,
     require_committed_name: bool = True,
     expected_provenance: Optional[Mapping[str, object]] = None,
+    require_semantic: bool = False,
 ) -> dict[str, object]:
     """Fail closed unless a checkpoint manifest and every payload hash agree."""
 
@@ -698,6 +705,13 @@ def _verify_checkpoint(
             raise RuntimeError("checkpoint OPD teacher digest is inconsistent")
     elif teacher_digest is not None:
         raise RuntimeError("checkpoint has an OPD teacher digest without teacher state")
+    if require_semantic or "semantic_identity" in manifest or "driver_semantic.json" in expected:
+        from verl.opd.checkpoint_semantics import checkpoint_semantic_identity
+        identity = checkpoint_semantic_identity(
+            checkpoint_dir, world_size=manifest["world_size"], require=True,
+        )
+        if manifest.get("semantic_identity") != identity:
+            raise RuntimeError("checkpoint semantic identity is inconsistent")
     return manifest
 
 
@@ -2056,6 +2070,10 @@ class RayPPOTrainer:
                 "torch_cpu": torch.get_rng_state(),
             },
         }
+        semantic_state = self.config.trainer.get("checkpoint_semantics") == "qwen_semantic_v1"
+        if semantic_state:
+            from verl.opd.rng_state import capture_rng_state
+            driver_state["semantic_rng"] = capture_rng_state()
 
         try:
             _write_rollout_integrity_record(temporary_checkpoint_dir, rollout_record)
@@ -2078,8 +2096,15 @@ class RayPPOTrainer:
                     max_ckpt_to_keep=None,
                 )
 
-            torch.save(self.train_dataloader.state_dict(), os.path.join(temporary_checkpoint_dir, "data.pt"))
+            dataloader_state = self.train_dataloader.state_dict()
+            torch.save(dataloader_state, os.path.join(temporary_checkpoint_dir, "data.pt"))
             torch.save(driver_state, os.path.join(temporary_checkpoint_dir, "driver_state.pt"))
+            if semantic_state:
+                from verl.opd.checkpoint_semantics import semantic_sha256, write_record
+                write_record(os.path.join(temporary_checkpoint_dir, "driver_semantic.json"), {
+                    "rng_sha256": semantic_sha256(driver_state["semantic_rng"]),
+                    "dataloader_sha256": semantic_sha256(dataloader_state),
+                })
             manifest = _write_checkpoint_manifest(
                 temporary_checkpoint_dir,
                 checkpoint_name=checkpoint_name,
@@ -2095,6 +2120,7 @@ class RayPPOTrainer:
                 selection_metric_value=selection_metric_value,
                 selection_tiebreak_metric_name=selection_tiebreak_metric_name,
                 selection_tiebreak_metric_value=selection_tiebreak_metric_value,
+                semantic_state=semantic_state,
             )
             _verify_checkpoint(
                 temporary_checkpoint_dir,
@@ -2125,6 +2151,12 @@ class RayPPOTrainer:
                 shutil.rmtree(temporary_checkpoint_dir)
                 _fsync_directory(checkpoint_root)
             raise
+        finally:
+            if semantic_state:
+                # Checkpoint RPCs and serialization are outside the training
+                # stream, including their library-internal random work.
+                from verl.opd.rng_state import restore_rng_state
+                restore_rng_state(driver_state["semantic_rng"])
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -2164,6 +2196,9 @@ class RayPPOTrainer:
             raise ValueError(f"unsupported trainer.resume_mode: {self.config.trainer.resume_mode}")
         if manifest is None or global_step_folder is None:
             raise RuntimeError("checkpoint resolution returned no verified checkpoint")
+        semantic_state = self.config.trainer.get("checkpoint_semantics") == "qwen_semantic_v1"
+        if semantic_state and manifest.get("semantic_identity", {}).get("schema") != "qwen_semantic_v1":
+            raise RuntimeError("this training profile requires a semantic checkpoint")
         self.global_steps = int(manifest["global_step"])
         if int(manifest["world_size"]) != int(self.actor_rollout_wg.world_size):
             raise RuntimeError(
@@ -2221,10 +2256,19 @@ class RayPPOTrainer:
                     f"driver checkpoint field {key!r} disagrees: "
                     f"{driver_state.get(key)!r} != {expected_value!r}"
                 )
-        rng_state = driver_state["rng"]
-        random.setstate(rng_state["python"])
-        np.random.set_state(rng_state["numpy"])
-        torch.set_rng_state(rng_state["torch_cpu"])
+        if semantic_state:
+            from verl.opd.checkpoint_semantics import read_record, semantic_sha256
+            from verl.opd.rng_state import restore_rng_state
+            semantic_driver = read_record(os.path.join(global_step_folder, "driver_semantic.json"))
+            if (semantic_driver["dataloader_sha256"] != semantic_sha256(dataloader_state_dict)
+                    or semantic_driver["rng_sha256"] != semantic_sha256(driver_state["semantic_rng"])):
+                raise RuntimeError("loaded driver RNG/dataloader semantic identity differs")
+            restore_rng_state(driver_state["semantic_rng"])
+        else:
+            rng_state = driver_state["rng"]
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            torch.set_rng_state(rng_state["torch_cpu"])
         _atomic_write_text(
             os.path.join(os.path.dirname(global_step_folder), _CHECKPOINT_TRACKER),
             f"{self.global_steps}\n",
@@ -2328,6 +2372,9 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint before doing anything
+        if self.config.trainer.get("checkpoint_semantics") == "qwen_semantic_v1":
+            from verl.opd.rng_state import seed_training_rng
+            seed_training_rng(int(self.config.data.seed), namespace="driver")
         self._load_checkpoint()
         self._resumed = self.global_steps > 0
         if self.global_steps >= self.total_training_steps:
@@ -2915,6 +2962,8 @@ class RayPPOTrainer:
                     grad_clip=self.config.actor_rollout_ref.actor.grad_clip,
                     checkpoint_committed=checkpoint_committed,
                     resumed=self._resumed,
+                    reference_kl_coef=(self.config.actor_rollout_ref.actor.kl_loss_coef
+                                       if self.config.actor_rollout_ref.actor.use_kl_loss else 0.0),
                 )
                 if self.rollout_integrity_config.enabled:
                     validate_iteration_metric_contract(metrics)

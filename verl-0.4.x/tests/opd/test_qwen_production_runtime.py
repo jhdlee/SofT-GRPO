@@ -141,7 +141,8 @@ def test_production_retains_finite_gradient_and_metric_checks(name, bad):
 
 
 @pytest.mark.parametrize("completed,continues", [(108, True), (109, False), (110, False)])
-def test_real_fit_resume_guard_stops_before_duplicate_validation_or_rollout(completed, continues):
+@pytest.mark.parametrize("semantic_mode", [None, "qwen_semantic_v1"])
+def test_real_fit_resume_guard_stops_before_duplicate_validation_or_rollout(completed, continues, semantic_mode, monkeypatch):
     source = Path(__file__).resolve().parents[2] / "verl/trainer/ppo/ray_trainer.py"
     tree = ast.parse(source.read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RayPPOTrainer")
@@ -151,9 +152,17 @@ def test_real_fit_resume_guard_stops_before_duplicate_validation_or_rollout(comp
     method = ast.FunctionDef(name="guard", args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="self")], kwonlyargs=[], kw_defaults=[], defaults=[]), body=fit.body[start:stop + 1] + [ast.Return(value=ast.Constant(value=True))], decorator_list=[])
     namespace = {}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(source), "exec"), namespace)
-    trainer = SimpleNamespace(global_steps=0, total_training_steps=109)
-    trainer._load_checkpoint = lambda: setattr(trainer, "global_steps", completed)
+    trainer = SimpleNamespace(global_steps=0, total_training_steps=109,
+                              config=SimpleNamespace(trainer={"checkpoint_semantics": semantic_mode},
+                                                     data=SimpleNamespace(seed=11)))
+    calls = []
+    monkeypatch.setattr('verl.opd.rng_state.seed_training_rng', lambda seed, **kw: calls.append(('seed', seed, kw)))
+    def load():
+        calls.append(('load',))
+        trainer.global_steps = completed
+    trainer._load_checkpoint = load
     assert bool(namespace["guard"](trainer)) is continues
+    assert calls == ([('seed', 11, {'namespace': 'driver'})] if semantic_mode else []) + [('load',)]
 
 
 def test_remaining_runtime_uses_active_critical_path_without_double_counting_overhead():

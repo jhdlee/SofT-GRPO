@@ -28,6 +28,7 @@ When working with Megatron:
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Dict, List, Union
@@ -116,9 +117,12 @@ class vLLMRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        self._frozen_batch_guard = config.get("qwen_replay_backend", "disabled") == "native_fa3_v2"
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        if self._frozen_batch_guard and tensor_parallel_size != 1:
+            raise ValueError("Qwen frozen hard-rollout lifecycle requires TP1")
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
@@ -199,6 +203,7 @@ class vLLMRollout(BaseRollout):
             **lora_kwargs,
             **engine_kwargs,
         )
+        self.inference_engine._qwen_frozen_batch_guard = self._frozen_batch_guard
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -233,15 +238,36 @@ class vLLMRollout(BaseRollout):
                     old_value = getattr(self.sampling_params, key)
                     old_sampling_params_args[key] = old_value
                     setattr(self.sampling_params, key, value)
-        yield
-        # roll back to previous sampling params
-        # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+        try:
+            yield
+        finally:
+            for key, value in old_sampling_params_args.items():
+                setattr(self.sampling_params, key, value)
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        if not self._frozen_batch_guard:
+            return self._generate_sequences_impl(prompts, **kwargs)
+        from verl.opd.vllm_lifecycle import poison_vllm, require_idle_vllm
+        self._generation_stage = "preparation"
+        started = time.perf_counter()
+        try:
+            require_idle_vllm(self.inference_engine)
+            self.inference_engine._opd_batch_outstanding = True
+            output = self._generate_sequences_impl(prompts, **kwargs)
+            self.inference_engine._opd_batch_outstanding = False
+            require_idle_vllm(self.inference_engine)
+            output.meta_info["rollout_timing"]["total_generation_seconds"] = time.perf_counter() - started
+            return output
+        except BaseException as failure:
+            # A failed synchronous frontend can leave queued scheduler entries.
+            # Keep the engine poisoned through the enclosing collective exit;
+            # the controller terminates the affected job, never reuses it.
+            poison_vllm(self.inference_engine, f"{self._generation_stage}: {type(failure).__name__}: {failure}")
+            raise
+
+    def _generate_sequences_impl(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
         if (
             vllm_version
@@ -373,12 +399,26 @@ class vLLMRollout(BaseRollout):
                         for request in lora_requests
                         for _ in range(requested_n)
                     ]
+            if self._frozen_batch_guard:
+                self._generation_stage = "engine generation"
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                generation_started = time.perf_counter()
             outputs = self.inference_engine.generate(
                 prompts=generation_inputs,  # token IDs were prepared above
                 sampling_params=request_sampling_params,
                 lora_request=generation_lora_requests,
                 use_tqdm=False,
             )
+            if self._frozen_batch_guard:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                generation_seconds = time.perf_counter() - generation_started
+                assembly_started = time.perf_counter()
+                self._generation_stage = "tensor assembly"
+                expected_samples = 1 if expanded_sampling_seeds is not None else requested_n
+                if len(outputs) != len(generation_inputs) or any(len(item.outputs) != expected_samples for item in outputs):
+                    raise RuntimeError("vLLM returned an incomplete request/sample inventory")
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -388,6 +428,8 @@ class vLLMRollout(BaseRollout):
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
+                    if self._frozen_batch_guard and len(output.outputs[sample_id].logprobs) != len(response_ids):
+                        raise RuntimeError("vLLM token and rollout-density lengths differ")
                     response.append(response_ids)
                     curr_log_prob = []
                     for i, logprob in enumerate(output.outputs[sample_id].logprobs):
@@ -464,7 +506,18 @@ class vLLMRollout(BaseRollout):
         ):
             self.inference_engine.free_cache_engine()
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        result = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        if self._frozen_batch_guard:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            result.meta_info["rollout_timing"] = {
+                "engine_generation_seconds": generation_seconds,
+                "tensor_assembly_seconds": time.perf_counter() - assembly_started,
+                "generated_tokens": sum(len(sample.token_ids) for output in outputs for sample in output.outputs),
+                "dispatch_mode": "vllm_expanded_batch" if expanded_sampling_seeds is not None else "vllm_batch",
+                "timing_method": "cuda_synchronized_wall" if torch.cuda.is_available() else "cpu_wall",
+            }
+        return result
 
 
 class vLLMAsyncRollout:

@@ -63,6 +63,12 @@ class TaskRunner:
         from verl.utils.fs import copy_to_local
 
         OmegaConf.resolve(config)
+        semantic_mode = config.trainer.get("checkpoint_semantics", None)
+        if semantic_mode not in (None, "qwen_semantic_v1"):
+            raise ValueError(f"unsupported checkpoint semantics: {semantic_mode}")
+        if semantic_mode:
+            from verl.opd.rng_state import seed_training_rng
+            seed_training_rng(int(config.data.seed), namespace="driver")
 
         # Keep ``algorithm.opd`` as the one public source of truth while making
         # an independent, fully resolved copy available to the colocated
@@ -77,6 +83,9 @@ class TaskRunner:
         with open_dict(config):
             config.actor_rollout_ref.opd = OmegaConf.create(resolved_opd)
             config.actor_rollout_ref.rollout_integrity = OmegaConf.create(resolved_integrity)
+            if semantic_mode:
+                config.actor_rollout_ref.checkpoint_semantics = semantic_mode
+                config.actor_rollout_ref.training_seed = int(config.data.seed)
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
 

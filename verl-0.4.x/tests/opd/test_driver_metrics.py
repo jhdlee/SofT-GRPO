@@ -691,6 +691,18 @@ def test_hbm_alias_uses_the_maximum_worker_rank():
     assert metrics["system/hbm_peak_gib"] == 68.5
 
 
+@pytest.mark.parametrize("coefficient", [0.0, 0.001])
+def test_reference_kl_option_changes_only_reference_part_of_total_metric(coefficient):
+    metrics = add_canonical_metric_aliases(
+        {"actor/pg_loss": 2.0, "actor/kl_loss": 3.0, "actor/opd_weighted": 0.25},
+        opd_config=OPDConfig(), rollout_iteration=1, total_iterations=109,
+        optimizer_step=4, grad_clip=1.0, checkpoint_committed=False, resumed=False,
+        reference_kl_coef=coefficient,
+    )
+    assert metrics["loss/total"] == pytest.approx(2.25 + 3.0 * coefficient)
+    assert metrics["loss/opd_weighted"] == 0.25
+
+
 def test_per_rank_resource_gate_enforces_fixed_acceptance_limits():
     validate_resource_limits(hbm_peak_gib=71.999, host_ram_percent=89.999)
     with pytest.raises(RuntimeError, match="HBM gate failed"):

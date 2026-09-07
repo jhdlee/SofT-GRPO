@@ -21,6 +21,56 @@ def values(overrides):
     return result
 
 
+@pytest.mark.parametrize("arm", production.ARM_IDS)
+@pytest.mark.parametrize("finetuning", ["full", "lora"])
+@pytest.mark.parametrize("reference_kl", ["recipe", "off"])
+def test_revised_profile_composes_native_training_and_independent_reference_kl(tmp_path, arm, finetuning, reference_kl):
+    import hydra
+    options = production.TrainingOptions(finetuning=finetuning, reference_kl=reference_kl)
+    overrides = production.production_overrides(arm, tmp_path / "assets", tmp_path / "run", training_options=options)
+    directory = Path(qwen_training.__file__).resolve().parents[1] / "verl-0.4.x/verl/trainer/config"
+    with hydra.initialize_config_dir(config_dir=str(directory), version_base=None):
+        config = hydra.compose(config_name="ppo_trainer", overrides=overrides)
+    assert config.trainer.training_profile == production.LORA_PROFILE_ID
+    assert config.trainer.checkpoint_semantics == config.actor_rollout_ref.checkpoint_semantics == "qwen_semantic_v1"
+    assert config.actor_rollout_ref.model.lora_rank == (32 if finetuning == "lora" else 0)
+    assert config.actor_rollout_ref.model.lora_alpha == 64
+    assert config.actor_rollout_ref.actor.optim.lr == 1e-6
+    assert config.actor_rollout_ref.model.qwen_replay_backend == config.actor_rollout_ref.rollout.qwen_replay_backend == "native_fa3_v2"
+    assert config.actor_rollout_ref.rollout.enable_soft_thinking == (arm != production.ARM_IDS[0])
+    assert config.actor_rollout_ref.actor.use_kl_loss == (reference_kl == "recipe" and arm != production.ARM_IDS[2])
+    assert config.actor_rollout_ref.actor.kl_loss_coef == (0.001 if config.actor_rollout_ref.actor.use_kl_loss else 0.0)
+    assert config.algorithm.opd.enabled == production.resolve_arm(arm).opd_enabled
+    assert not config.algorithm.use_kl_in_reward
+    assert config.trainer.max_rollout_iterations_per_invocation is None
+
+
+@pytest.mark.parametrize("arm", production.ARM_IDS[3:])
+def test_revised_prologue_inherits_lora_and_kl_options(tmp_path, arm):
+    options = production.TrainingOptions(lora_rank=16, lora_alpha=32, reference_kl="off")
+    results = {}
+    for phase in production.PHASES:
+        results[phase] = values(production.production_overrides(
+            arm, tmp_path / "assets", tmp_path / "run", phase=phase,
+            resume_from_path=tmp_path / "checkpoint" if phase == "resume" else None,
+            training_options=options,
+        ))
+        assert results[phase]["actor_rollout_ref.model.lora_rank"] == 16
+        assert results[phase]["actor_rollout_ref.model.lora_alpha"] == 32
+        assert not results[phase]["actor_rollout_ref.actor.use_kl_loss"]
+        assert results[phase]["trainer.total_training_steps"] is None
+    assert not results["zero_dose"]["algorithm.opd.enabled"]
+    assert results["full_dose"]["algorithm.opd.schedule"] == "constant"
+    assert results["full_dose"]["algorithm.opd.beta_base"] == production.resolve_arm(arm).beta_base
+
+
+@pytest.mark.parametrize("options", [dict(lora_rank=0), dict(lora_rank=True), dict(lora_alpha=-1),
+                                  dict(lora_target_modules=("lm_head",)), dict(reference_kl="opd_off")])
+def test_revised_options_reject_unsupported_parameterization(options):
+    with pytest.raises(ValueError):
+        production.TrainingOptions(**options)
+
+
 def test_order_objectives_and_historical_registry_are_isolated():
     historical = [spec.as_manifest() for spec in study.ARM_SPECS]
     assert production.ARM_IDS == (
@@ -189,6 +239,33 @@ def test_manifest_materialization_authenticates_source_assets_order_and_environm
         assert arm["production_overrides_sha256"] == canonical_sha256(command[3:])
     changed = production.build_manifest(**{**manifest_inputs, "hard_env": manifest_inputs["hard_env"] / "new"})
     assert changed["arms"][0]["wandb_run_id"] != manifest["arms"][0]["wandb_run_id"]
+
+
+def test_revised_manifest_binds_one_environment_and_all_phase_options(manifest_inputs):
+    runtime = manifest_inputs["soft_env"]
+    runtime.mkdir()
+    runtime_file = runtime / "opd-runtime-manifest.json"
+    runtime_payload = {"schema_version": 1, "cpu_ray_preflight": True, "dependency_lock_sha256": "c" * 64,
+                       "build_record": {"source": {key: manifest_inputs[key] for key in ("parent_commit", "fork_commit")}}}
+    runtime_file.write_text(json.dumps(production._seal(runtime_payload)))
+    kwargs = {**manifest_inputs, "hard_env": runtime, "training_options": production.TrainingOptions()}
+    manifest = production.materialize_manifest(**kwargs)
+    path = kwargs["study_root"] / "manifest.json"
+    assert production.verify_manifest(path) == manifest
+    assert manifest["profile_id"] == production.LORA_PROFILE_ID
+    assert len({row["environment_root"] for row in manifest["arms"]}) == 1
+    assert all(row["runtime_packages"] == production.SHARED_RUNTIME_PINS for row in manifest["arms"])
+    for arm in manifest["arms"]:
+        assert values(production.phase_command(manifest, arm["arm_id"], "split")[3:])["actor_rollout_ref.model.lora_rank"] == 32
+        assert arm["contract"]["checkpoint_semantics"] == "qwen_semantic_v1"
+    runtime_file.write_text(json.dumps(production._seal({**runtime_payload, "dependency_lock_sha256": "d" * 64})))
+    with pytest.raises(ValueError, match="contract"):
+        production.verify_manifest(path)
+    with pytest.raises(ValueError, match="one shared"):
+        production.build_manifest(**{**kwargs, "hard_env": runtime / "different"})
+    runtime_file.write_text(json.dumps(production._seal({**runtime_payload, "build_record": {"source": {}}})))
+    with pytest.raises(ValueError, match="runtime source"):
+        production.build_manifest(**kwargs)
 
 
 @pytest.mark.parametrize("tamper", ["beta", "resources", "order", "profile", "config", "arm_file"])

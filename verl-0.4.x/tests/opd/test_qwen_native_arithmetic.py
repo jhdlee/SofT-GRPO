@@ -240,6 +240,34 @@ def _install_cpu_replay_reference(monkeypatch, model, **kwargs):
     return install_qwen_replay_arithmetic(model, cache_device="cuda:0", **kwargs)
 
 
+def test_fp32_master_native_decoder_adapters_match_base_and_receive_causal_gradients(monkeypatch):
+    import verl.opd.qwen_native_arithmetic as arithmetic
+    from verl.opd.native_fa3_attention import native_fa3_attention
+    from verl.opd.qwen_lora import install_qwen_lora
+    from verl.opd.batch_invariant_linear import batch_invariant_linear
+
+    torch.manual_seed(58)
+    base = _small_replay_model()
+    model = copy.deepcopy(base).float()
+    install_qwen_lora(model, rank=4, alpha=8)
+    _install_cpu_replay_reference(monkeypatch, base)
+    arithmetic._install_native_arithmetic(
+        model, linear=batch_invariant_linear, attention=native_fa3_attention,
+        production=True, fp32_masters=True, cache_device="cuda:0",
+    )
+    embeddings = torch.randn(1, 6, 64).bfloat16().requires_grad_()
+    positions = torch.tensor([[0, 1, 2, 0, 1, 2]])
+    kwargs = dict(inputs_embeds=embeddings, position_ids=positions,
+                  opd_cu_seqlens=torch.tensor([0, 3, 6], dtype=torch.int32), opd_max_seqlen=3)
+    actual = model.lm_head(model.model(**kwargs).last_hidden_state)
+    expected = base.lm_head(base.model(**kwargs).last_hidden_state)
+    assert torch.equal(actual, expected)
+    actual[:, :2].float().square().sum().backward()
+    assert torch.count_nonzero(embeddings.grad[:, 2:]) == 0
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for n, p in model.named_parameters() if n.endswith("qwen_lora_B"))
+    assert all(p.grad is None for n, p in model.named_parameters() if "qwen_lora" not in n)
+
+
 @pytest.mark.parametrize("kind", ["model", "scaled_rope", "checkpointing", "cache_device", "head_dim", "dropout", "window", "missing_head"])
 def test_production_install_rejects_before_mutating_model(kind):
     model = _small_replay_model()

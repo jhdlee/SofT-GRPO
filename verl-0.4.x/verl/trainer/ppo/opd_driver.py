@@ -823,6 +823,7 @@ def add_canonical_metric_aliases(
     grad_clip: float,
     checkpoint_committed: bool,
     resumed: bool,
+    reference_kl_coef: float = 0.001,
 ) -> dict[str, Any]:
     """Add stable study names while retaining every released verl metric."""
 
@@ -907,7 +908,9 @@ def add_canonical_metric_aliases(
     if "loss/total" not in result and "loss/grpo" in result:
         total = float(result["loss/grpo"])
         if "loss/native_ref_kl" in result:
-            total += float(result["loss/native_ref_kl"]) * 0.001
+            if not np.isfinite(reference_kl_coef) or reference_kl_coef < 0:
+                raise ValueError("reference KL coefficient must be finite and nonnegative")
+            total += float(result["loss/native_ref_kl"]) * reference_kl_coef
         total += float(result.get("loss/opd_weighted", 0.0))
         result["loss/total"] = total
 

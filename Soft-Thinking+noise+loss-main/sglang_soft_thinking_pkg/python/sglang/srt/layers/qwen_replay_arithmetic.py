@@ -16,7 +16,7 @@ from pathlib import Path
 import types
 
 logger = logging.getLogger(__name__)
-BACKENDS = ("disabled", "native_fa3_v1")
+BACKENDS = ("disabled", "native_fa3_v1", "native_fa3_v2")
 
 
 def validate_qwen_replay_server_args(args):
@@ -51,6 +51,11 @@ def fa3_replay_callables(args, varlen, kvcache):
     """Keep original callable identity/defaults unless this backend is selected."""
     if not validate_qwen_replay_server_args(args):
         return varlen, kvcache
+    if args.opd_qwen_replay_backend == "native_fa3_v2":
+        from opd_fa3 import flash_attn_varlen_func, flash_attn_with_kvcache, validate_build
+
+        validate_build()
+        varlen, kvcache = flash_attn_varlen_func, flash_attn_with_kvcache
     return functools.partial(varlen, num_splits=1), functools.partial(kvcache, num_splits=1)
 
 
@@ -117,14 +122,15 @@ def install_qwen_replay_backend(model, config, args):
     from verl.opd.qwen_replay_backend import validate_qwen_replay_runtime
     from sglang.srt.layers.linear import UnquantizedLinearMethod
 
-    runtime = validate_qwen_replay_runtime()
+    mode = args.opd_qwen_replay_backend
+    runtime = validate_qwen_replay_runtime(backend=mode) if mode == "native_fa3_v2" else validate_qwen_replay_runtime()
     count = _install_linear(model, batch_invariant_linear, UnquantizedLinearMethod)
-    model._opd_qwen_replay_backend = "native_fa3_v1"
+    model._opd_qwen_replay_backend = mode
     source_paths = {"native_integration": Path(__file__),
                     "linear": Path(inspect.getfile(batch_invariant_linear)),
                     "attention_backend": Path(__file__).parent / "attention" / "flashattention_backend.py"}
     result = {
-        "backend": "native_fa3_v1", "projection_policy": "fixed_tile_triton_32_64_32",
+        "backend": mode, "projection_policy": "fixed_tile_triton_32_64_32",
         "attention_backend": "fa3", "num_splits": 1, "tp_size": 1,
         "dtype": "bfloat16", "device": "cuda", "model_type": "qwen3",
         "model_architecture": "Qwen3-0.6B", "projection_module_count": count,

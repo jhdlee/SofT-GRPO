@@ -157,6 +157,11 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         self._guard_stage("entry local preparation", prepare_local)
         params = self._guard_stage("state dict", self.module.state_dict)
 
+        from verl.opd.qwen_lora import has_qwen_lora, qwen_lora_config
+        if has_qwen_lora(self.module):
+            from verl.opd.qwen_weight_export import dense_rollout_weights
+            return dense_rollout_weights(params, qwen_lora_config(self.module), stage=self._guard_stage)
+
         def transfer_local():
             log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
             device = torch.cuda.current_device()

@@ -7,7 +7,7 @@ training. The controller consumes the phase commands emitted here.
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -20,6 +20,7 @@ from .manifest import canonical_sha256, file_sha256, validate_sealed_content
 
 
 PROFILE_ID = "qwen3-math-seven-arm-v1"
+LORA_PROFILE_ID = "qwen3-math-seven-arm-lora-fa3-v1"
 PROMPT_PROFILE_ID = qwen_training.PROFILE_ID
 MODEL = dict(qwen_training.MODEL)
 SEED = 11
@@ -45,6 +46,53 @@ RUNTIME_PACKAGE_PINS = {
              "numba": "0.61.2", "numpy": "2.2.6"},
 }
 HARD_RUNTIME_PINS = RUNTIME_PACKAGE_PINS["hard"]
+SHARED_RUNTIME_PINS = {
+    "torch": "2.6.0", "transformers": "4.51.1", "peft": "0.17.1",
+    "ray": "2.43.0", "sglang": "0.4.6.post1", "vllm": "0.8.5",
+    "xgrammar": "0.1.18", "numpy": "2.2.6", "numba": "0.61.2",
+    "xformers": "0.0.29.post2", "triton": "3.2.0",
+    "opd-fa3": "0.1.0", "sgl-kernel": "0.1.1", "flash-attn": "2.7.3",
+    "opentelemetry-api": "1.26.0", "opentelemetry-sdk": "1.26.0",
+    "opentelemetry-semantic-conventions": "0.47b0",
+    "opentelemetry-exporter-prometheus": "0.47b0",
+}
+LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+
+@dataclass(frozen=True)
+class TrainingOptions:
+    """Explicit options for the revised study; None preserves the old recipe."""
+
+    finetuning: str = "lora"
+    lora_rank: int = 32
+    lora_alpha: int = 64
+    lora_target_modules: tuple[str, ...] = LORA_TARGET_MODULES
+    reference_kl: str = "recipe"
+
+    def __post_init__(self):
+        if self.finetuning not in ("full", "lora") or self.reference_kl not in ("recipe", "off"):
+            raise ValueError("invalid finetuning or reference-KL mode")
+        if any(type(value) is not int or value <= 0 for value in (self.lora_rank, self.lora_alpha)):
+            raise ValueError("LoRA rank and alpha must be positive integers")
+        if self.lora_rank > 256:
+            raise ValueError("native LoRA rank must not exceed 256")
+        targets = tuple(self.lora_target_modules)
+        if not targets or len(set(targets)) != len(targets) or not set(targets) <= set(LORA_TARGET_MODULES):
+            raise ValueError("LoRA targets must be unique supported attention/MLP projections")
+        object.__setattr__(self, "lora_target_modules", targets)
+
+    def as_manifest(self):
+        result = asdict(self)
+        result["lora_target_modules"] = list(self.lora_target_modules)
+        return result
+
+
+def _options(value):
+    return value if value is None or isinstance(value, TrainingOptions) else TrainingOptions(**value)
+
+
+def _profile(options):
+    return LORA_PROFILE_ID if options is not None else PROFILE_ID
 
 
 def resolve_arm(identifier: str) -> study.ArmSpec:
@@ -56,7 +104,8 @@ def resolve_arm(identifier: str) -> study.ArmSpec:
     return spec
 
 
-def arm_contract(identifier: str) -> dict[str, Any]:
+def arm_contract(identifier: str, training_options=None) -> dict[str, Any]:
+    options = _options(training_options)
     spec = resolve_arm(identifier)
     result = spec.as_manifest()
     result.update(protocol=PROFILE_ID, model=dict(MODEL), prompt_profile=PROMPT_PROFILE_ID,
@@ -70,6 +119,14 @@ def arm_contract(identifier: str) -> dict[str, Any]:
                   ratio_range_gate_enabled=False, clipping_frequency_gate_enabled=False)
     result["experiment_name"] = "qwen3_0p6b_" + identifier
     result["wandb_tags"] = [PROFILE_ID, *result["wandb_tags"]]
+    if options is not None:
+        result.update(protocol=LORA_PROFILE_ID, training_options=options.as_manifest(),
+                      qwen_replay_backend="native_fa3_v2", checkpoint_semantics="qwen_semantic_v1",
+                      forward_dtype="bfloat16", master_dtype="float32", reduce_dtype="float32",
+                      teacher_weight_space="dense_effective", reference_kl_coefficient=(
+                          0.001 if options.reference_kl == "recipe" and spec.opd_mode != "standalone" else 0.0))
+        result["wandb_tags"] = [LORA_PROFILE_ID, options.finetuning, "reference-kl-" + options.reference_kl,
+                               *result["wandb_tags"][1:]]
     return result
 
 
@@ -110,9 +167,11 @@ def production_overrides(
     identifier: str, assets_root: Path | str, run_root: Path | str, *,
     phase: str = "production", resume_from_path: Path | str | None = None,
     source_root: Path | str | None = None,
+    training_options=None, runtime_manifest=None,
 ) -> list[str]:
     """Emit unique Hydra overrides; invocation limits never shorten the horizon."""
     spec = resolve_arm(identifier)
+    options = _options(training_options)
     metadata = phase_metadata(identifier, run_root, phase)
     if not metadata["applicable"]:
         raise ValueError(f"{phase} only applies to hybrid OPD arms")
@@ -162,7 +221,33 @@ def production_overrides(
     })
     if source_root is not None:
         values["custom_reward_function.path"] = str(_absolute(source_root) / "3rdparty/SofT-GRPO/opd_tools/reward.py")
-    return [("++" if key.startswith("trainer.production_") or key == "actor_rollout_ref.rollout.production_engine_isolation" else "") + key + "="
+    extra_keys = set()
+    if options is not None:
+        reference = options.reference_kl == "recipe" and spec.opd_mode != "standalone"
+        additions = {
+            "trainer.training_profile": LORA_PROFILE_ID,
+            "trainer.project_name": PRODUCTION_PROJECT + "-lora-fa3" + ("" if phase == "production" else "-prologue"),
+            "trainer.checkpoint_semantics": "qwen_semantic_v1",
+            "actor_rollout_ref.checkpoint_semantics": "qwen_semantic_v1",
+            "actor_rollout_ref.training_seed": SEED,
+            "actor_rollout_ref.model.qwen_replay_backend": "native_fa3_v2",
+            "actor_rollout_ref.rollout.qwen_replay_backend": "native_fa3_v2",
+            "actor_rollout_ref.model.lora_rank": options.lora_rank if options.finetuning == "lora" else 0,
+            "actor_rollout_ref.model.lora_alpha": options.lora_alpha,
+            "actor_rollout_ref.model.target_modules": list(options.lora_target_modules),
+            "actor_rollout_ref.actor.use_kl_loss": reference,
+            "actor_rollout_ref.actor.kl_loss_coef": 0.001 if reference else 0.0,
+            "algorithm.use_kl_in_reward": False,
+            "actor_rollout_ref.rollout.seed": SEED,
+        }
+        if runtime_manifest is not None:
+            additions.update({"trainer.runtime_manifest_path": runtime_manifest["path"],
+                              "trainer.runtime_manifest_sha256": runtime_manifest["sha256"]})
+        if source_root is not None:
+            additions["trainer.runtime_source_root"] = str(_absolute(source_root) / "3rdparty/SofT-GRPO")
+        extra_keys.update(additions)
+        values.update(additions)
+    return [("++" if key in extra_keys or key.startswith("trainer.production_") or key == "actor_rollout_ref.rollout.production_engine_isolation" else "") + key + "="
             + json.dumps(value, separators=(",", ":")) for key, value in values.items()]
 
 
@@ -193,7 +278,9 @@ def _seal(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
-                    parent_gitlink, soft_env, hard_env, assets_manifest) -> dict[str, Any]:
+                    parent_gitlink, soft_env, hard_env, assets_manifest, training_options=None) -> dict[str, Any]:
+    options = _options(training_options)
+    profile_id = _profile(options)
     for name, value in (("parent_commit", parent_commit), ("fork_commit", fork_commit), ("parent_gitlink", parent_gitlink)):
         _commit(value, name)
     if parent_gitlink != fork_commit:
@@ -202,8 +289,23 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
     if assets_manifest.get("profile_id") != PROMPT_PROFILE_ID or assets_manifest.get("model") != MODEL:
         raise ValueError("production assets must use the authenticated pinned Qwen profile")
     assets_root, study_root, source_root, soft_env, hard_env = map(_absolute, (assets_root, study_root, source_root, soft_env, hard_env))
+    runtime_manifest = None
+    if options is not None:
+        if soft_env != hard_env:
+            raise ValueError("the LoRA/FA3 study requires one shared runtime environment")
+        runtime_path = soft_env / "opd-runtime-manifest.json"
+        if runtime_path.is_symlink() or not runtime_path.is_file():
+            raise ValueError("shared runtime requires an authenticated build manifest")
+        runtime = json.loads(runtime_path.read_text())
+        validate_sealed_content(runtime)
+        if runtime.get("cpu_ray_preflight") is not True or runtime.get("schema_version") != 1:
+            raise ValueError("shared runtime requires passed real Ray acceptance")
+        if runtime.get("build_record", {}).get("source") != {"parent_commit": parent_commit, "fork_commit": fork_commit}:
+            raise ValueError("shared runtime source differs from the production snapshot")
+        runtime_manifest = {"path": str(runtime_path), "sha256": file_sha256(runtime_path),
+                            "manifest_content_sha256": runtime["manifest_content_sha256"]}
     base = {
-        "schema_version": 1, "profile_id": PROFILE_ID, "protocol": "qwen3-production-submission-v1",
+        "schema_version": 1, "profile_id": profile_id, "protocol": "qwen3-production-submission-v1",
         "source_root": str(source_root), "parent_commit": parent_commit,
         "fork_commit": fork_commit, "parent_gitlink": parent_gitlink,
         "assets_root": str(assets_root), "study_root": str(study_root),
@@ -215,20 +317,24 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
         "base_config_sha256": file_sha256(source_root / "3rdparty/SofT-GRPO/verl-0.4.x/verl/trainer/config/ppo_trainer.yaml"),
         "arm_order": list(ARM_IDS), "arms": [],
     }
+    if options is not None:
+        base.update(training_options=options.as_manifest(), runtime_manifest=runtime_manifest,
+                    runtime_package_pins={kind: dict(SHARED_RUNTIME_PINS) for kind in ("soft", "hard")})
     for identifier in ARM_IDS:
         spec = resolve_arm(identifier)
         run_root = study_root / "arms" / identifier
         environment = soft_env if spec.rollout_kind == "native_soft" else hard_env
-        contract = arm_contract(identifier)
-        identity = canonical_sha256([PROFILE_ID, identifier, parent_commit, fork_commit,
+        contract = arm_contract(identifier, options)
+        identity = canonical_sha256([profile_id, identifier, parent_commit, fork_commit,
                                      assets_manifest["manifest_content_sha256"], str(run_root), str(environment), contract])
         phases = {phase: phase_metadata(identifier, run_root, phase) for phase in PHASES}
-        production = production_overrides(identifier, assets_root, run_root, source_root=source_root)
+        production = production_overrides(identifier, assets_root, run_root, source_root=source_root,
+                                          training_options=options, runtime_manifest=runtime_manifest)
         base["arms"].append({
             "arm_id": identifier, "account": spec.account, "run_root": str(run_root),
             "environment_root": str(environment), "python_bin": str(environment / "bin/python"),
-            "runtime_packages": dict(RUNTIME_PACKAGE_PINS["soft" if spec.rollout_kind == "native_soft" else "hard"]),
-            "wandb_run_id": "qprod-" + identity[:24], "wandb_project": PRODUCTION_PROJECT,
+            "runtime_packages": dict(base["runtime_package_pins"]["soft" if spec.rollout_kind == "native_soft" else "hard"]),
+            "wandb_run_id": "qprod-" + identity[:24], "wandb_project": PRODUCTION_PROJECT + ("-lora-fa3" if options else ""),
             "contract": contract, "contract_sha256": canonical_sha256(contract),
             "phases": phases, "production_overrides": production,
             "production_overrides_sha256": canonical_sha256(production),
@@ -237,13 +343,14 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
 
 
 def build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
-                   soft_env, hard_env, parent_gitlink=None) -> dict[str, Any]:
+                   soft_env, hard_env, parent_gitlink=None, training_options=None) -> dict[str, Any]:
     assets = qwen_training.verify(assets_root)
     _verify_source(_absolute(source_root), parent_commit, fork_commit)
     return _build_manifest(assets_root=assets_root, study_root=study_root, source_root=source_root,
                            parent_commit=parent_commit, fork_commit=fork_commit,
                            parent_gitlink=fork_commit if parent_gitlink is None else parent_gitlink,
-                           soft_env=soft_env, hard_env=hard_env, assets_manifest=assets)
+                           soft_env=soft_env, hard_env=hard_env, assets_manifest=assets,
+                           training_options=training_options)
 
 
 def _write_immutable(path: Path, payload: Mapping[str, Any]) -> None:
@@ -280,7 +387,7 @@ def materialize_manifest(**kwargs) -> dict[str, Any]:
     root = Path(manifest["study_root"])
     for arm in manifest["arms"]:
         _write_immutable(root / "arms" / arm["arm_id"] / "profile.json", _seal({
-            "profile_id": PROFILE_ID, "study_manifest_content_sha256": manifest["manifest_content_sha256"],
+            "profile_id": manifest["profile_id"], "study_manifest_content_sha256": manifest["manifest_content_sha256"],
             "arm": arm,
         }))
     _write_immutable(root / "manifest.json", manifest)
@@ -293,22 +400,25 @@ def verify_manifest(path: Path | str, *, verify_assets: bool = True, verify_sour
         raise ValueError("production manifest must be a regular file")
     manifest = json.loads(path.read_text())
     validate_sealed_content(manifest)
-    if manifest.get("profile_id") != PROFILE_ID:
+    if manifest.get("profile_id") not in (PROFILE_ID, LORA_PROFILE_ID):
         raise ValueError("not a Qwen seven-arm production manifest")
+    if (manifest["profile_id"] == LORA_PROFILE_ID) != (manifest.get("training_options") is not None):
+        raise ValueError("production profile and training options differ")
     if path.resolve() != Path(manifest["study_root"]) / "manifest.json":
         raise ValueError("production manifest is not in its sealed study root")
     assets = qwen_training.verify(manifest["assets_root"]) if verify_assets else qwen_training._read_manifest(Path(manifest["assets_root"]) / "manifest.json")
     if verify_source:
         _verify_source(Path(manifest["source_root"]), manifest["parent_commit"], manifest["fork_commit"])
     expected = _build_manifest(**{key: manifest[key] for key in ("assets_root", "study_root", "source_root", "parent_commit", "fork_commit", "parent_gitlink")},
-                               soft_env=manifest["runtime_environments"]["soft"], hard_env=manifest["runtime_environments"]["hard"], assets_manifest=assets)
+                               soft_env=manifest["runtime_environments"]["soft"], hard_env=manifest["runtime_environments"]["hard"], assets_manifest=assets,
+                               training_options=manifest.get("training_options"))
     if manifest != expected:
         raise ValueError("production manifest differs from the source/profile/asset contract")
     for arm in manifest["arms"]:
         path = Path(arm["run_root"]) / "profile.json"
         if path.is_symlink() or not path.is_file():
             raise ValueError("missing regular per-arm production profile")
-        expected_arm = _seal({"profile_id": PROFILE_ID,
+        expected_arm = _seal({"profile_id": manifest["profile_id"],
                               "study_manifest_content_sha256": manifest["manifest_content_sha256"], "arm": arm})
         if json.loads(path.read_text()) != expected_arm:
             raise ValueError("per-arm production profile differs from study manifest")
@@ -328,6 +438,7 @@ def phase_command(manifest: Mapping[str, Any], identifier: str, phase: str, *, r
     return [arm["python_bin"], "-m", "verl.trainer.main_ppo", *production_overrides(
         identifier, manifest["assets_root"], arm["run_root"], phase=phase, resume_from_path=resume_from_path,
         source_root=manifest["source_root"],
+        training_options=manifest.get("training_options"), runtime_manifest=manifest.get("runtime_manifest"),
     )]
 
 
@@ -340,8 +451,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if name == "prepare-assets":
             sub.add_argument("--cache-dir", type=Path, required=True)
     sub = commands.add_parser("materialize")
-    for name in ("assets-root", "study-root", "source-root", "soft-env", "hard-env"):
+    for name in ("assets-root", "study-root", "source-root"):
         sub.add_argument("--" + name, type=Path, required=True)
+    for name in ("soft-env", "hard-env", "shared-env"):
+        sub.add_argument("--" + name, type=Path)
+    sub.add_argument("--profile", choices=(PROFILE_ID, LORA_PROFILE_ID), default=PROFILE_ID)
+    sub.add_argument("--finetuning", choices=("full", "lora"), default="lora")
+    sub.add_argument("--lora-rank", type=int, default=32)
+    sub.add_argument("--lora-alpha", type=int, default=64)
+    sub.add_argument("--lora-target-modules", default=",".join(LORA_TARGET_MODULES))
+    sub.add_argument("--reference-kl", choices=("recipe", "off"), default="recipe")
     for name in ("parent-commit", "fork-commit"):
         sub.add_argument("--" + name, required=True)
     sub.add_argument("--parent-gitlink")
@@ -358,7 +477,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "verify-assets":
         result = qwen_training.verify(args.assets_root)
     elif args.command == "materialize":
-        result = materialize_manifest(**{key: value for key, value in vars(args).items() if key != "command"})
+        kwargs = vars(args).copy()
+        kwargs.pop("command")
+        revised = kwargs.pop("profile") == LORA_PROFILE_ID
+        shared = kwargs.pop("shared_env")
+        choices = {key: kwargs.pop(key) for key in ("finetuning", "lora_rank", "lora_alpha", "lora_target_modules", "reference_kl")}
+        choices["lora_target_modules"] = tuple(choices["lora_target_modules"].split(","))
+        if revised:
+            if shared is None or kwargs["soft_env"] is not None or kwargs["hard_env"] is not None:
+                parser.error("LoRA/FA3 requires --shared-env, without --soft-env/--hard-env")
+            kwargs.update(soft_env=shared, hard_env=shared, training_options=TrainingOptions(**choices))
+        elif shared is not None or kwargs["soft_env"] is None or kwargs["hard_env"] is None:
+            parser.error("legacy production requires --soft-env and --hard-env")
+        elif TrainingOptions(**choices) != TrainingOptions():
+            parser.error("LoRA/FA3 training options require the revised production profile")
+        result = materialize_manifest(**kwargs)
     else:
         manifest = verify_manifest(args.manifest)
         if args.command == "verify":
