@@ -17,8 +17,19 @@ from typing import Mapping
 from .manifest import canonical_sha256, file_sha256, write_manifest_atomic
 
 
-def capacity_contract():
+CAPACITY_BETA_BASES = (0.001, 0.1)
+
+
+def validate_capacity_beta_base(beta_base):
+    """Only the default and explicitly requested high-dose capacity tests exist."""
+    if type(beta_base) not in (int, float) or beta_base not in CAPACITY_BETA_BASES:
+        raise ValueError("capacity beta_base must be exactly 0.001 or 0.1")
+    return float(beta_base)
+
+
+def capacity_contract(beta_base=0.001):
     """Dependency-light, source-bound receipt contract for this single test."""
+    beta_base = validate_capacity_beta_base(beta_base)
     return {
         "schema_version": 1, "role": "qwen3_g8_capacity",
         "model_id": "Qwen/Qwen3-0.6B",
@@ -27,7 +38,7 @@ def capacity_contract():
         "micro_batch_size_per_gpu": 2, "gpus": 2, "tensor_parallel_size": 1,
         "qwen_replay_backend": "native_fa3_v1", "dispatch_mode": "bounded_async",
         "max_running_requests": 32, "async_queue_size": 64,
-        "beta_base": 0.001, "schedule": "constant", "seed": 11,
+        "beta_base": beta_base, "schedule": "constant", "seed": 11,
         "response_token_cap": 8192, "total_rollout_iterations": 109,
         "invocation_iterations": 1, "optimizer_steps": 2, "ema_updates": 1,
         "full_dose_gradient_gate_enabled": True, "completion_gate_enabled": False,
@@ -36,16 +47,22 @@ def capacity_contract():
     }
 
 
-def capacity_overrides(assets_root, run_root):
+def _capacity_experiment_name(beta_base):
+    return "qwen3_g8_full_dose_capacity" + ("_beta0p1" if beta_base == 0.1 else "")
+
+
+def capacity_overrides(assets_root, run_root, *, beta_base=0.001):
     from .qwen_training import profile_overrides
 
+    beta_base = validate_capacity_beta_base(beta_base)
     root = Path(run_root).resolve()
     return profile_overrides("hybrid", 2, assets_root, root / "training", replay_backend="native_fa3_v1") + [
-        "algorithm.opd.beta_base=0.001", "algorithm.opd.schedule=constant",
+        f"algorithm.opd.beta_base={beta_base}", "algorithm.opd.schedule=constant",
         "actor_rollout_ref.rollout.dispatch_mode=bounded_async",
         "actor_rollout_ref.rollout.max_running_requests=32",
         "actor_rollout_ref.rollout.async_queue_size=64",
         "++trainer.training_capacity_mode=true",
+        f"++trainer.training_capacity_beta_base={beta_base}",
         "++trainer.training_capacity_output=" + str(root / "measurement.json"),
         "trainer.max_rollout_iterations_per_invocation=1",
         "trainer.rollout_integrity.full_dose_gradient_gate_enabled=true",
@@ -53,7 +70,7 @@ def capacity_overrides(assets_root, run_root):
         "trainer.val_before_train=false", "trainer.test_freq=-1", "trainer.save_freq=-1",
         "trainer.log_val_generations=0", "trainer.resume_mode=disable",
         "trainer.project_name=opd-qwen3-training-capacity",
-        "trainer.experiment_name=qwen3_g8_full_dose_capacity",
+        "trainer.experiment_name=" + _capacity_experiment_name(beta_base),
         "hydra.run.dir=" + str(root / "hydra"), "hydra.job.chdir=false",
     ]
 
@@ -153,8 +170,9 @@ class CapacityRecorder:
         self.persist()
 
 
-def validate_capacity_iteration(record):
+def validate_capacity_iteration(record, *, beta_base=0.001):
     """Accept exactly one full-dose iteration, independently of warmup pilots."""
+    beta_base = validate_capacity_beta_base(beta_base)
     if not isinstance(record, Mapping) or record.get("rollout_iteration") != 0:
         raise ValueError("capacity requires rollout iteration zero")
     if type(record.get("trajectory_count")) is not int or record["trajectory_count"] != 512:
@@ -175,8 +193,8 @@ def validate_capacity_iteration(record):
     }.items():
         if number(name) != expected:
             raise ValueError(f"capacity {name} must equal {expected}")
-    if not math.isclose(number("opd/beta_effective"), 0.001, rel_tol=1e-12, abs_tol=0):
-        raise ValueError("capacity requires full beta 0.001 at iteration zero")
+    if not math.isclose(number("opd/beta_effective"), beta_base, rel_tol=1e-12, abs_tol=0):
+        raise ValueError(f"capacity requires full beta {beta_base} at iteration zero")
     if not 0 <= number("replay/ratio_abs_error_max") <= 1e-4:
         raise ValueError("capacity replay tolerance exceeded")
     if not 0 < number("latent/soft_to_hard_rate") <= 1:
@@ -241,7 +259,8 @@ def publish_report(root, report):
         f"Failure category: {failure.get('category', 'none')}; stage: {failure.get('stage', 'none')}. "
         f"Optimizer update state: {measurement.get('progress', {}).get('optimizer_update_state', 'not_observed')}.\n\n"
         f"Checkpoint authenticated: {report.get('checkpoint_authenticated', False)}.\n\n"
-        "This checks G8 capacity at beta 0.001. It is not a runtime estimate, next-update resume acceptance, or full training. "
+        f"This checks G8 capacity at beta {report.get('contract', {}).get('beta_base', 'unverified')}. "
+        "It is not a runtime estimate, next-update resume acceptance, or full training. "
         "No validation or automatic retry is performed. See capacity.json for configuration, stage timings, resource peaks, and source hashes.\n"
     )
     text += "\n| Measurement | Value |\n|---|---|\n"
@@ -270,12 +289,13 @@ def publish_report(root, report):
 class CapacityRunner:
     def __init__(self, args):
         self.args = args
+        self.beta_base = validate_capacity_beta_base(getattr(args, "beta_base", 0.001))
         self.started = time.monotonic()
         self.deadline = self.started + args.time_limit_seconds
         self.root = args.run_root.resolve()
         self.root.mkdir(parents=True, exist_ok=False)
         self.child = None
-        self.report = {"schema_version": 1, "status": "running", "contract": capacity_contract(), "job_id": os.environ.get("SLURM_JOB_ID"), "submission_id": os.environ.get("OPD_QTB_SUBMISSION_ID"), "time_limit_seconds": args.time_limit_seconds, "checkpoint_authenticated": False, "measurement_authenticated": False}
+        self.report = {"schema_version": 1, "status": "running", "contract": capacity_contract(self.beta_base), "job_id": os.environ.get("SLURM_JOB_ID"), "submission_id": os.environ.get("OPD_QTB_SUBMISSION_ID"), "time_limit_seconds": args.time_limit_seconds, "checkpoint_authenticated": False, "measurement_authenticated": False}
         self.stage = "startup"
 
     def _terminate(self):
@@ -320,14 +340,14 @@ class CapacityRunner:
             source = self.report["source"] = source_identity(fork)
             self.stage = "asset_authentication"
             assets = self.report["assets"] = verify(self.args.assets_root)
-            overrides = capacity_overrides(self.args.assets_root, self.root)
+            overrides = capacity_overrides(self.args.assets_root, self.root, beta_base=self.beta_base)
             self.report["overrides"] = overrides
-            run_id = os.environ.get("WANDB_RUN_ID") or "qcap-" + canonical_sha256({"source": source, "job": self.report["job_id"], "root": str(self.root)})[:24]
+            run_id = os.environ.get("WANDB_RUN_ID") or "qcap-" + canonical_sha256({"source": source, "job": self.report["job_id"], "root": str(self.root), "contract": self.report["contract"]})[:24]
             self.report["wandb_run_id"] = run_id
             environment = dict(os.environ)
-            environment.update(WANDB_RUN_ID=run_id, WANDB_NAME="qwen3_g8_full_dose_capacity", WANDB_MODE="online", WANDB_RESUME="never", OPD_CAPACITY_STARTED=str(time.time()))
+            environment.update(WANDB_RUN_ID=run_id, WANDB_NAME=_capacity_experiment_name(self.beta_base), WANDB_MODE="online", WANDB_RESUME="never", OPD_CAPACITY_STARTED=str(time.time()))
             command = [sys.executable, "-m", "verl.trainer.main_ppo", *overrides]
-            write_manifest_atomic(self.root / "invocation.json", {"command": command, "source": source, "assets": assets, "wandb_run_id": run_id, "contract": capacity_contract()}, validator=None)
+            write_manifest_atomic(self.root / "invocation.json", {"command": command, "source": source, "assets": assets, "wandb_run_id": run_id, "contract": capacity_contract(self.beta_base)}, validator=None)
             self.stage = "startup"
             publish_report(self.root, self.report)
             with (self.root / "trainer.log").open("w") as log:
@@ -345,7 +365,7 @@ class CapacityRunner:
             iterations = measured.get("iterations", [])
             if len(iterations) != 1:
                 raise ValueError("capacity requires exactly one accepted iteration")
-            validate_capacity_iteration(iterations[0])
+            validate_capacity_iteration(iterations[0], beta_base=self.beta_base)
             self.stage = "checkpoint_authentication"
             checkpoint = measured.get("checkpoint", {})
             if checkpoint.get("authenticated") is not True or checkpoint.get("payload_rehashed") is not True:
@@ -422,6 +442,7 @@ def main(argv=None):
     parser.add_argument("--assets-root", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--time-limit-seconds", type=int, default=1700)
+    parser.add_argument("--beta-base", type=float, choices=CAPACITY_BETA_BASES, default=0.001)
     args = parser.parse_args(argv)
     if not 60 <= args.time_limit_seconds <= 1700:
         parser.error("capacity process budget must be between 60 and 1700 seconds")

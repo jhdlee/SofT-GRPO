@@ -7,7 +7,7 @@ import time
 from omegaconf import OmegaConf
 
 from opd_tools.manifest import file_sha256
-from opd_tools.training_capacity import CapacityRecorder, capacity_contract, finite_snapshot, validate_capacity_iteration
+from opd_tools.training_capacity import CapacityRecorder, capacity_contract, finite_snapshot, validate_capacity_beta_base, validate_capacity_iteration
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _verify_checkpoint
 
 
@@ -15,6 +15,7 @@ class QwenTrainingCapacityTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         config = self.config
+        self.capacity_beta_base = validate_capacity_beta_base(config.trainer.get("training_capacity_beta_base", 0.001))
         if config.trainer.get("training_benchmark_mode") is not None:
             raise ValueError("capacity and three-iteration benchmark modes are exclusive")
         if config.trainer.get("training_profile") != "qwen3-training-benchmark-v1":
@@ -25,8 +26,8 @@ class QwenTrainingCapacityTrainer(RayPPOTrainer):
             raise ValueError("capacity requires the primary G8 hybrid")
         if config.trainer.max_rollout_iterations_per_invocation != 1:
             raise ValueError("capacity must stop after one iteration")
-        if config.algorithm.opd.schedule != "constant" or config.algorithm.opd.beta_base != 0.001:
-            raise ValueError("capacity requires immediate full beta 0.001")
+        if config.algorithm.opd.schedule != "constant" or config.algorithm.opd.beta_base != self.capacity_beta_base:
+            raise ValueError("capacity OPD dose must match the selected constant full beta")
         if not self.rollout_integrity_config.full_dose_gradient_gate_enabled or self.rollout_integrity_config.completion_gate_enabled:
             raise ValueError("capacity requires the full-dose gate and disables completion gating")
         if config.trainer.val_before_train or config.trainer.test_freq > 0:
@@ -44,6 +45,8 @@ class QwenTrainingCapacityTrainer(RayPPOTrainer):
             "algorithm.opd.enabled": True, "algorithm.opd.mode": "auxiliary",
             "algorithm.opd.loss_support": "all_response", "algorithm.opd.teacher.type": "ema",
             "algorithm.opd.teacher.ema_decay": 0.99, "algorithm.opd.trajectory_gate": "all",
+            "actor_rollout_ref.opd.beta_base": self.capacity_beta_base,
+            "actor_rollout_ref.opd.schedule": "constant",
         }.items():
             if OmegaConf.select(config, key) != expected:
                 raise ValueError("capacity configuration differs at " + key)
@@ -51,7 +54,7 @@ class QwenTrainingCapacityTrainer(RayPPOTrainer):
 
         self.capacity = CapacityRecorder(config.trainer.training_capacity_output, {
             "schema_version": 1, "status": "initializing", "phase": "capacity",
-            "variant": "bounded_async32", "contract": capacity_contract(),
+            "variant": "bounded_async32", "contract": capacity_contract(self.capacity_beta_base),
             "configuration": OmegaConf.to_container(config, resolve=True),
             "checkpoint_provenance": self.checkpoint_provenance,
             "qwen_replay_arithmetic": qwen_replay_arithmetic_identity(),
@@ -82,7 +85,7 @@ class QwenTrainingCapacityTrainer(RayPPOTrainer):
             "rollout_timing": meta_info.get("rollout_timing", {}),
             "actor_update_timing": meta_info.get("actor_update_timing", {}),
         })
-        record["capacity_acceptance"] = validate_capacity_iteration(record)
+        record["capacity_acceptance"] = validate_capacity_iteration(record, beta_base=self.capacity_beta_base)
         self.capacity.measurement["iterations"].append(record)
         self.capacity.measurement["checkpoint_seconds"] = timing.get("save_checkpoint")
         self.capacity.persist()

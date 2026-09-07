@@ -208,6 +208,19 @@ def validate_phase_measurement(measured, *, phase, variant, batches, overrides, 
             observed = observed[part]
         if canonical_sha256(observed) != canonical_sha256(value):
             raise ValueError("phase configuration differs at " + key)
+    if phase == "capacity":
+        from .training_capacity import capacity_contract
+
+        expected_contract = capacity_contract(expected.get("trainer.training_capacity_beta_base", 0.001))
+        beta_base = expected_contract["beta_base"]
+        if canonical_sha256(configuration.get("trainer", {}).get("training_capacity_beta_base", 0.001)) != canonical_sha256(beta_base):
+            raise ValueError("capacity beta selector differs from invocation")
+        if canonical_sha256(measured.get("contract")) != canonical_sha256(expected_contract):
+            raise ValueError("capacity measurement contract differs from invocation")
+        for section in ("algorithm", "actor_rollout_ref"):
+            opd = configuration.get(section, {}).get("opd", {})
+            if canonical_sha256(opd.get("beta_base")) != canonical_sha256(beta_base) or opd.get("schedule") != "constant":
+                raise ValueError("capacity configured OPD dose differs from selector at " + section)
     provenance = validate_checkpoint_provenance(measured.get("checkpoint_provenance"))
     if provenance["source"]["commit"] != source["fork_commit"]:
         raise ValueError("phase source differs from the submitted benchmark fork")

@@ -381,6 +381,40 @@ def test_phase_rejects_mismatched_or_forged_measurements(authenticated_phase, fi
         benchmark.validate_phase_measurement(measured, **kwargs)
 
 
+@pytest.mark.parametrize("beta_base", [0.001, 0.1])
+@pytest.mark.parametrize("mutation", [None, "contract", "selector", "driver_dose", "worker_dose", "provenance"])
+def test_capacity_phase_authenticates_selected_dose_and_contract(authenticated_phase, beta_base, mutation):
+    from opd_tools.training_capacity import capacity_contract
+    from verl.opd.provenance import _environment_identity, build_checkpoint_provenance
+
+    measured, kwargs = authenticated_phase
+    measured.update(phase="capacity", variant="bounded_async32", rows=[], contract=capacity_contract(beta_base))
+    kwargs.update(phase="capacity", variant="bounded_async32", batches=[])
+    config = measured["configuration"]
+    config["trainer"]["training_capacity_beta_base"] = beta_base
+    config["algorithm"] = {"opd": {"beta_base": beta_base, "schedule": "constant"}}
+    config["actor_rollout_ref"]["opd"] = dict(config["algorithm"]["opd"])
+    kwargs["overrides"] += [f"++trainer.training_capacity_beta_base={beta_base}", f"algorithm.opd.beta_base={beta_base}"]
+    measured["checkpoint_provenance"] = build_checkpoint_provenance(config, source_commit="b" * 40, environment_identity=_environment_identity(package_versions={"torch": "2.6.0", "verl": "0.4.0"}))
+    other = 0.1 if beta_base == 0.001 else 0.001
+    if mutation == "contract":
+        measured["contract"] = capacity_contract(other)
+    elif mutation == "selector":
+        config["trainer"]["training_capacity_beta_base"] = other
+    elif mutation == "driver_dose":
+        config["algorithm"]["opd"]["beta_base"] = other
+    elif mutation == "worker_dose":
+        config["actor_rollout_ref"]["opd"]["beta_base"] = other
+    elif mutation == "provenance":
+        # Matching requested values still require their original config seal.
+        config["trainer"]["total_epochs"] = 2
+    if mutation:
+        with pytest.raises((ValueError, RuntimeError)):
+            benchmark.validate_phase_measurement(measured, **kwargs)
+    else:
+        benchmark.validate_phase_measurement(measured, **kwargs)
+
+
 @pytest.fixture
 def runner(tmp_path, monkeypatch):
     instance = object.__new__(benchmark.CellRunner)
