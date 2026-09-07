@@ -90,7 +90,7 @@ def validate_pilot_metrics(objective, iteration, metrics, *, actor_update_timing
 
     Production replay, causal-mask, frozen-teacher, and finite-update guards
     remain authoritative. This adds benchmark cadence and nonzero OPD evidence;
-    the full-dose gradient-ratio gate is intentionally outside this warmup pilot.
+    full-dose gradient integrity checks are intentionally outside this warmup pilot.
     """
     if objective not in ("standalone", "hybrid"):
         raise ValueError("pilot objective must be standalone or hybrid")

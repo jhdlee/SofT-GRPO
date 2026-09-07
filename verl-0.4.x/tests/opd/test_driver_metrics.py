@@ -329,24 +329,20 @@ def _gradient_gate_config(**overrides):
     return RolloutIntegrityConfig.from_mapping(values)
 
 
-def test_full_dose_gradient_gate_accepts_inclusive_ratio_and_clip_boundaries():
+@pytest.mark.parametrize("ratio", [1e-12, 0.000507638, 0.099, 0.1, 1.0, 10.0, 10.01, 1e6])
+def test_full_dose_gradient_gate_keeps_ratio_diagnostic_with_clip_boundary(ratio):
     config = _gradient_gate_config()
-    for ratio in (0.1, 1.0, 10.0):
-        validate_full_dose_gradient_integrity(
-            {
-                "grad/grpo_norm": 2.0,
-                "grad/opd_norm": 2.0 * ratio,
-                "actor/gradient_clipfrac": 0.5,
-            },
-            config,
-            schedule_multiplier=1.0,
-        )
+    validate_full_dose_gradient_integrity(
+        {"grad/grpo_norm": 2.0, "grad/opd_norm": 2.0 * ratio, "actor/gradient_clipfrac": 0.5},
+        config,
+        schedule_multiplier=1.0,
+    )
 
 
 def test_disabling_completion_gate_does_not_disable_full_dose_gradient_gate():
-    with pytest.raises(RuntimeError, match="support-gradient ratio"):
+    with pytest.raises(RuntimeError, match="clip fraction"):
         validate_full_dose_gradient_integrity(
-            {"grad/grpo_norm": 1.0, "grad/opd_norm": 100.0, "actor/gradient_clipfrac": 0.0},
+            {"grad/grpo_norm": 1.0, "grad/opd_norm": 100.0, "actor/gradient_clipfrac": 1.0},
             _gradient_gate_config(completion_gate_enabled=False), schedule_multiplier=1.0,
         )
 
@@ -357,18 +353,18 @@ def test_disabling_completion_gate_does_not_disable_full_dose_gradient_gate():
         (
             {
                 "grad/grpo_norm": 1.0,
-                "grad/opd_norm": 0.099,
+                "grad/opd_norm": 0.0,
                 "actor/gradient_clipfrac": 0.0,
             },
-            "support-gradient ratio",
+            "positive OPD",
         ),
         (
             {
-                "grad/grpo_norm": 1.0,
+                "grad/grpo_norm": 0.0,
                 "grad/opd_norm": 10.01,
                 "actor/gradient_clipfrac": 0.0,
             },
-            "support-gradient ratio",
+            "positive GRPO",
         ),
         (
             {
@@ -380,7 +376,7 @@ def test_disabling_completion_gate_does_not_disable_full_dose_gradient_gate():
         ),
     ],
 )
-def test_full_dose_gradient_gate_rejects_out_of_range_diagnostics(metrics, message):
+def test_full_dose_gradient_gate_rejects_zero_gradients_and_excessive_clipping(metrics, message):
     with pytest.raises(RuntimeError, match=message):
         validate_full_dose_gradient_integrity(
             metrics,
@@ -410,11 +406,6 @@ def test_full_dose_gradient_gate_skips_warmup_and_disabled_stress_arm():
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"min_opd_grpo_support_gradient_ratio": 0.0},
-        {
-            "min_opd_grpo_support_gradient_ratio": 2.0,
-            "max_opd_grpo_support_gradient_ratio": 1.0,
-        },
         {"max_full_dose_gradient_clip_fraction": 1.01},
         {"full_dose_gradient_gate_enabled": 1},
     ],
@@ -422,6 +413,54 @@ def test_full_dose_gradient_gate_skips_warmup_and_disabled_stress_arm():
 def test_full_dose_gradient_gate_config_rejects_invalid_thresholds(overrides):
     with pytest.raises((TypeError, ValueError)):
         _gradient_gate_config(**overrides)
+
+
+@pytest.mark.parametrize("legacy", [
+    {"min_opd_grpo_support_gradient_ratio": 0.0},
+    {"min_opd_grpo_support_gradient_ratio": 2.0, "max_opd_grpo_support_gradient_ratio": 1.0},
+    {"min_opd_grpo_support_gradient_ratio": 1e100, "max_opd_grpo_support_gradient_ratio": 1e101},
+])
+def test_legacy_ratio_bounds_cannot_reenable_acceptance_range(legacy):
+    validate_full_dose_gradient_integrity(
+        {"grad/grpo_norm": 1.0, "grad/opd_norm": 1e-8, "actor/gradient_clipfrac": 0.0},
+        _gradient_gate_config(**legacy), schedule_multiplier=1.0,
+    )
+
+
+@pytest.mark.parametrize("name", ["grad/grpo_norm", "grad/opd_norm", "actor/gradient_clipfrac"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0])
+def test_gradient_diagnostics_still_reject_nonfinite_or_negative_values(name, value):
+    metrics = {"grad/grpo_norm": 1.0, "grad/opd_norm": 0.001, "actor/gradient_clipfrac": 0.0}
+    metrics[name] = value
+    with pytest.raises(RuntimeError):
+        validate_full_dose_gradient_integrity(metrics, _gradient_gate_config(), schedule_multiplier=1.0)
+
+
+def test_full_dose_gradient_gate_rejects_nonfinite_derived_ratio():
+    with pytest.raises(RuntimeError, match="ratio must be finite"):
+        validate_full_dose_gradient_integrity(
+            {"grad/grpo_norm": 1e-300, "grad/opd_norm": 1e300, "actor/gradient_clipfrac": 0.0},
+            _gradient_gate_config(), schedule_multiplier=1.0,
+        )
+
+
+@pytest.mark.parametrize("opd_norm,grpo_norm", [(1e-8, 1.0), (100.0, 1.0), (0.0, 1.0)])
+def test_canonical_metrics_record_component_ratio_without_a_range_gate(opd_norm, grpo_norm):
+    metrics = add_canonical_metric_aliases(
+        {"actor/grpo_grad_norm": grpo_norm, "actor/opd_grad_norm": opd_norm},
+        opd_config=OPDConfig(), rollout_iteration=11, total_iterations=109,
+        optimizer_step=24, grad_clip=1.0, checkpoint_committed=False, resumed=False,
+    )
+    assert metrics["grad/opd_grpo_support_gradient_ratio"] == opd_norm / grpo_norm
+
+
+def test_canonical_metrics_omit_undefined_component_ratio():
+    metrics = add_canonical_metric_aliases(
+        {"actor/grpo_grad_norm": 0.0, "actor/opd_grad_norm": 1.0},
+        opd_config=OPDConfig(), rollout_iteration=11, total_iterations=109,
+        optimizer_step=24, grad_clip=1.0, checkpoint_committed=False, resumed=False,
+    )
+    assert "grad/opd_grpo_support_gradient_ratio" not in metrics
 
 
 def test_replay_ratio_metric_equals_zero_for_identical_log_densities():

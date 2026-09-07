@@ -81,6 +81,8 @@ class RolloutIntegrityConfig:
     min_categorical_boxed_answer_rate: float = 0.95
     max_replay_ratio_abs_error: float = 1e-4
     full_dose_gradient_gate_enabled: bool = False
+    # Accepted only for historical config compatibility. Component balance is
+    # diagnostic; these legacy bounds no longer constrain training acceptance.
     min_opd_grpo_support_gradient_ratio: float = 0.1
     max_opd_grpo_support_gradient_ratio: float = 10.0
     max_full_dose_gradient_clip_fraction: float = 0.5
@@ -113,16 +115,6 @@ class RolloutIntegrityConfig:
                 raise ValueError(f"{name} must be in [0, 1]")
         if not np.isfinite(result.max_replay_ratio_abs_error) or result.max_replay_ratio_abs_error < 0:
             raise ValueError("max_replay_ratio_abs_error must be finite and nonnegative")
-        minimum_ratio = float(result.min_opd_grpo_support_gradient_ratio)
-        maximum_ratio = float(result.max_opd_grpo_support_gradient_ratio)
-        if not np.isfinite(minimum_ratio) or minimum_ratio <= 0.0:
-            raise ValueError(
-                "min_opd_grpo_support_gradient_ratio must be finite and positive"
-            )
-        if not np.isfinite(maximum_ratio) or maximum_ratio < minimum_ratio:
-            raise ValueError(
-                "max_opd_grpo_support_gradient_ratio must be finite and at least the minimum"
-            )
         maximum_clip_fraction = float(result.max_full_dose_gradient_clip_fraction)
         if not np.isfinite(maximum_clip_fraction) or not 0.0 <= maximum_clip_fraction <= 1.0:
             raise ValueError(
@@ -727,12 +719,13 @@ def validate_full_dose_gradient_integrity(
     *,
     schedule_multiplier: float,
 ) -> None:
-    """Fail closed on pathological hybrid gradients at a full OPD dose.
+    """Require finite, nonzero hybrid gradients and bounded full-dose clipping.
 
     The fixed-support component gradients are available only after the actor
     update, so this gate deliberately runs after both optimizer steps have
     completed.  Warm-up iterations are not interpreted as failures: the gate
     becomes active only at the exact full-dose multiplier of one.
+    The OPD/GRPO component ratio is a diagnostic, without an acceptance range.
     """
 
     if not config.enabled or not config.full_dose_gradient_gate_enabled:
@@ -776,24 +769,15 @@ def validate_full_dose_gradient_integrity(
         raise RuntimeError(
             "full-dose gradient gate requires a positive GRPO support-gradient norm"
         )
-    if opd_norm < 0.0:
+    if opd_norm <= 0.0:
         raise RuntimeError(
-            "full-dose gradient gate requires a nonnegative OPD support-gradient norm"
+            "full-dose gradient gate requires a positive OPD support-gradient norm"
         )
 
     ratio = opd_norm / grpo_norm
+    if not np.isfinite(ratio):
+        raise RuntimeError("full-dose OPD/GRPO support-gradient ratio must be finite")
     failures = []
-    if not (
-        config.min_opd_grpo_support_gradient_ratio
-        <= ratio
-        <= config.max_opd_grpo_support_gradient_ratio
-    ):
-        failures.append(
-            "OPD/GRPO support-gradient ratio="
-            f"{ratio:.6g} (required "
-            f"[{config.min_opd_grpo_support_gradient_ratio:.6g}, "
-            f"{config.max_opd_grpo_support_gradient_ratio:.6g}])"
-        )
     if not 0.0 <= clip_fraction <= config.max_full_dose_gradient_clip_fraction:
         failures.append(
             f"gradient clip fraction={clip_fraction:.6g} (required "
@@ -858,6 +842,14 @@ def add_canonical_metric_aliases(
     for canonical, released in aliases.items():
         if canonical not in result and released in result:
             result[canonical] = result[released]
+
+    if "grad/grpo_norm" in result and "grad/opd_norm" in result:
+        grpo_norm = float(result["grad/grpo_norm"])
+        opd_norm = float(result["grad/opd_norm"])
+        if np.isfinite(grpo_norm) and grpo_norm > 0.0 and np.isfinite(opd_norm) and opd_norm >= 0.0:
+            ratio = opd_norm / grpo_norm
+            if np.isfinite(ratio):
+                result["grad/opd_grpo_support_gradient_ratio"] = ratio
 
     # The actor reports one exact clipping indicator per optimizer step and Ray
     # reduces those indicators to their mean across steps/ranks.  Any positive

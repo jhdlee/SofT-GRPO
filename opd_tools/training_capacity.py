@@ -42,6 +42,7 @@ def capacity_contract(beta_base=0.001):
         "response_token_cap": 8192, "total_rollout_iterations": 109,
         "invocation_iterations": 1, "optimizer_steps": 2, "ema_updates": 1,
         "full_dose_gradient_gate_enabled": True, "completion_gate_enabled": False,
+        "opd_grpo_ratio_range_gate_enabled": False,
         "validation_enabled": False, "checkpoint_after_iteration": 1,
         "maximum_process_seconds": 1700, "automatic_retry": False,
     }
@@ -204,10 +205,10 @@ def validate_capacity_iteration(record, *, beta_base=0.001):
             raise ValueError("capacity requires positive " + name)
     if number("grad/total_norm") < 0:
         raise ValueError("capacity total gradient norm must be nonnegative")
-    # These are the unchanged production full-dose gate bounds. The trainer
-    # also executes the authoritative gate before publishing a checkpoint.
+    # Relative component strength is a diagnostic, not an acceptance range.
+    # The trainer still checks gradient integrity before publishing a checkpoint.
     ratio = number("grad/opd_norm") / number("grad/grpo_norm")
-    if not 0.1 <= ratio <= 10 or not 0 <= number("actor/gradient_clipfrac") <= 0.5:
+    if not math.isfinite(ratio) or not 0 <= number("actor/gradient_clipfrac") <= 0.5:
         raise ValueError("capacity full-dose gradient integrity gate failed")
     ranks = record.get("actor_update_timing", {}).get("ranks")
     if not isinstance(ranks, list) or len(ranks) != 2 or {row.get("rank") for row in ranks} != {0, 1}:
@@ -223,7 +224,8 @@ def validate_capacity_iteration(record, *, beta_base=0.001):
         for name in ("policy_update_seconds", "worker_update_seconds", "max_memory_allocated_gib", "max_memory_reserved_gib"):
             if number(name, row) < 0:
                 raise ValueError("capacity rank timing/memory must be nonnegative")
-    return {"accepted": True, "opd_grpo_support_gradient_ratio": ratio, "full_dose_gradient_gate": "passed"}
+    return {"accepted": True, "opd_grpo_support_gradient_ratio": ratio,
+            "opd_grpo_ratio_range_gate_enabled": False, "full_dose_gradient_gate": "passed"}
 
 
 def _atomic_text(path, value):

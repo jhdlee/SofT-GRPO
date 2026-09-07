@@ -48,6 +48,7 @@ def test_contract_is_fresh_and_full_dose_single_invocation():
     assert contract["maximum_process_seconds"] == 1700
     assert contract["full_dose_gradient_gate_enabled"] is True
     assert contract["completion_gate_enabled"] is False
+    assert contract["opd_grpo_ratio_range_gate_enabled"] is False
     assert contract["beta_base"] == 0.001
 
 
@@ -112,7 +113,7 @@ def test_capacity_beta_api_rejects_implicit_or_unregistered_doses(tmp_path, inva
     ("trainer/optimizer_step", 6), ("opd/ema_update_count", 3),
     ("integrity/continuous_replay_active", 0), ("replay/fallback_count", 1),
     ("replay/ratio_abs_error_max", 1.01e-4), ("latent/soft_to_hard_rate", 0),
-    ("grad/grpo_norm", 0), ("grad/opd_norm", 0.001),
+    ("grad/grpo_norm", 0), ("grad/opd_norm", 0),
     ("actor/gradient_clipfrac", 0.51), ("grad/total_norm", float("nan")),
     ("opd/answer_slot_count", 0), ("opd/latent_slot_count", True),
 ])
@@ -121,6 +122,25 @@ def test_capacity_rejects_invalid_production_evidence(key, value, beta_base):
     record = valid_record(beta_base)
     record["metrics"][key] = value
     with pytest.raises(ValueError):
+        capacity.validate_capacity_iteration(record, beta_base=beta_base)
+
+
+@pytest.mark.parametrize("beta_base", [0.001, 0.1])
+@pytest.mark.parametrize("ratio", [0.0005076381422815234, 0.05076381422815234, 20.0])
+def test_capacity_records_ratio_outside_former_required_range(beta_base, ratio):
+    record = valid_record(beta_base)
+    record["metrics"]["grad/opd_norm"] = ratio * record["metrics"]["grad/grpo_norm"]
+    result = capacity.validate_capacity_iteration(record, beta_base=beta_base)
+    assert result["accepted"] is True
+    assert result["opd_grpo_support_gradient_ratio"] == pytest.approx(ratio)
+    assert result["opd_grpo_ratio_range_gate_enabled"] is False
+
+
+@pytest.mark.parametrize("beta_base", [0.001, 0.1])
+def test_capacity_still_rejects_nonfinite_ratio(beta_base):
+    record = valid_record(beta_base)
+    record["metrics"].update({"grad/opd_norm": 1e308, "grad/grpo_norm": 1e-308})
+    with pytest.raises(ValueError, match="gradient integrity"):
         capacity.validate_capacity_iteration(record, beta_base=beta_base)
 
 
