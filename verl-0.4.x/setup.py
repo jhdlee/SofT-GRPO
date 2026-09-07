@@ -35,9 +35,9 @@ install_requires = [
     "pyarrow>=19.0.0",
     "pybind11",
     "pylatexenc",
-    # Only Ray Core is used by this training path.  The ``default`` extra pulls
-    # OpenTelemetry >=1.30, which is incompatible with vLLM 0.8.5's required
-    # OpenTelemetry 1.26 runtime.
+    # The unified runtime pins Ray2.43[default,cgraph] with OpenTelemetry1.26.
+    # Leave this base requirement compatible; newer Ray default extras require
+    # an incompatible OpenTelemetry SDK and must not replace the complete lock.
     "ray>=2.43.0,!=2.44.*,<2.50.0",
     "torchdata",
     "tensordict<=0.6.2",
@@ -54,7 +54,7 @@ MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
 VLLM_REQUIRES = ["tensordict<=0.6.2", "vllm<=0.8.5"]
 SGLANG_REQUIRES = [
     "tensordict<=0.6.2",
-    "sglang[srt,openai]==0.4.6.post5",
+    "sglang[srt,openai]==0.4.6.post1",
     "torch-memory-saver>=0.0.5",
     "torch==2.6.0",
 ]

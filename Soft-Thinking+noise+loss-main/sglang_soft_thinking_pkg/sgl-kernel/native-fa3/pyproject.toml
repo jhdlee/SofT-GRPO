@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools==75.8.0", "wheel==0.45.1", "torch==2.6.0", "ninja==1.11.1.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opd-fa3"
+version = "0.1.0"
+description = "Pinned Qwen3/Hopper BF16 FA3 forward and backward"
+requires-python = ">=3.11,<3.12"
+dependencies = ["torch==2.6.0"]
+
+[tool.setuptools]
+packages = ["opd_fa3"]

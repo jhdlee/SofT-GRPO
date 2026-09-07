@@ -363,3 +363,72 @@ def test_h100_packed_forward_gradients_and_row_isolation():
         assert torch.count_nonzero(actual[:, :, 27:]) == 0
         torch.testing.assert_close(actual.float(), math_input.grad.float(), rtol=0.03, atol=0.003)
         torch.testing.assert_close(actual.float(), fa2_input.grad.transpose(0, 1)[None].float(), rtol=0.03, atol=0.003)
+
+
+def test_v2_cpu_reference_preserves_causality_gqa_and_packed_boundaries():
+    _, _, layout = _layout((2, 3))
+    inputs = _inputs(length=5, dim=2)
+    expected = bridge.native_fa3_attention(None, *inputs, opd_attention_layout=layout)[0]
+    actual = bridge.native_fa3_attention_v2(None, *inputs, opd_attention_layout=layout)[0]
+    assert torch.equal(actual, expected)
+    assert torch.autograd.gradcheck(
+        lambda *args: bridge.native_fa3_attention_v2(None, *args, opd_attention_layout=layout)[0], inputs,
+    )
+    actual[:, 2:3].sum().backward()
+    for value in inputs:
+        assert torch.count_nonzero(value.grad[:, :, :2]) == 0
+        assert torch.count_nonzero(value.grad[:, :, 3:]) == 0
+
+
+def test_v2_uses_native_backward_with_actual_saved_forward_and_no_fa2(monkeypatch):
+    _, _, layout = _layout((2, 3))
+    q, k, v = (t.transpose(1, 2).squeeze(0).detach().contiguous().requires_grad_() for t in _inputs())
+    output = torch.full_like(q, 0.25)
+    lse = torch.arange(20, dtype=torch.float32).view(4, 5)
+    calls = []
+
+    def forward(a, b, c, cumulative, length, scale):
+        assert (a, b, c) == (q, k, v)
+        assert cumulative is layout.cu_seqlens and length == 3 and scale == .37
+        calls.append('native_forward')
+        return output, lse
+
+    def backward(gradient, a, b, c, saved_out, saved_lse, cumulative, length, scale):
+        assert (a, b, c) == (q, k, v)
+        assert saved_out.data_ptr() == output.data_ptr() and saved_lse.data_ptr() == lse.data_ptr()
+        assert cumulative is layout.cu_seqlens and length == 3 and scale == .37
+        calls.append('native_backward')
+        return torch.ones_like(q), torch.full_like(k, 2), torch.full_like(v, 3)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('v2 used the legacy FA2 bridge')
+
+    monkeypatch.setattr(bridge, '_fa3_v2_forward', forward)
+    monkeypatch.setattr(bridge, '_fa3_v2_backward', backward)
+    monkeypatch.setattr(bridge, '_fa2_backward', forbidden)
+    result = bridge._NativeFA3AttentionV2.apply(q, k, v, .37, layout)
+    result.sum().backward()
+    assert calls == ['native_forward', 'native_backward']
+    for tensor, value in ((q, 1), (k, 2), (v, 3)):
+        assert torch.equal(tensor.grad, torch.full_like(tensor, value))
+
+
+def test_v2_pinned_backward_signature_is_native_and_deterministic(monkeypatch):
+    q, k, v = (t.transpose(1, 2).squeeze(0).contiguous() for t in _inputs())
+    cumulative = torch.tensor([0, 5], dtype=torch.int32)
+    out, lse = torch.zeros_like(q), torch.zeros(4, 5)
+    expected = (torch.ones_like(q), torch.ones_like(k), torch.ones_like(v))
+
+    def native(*args, **kwargs):
+        assert len(args) == 10
+        assert args[1] is q and args[2] is k and args[3] is v
+        assert args[4] is out and args[5] is lse
+        assert args[6] is cumulative and args[7] is cumulative and args[8:] == (5, 5)
+        assert kwargs == {'softmax_scale': .37, 'causal': True, 'deterministic': True}
+        return expected
+
+    module = ModuleType('opd_fa3')
+    module.flash_attn_varlen_backward = native
+    monkeypatch.setitem(sys.modules, 'opd_fa3', module)
+    actual = bridge._fa3_v2_backward(torch.ones_like(q), q, k, v, out, lse, cumulative, 5, .37)
+    assert all(a is b for a, b in zip(actual, expected))

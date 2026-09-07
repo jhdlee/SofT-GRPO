@@ -186,10 +186,11 @@ def _dense_attention(query, key, value, scale):
     return torch.matmul(scores.softmax(-1), v).transpose(1, 2).to(query.dtype)
 
 
-def native_fa3_attention(
+def _native_attention(
     module, query, key, value, attention_mask=None, *, dropout=0.0, scaling=None,
     sliding_window=None, position_ids=None, is_causal=True,
-    opd_cu_seqlens=None, opd_max_seqlen=None, opd_attention_layout=None, **kwargs,
+    opd_cu_seqlens=None, opd_max_seqlen=None, opd_attention_layout=None,
+    _autograd_function=_NativeFA3Attention, **kwargs,
 ):
     """HF attention interface: [1, heads, tokens, dim] -> [1, tokens, heads, dim].
 
@@ -230,10 +231,100 @@ def native_fa3_attention(
         if query.dtype not in (torch.float16, torch.bfloat16) or query.shape[-1] % 8 or query.shape[-1] > 256:
             raise ValueError("diagnostic FA3 CUDA requires FP16/BF16 and a head dimension divisible by 8, at most 256")
         q, k, v = (tensor.transpose(1, 2).squeeze(0).contiguous() for tensor in (query, key, value))
-        output = _NativeFA3Attention.apply(q, k, v, scale, layout).unsqueeze(0)
+        output = _autograd_function.apply(q, k, v, scale, layout).unsqueeze(0)
     else:
         output = torch.cat([
             _dense_attention(query[:, :, begin:end], key[:, :, begin:end], value[:, :, begin:end], scale)
             for begin, end in layout.segments
         ], dim=1)
     return output, None
+
+
+def _fa3_v2_forward(query, key, value, cumulative, length, scale):
+    from opd_fa3 import flash_attn_varlen_func
+
+    output, lse, *_ = flash_attn_varlen_func(
+        query, key, value, cumulative, cumulative, length, length,
+        softmax_scale=scale, causal=True, num_splits=1, return_softmax_lse=True,
+    )
+    return output, lse
+
+
+def _fa3_v2_backward(gradient, query, key, value, output, lse, cumulative, length, scale):
+    from opd_fa3 import flash_attn_varlen_backward
+
+    return flash_attn_varlen_backward(
+        gradient.contiguous(), query, key, value, output, lse,
+        cumulative, cumulative, length, length,
+        softmax_scale=scale, causal=True, deterministic=True,
+    )
+
+
+class _NativeFA3AttentionV2(torch.autograd.Function):
+    """Pinned native FA3 in both directions; never dispatches to FA2."""
+
+    @staticmethod
+    def forward(ctx, query, key, value, scale, layout):
+        output, lse = _fa3_v2_forward(
+            query, key, value, layout.cu_seqlens, layout.max_seqlen, scale,
+        )
+        if output.shape != query.shape or output.dtype != query.dtype or output.device != query.device:
+            raise RuntimeError("FA3 v2 returned an incompatible attention output")
+        if lse.shape != (query.shape[1], query.shape[0]) or lse.dtype != torch.float32 or lse.device != query.device:
+            raise RuntimeError("FA3 v2 LSE must be float32 [query_heads, total_query_tokens]")
+        ctx.save_for_backward(query, key, value, output, lse.contiguous(), layout.cu_seqlens)
+        ctx.length, ctx.scale = layout.max_seqlen, scale
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient):
+        query, key, value, output, lse, cumulative = ctx.saved_tensors
+        dq, dk, dv = _fa3_v2_backward(
+            gradient, query, key, value, output, lse, cumulative, ctx.length, ctx.scale,
+        )
+        for name, actual, expected in (("dq", dq, query), ("dk", dk, key), ("dv", dv, value)):
+            if actual.shape != expected.shape or actual.dtype != expected.dtype or actual.device != expected.device:
+                raise RuntimeError(f"FA3 v2 returned incompatible {name}")
+        return dq, dk, dv, None, None
+
+
+def native_fa3_attention(
+    module, query, key, value, attention_mask=None, *, dropout=0.0, scaling=None,
+    sliding_window=None, position_ids=None, is_causal=True,
+    opd_cu_seqlens=None, opd_max_seqlen=None, opd_attention_layout=None, **kwargs,
+):
+    """Existing v1: sgl-kernel FA3 forward and flash-attn FA2 backward."""
+    if "_autograd_function" in kwargs:
+        raise ValueError("unsupported diagnostic FA3 attention option: _autograd_function")
+    return _native_attention(
+        module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
+        sliding_window=sliding_window, position_ids=position_ids, is_causal=is_causal,
+        opd_cu_seqlens=opd_cu_seqlens, opd_max_seqlen=opd_max_seqlen,
+        opd_attention_layout=opd_attention_layout, **kwargs,
+    )
+
+
+def native_fa3_attention_v2(
+    module, query, key, value, attention_mask=None, *, dropout=0.0, scaling=None,
+    sliding_window=None, position_ids=None, is_causal=True,
+    opd_cu_seqlens=None, opd_max_seqlen=None, opd_attention_layout=None, **kwargs,
+):
+    """Qwen3/H100 BF16 FA3 forward and native deterministic FA3 backward.
+
+    CPU is a mathematical reference only. CUDA requires the separately built,
+    source-pinned opd-fa3 extension; there is no older-kernel fallback.
+    """
+    if "_autograd_function" in kwargs:
+        raise ValueError("unsupported diagnostic FA3 attention option: _autograd_function")
+    if query.is_cuda:
+        if query.dtype != torch.bfloat16 or query.shape[-1] != 128:
+            raise ValueError("native_fa3_v2 requires BF16 with head dimension 128")
+        if torch.cuda.get_device_capability(query.device) != (9, 0):
+            raise ValueError("native_fa3_v2 requires Hopper SM90")
+    return _native_attention(
+        module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
+        sliding_window=sliding_window, position_ids=position_ids, is_causal=is_causal,
+        opd_cu_seqlens=opd_cu_seqlens, opd_max_seqlen=opd_max_seqlen,
+        opd_attention_layout=opd_attention_layout, _autograd_function=_NativeFA3AttentionV2, **kwargs,
+    )
