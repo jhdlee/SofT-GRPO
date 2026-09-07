@@ -26,6 +26,10 @@ RESUME_INVOCATION_ONLY_CONFIG_FIELDS = (
     "trainer.resume_from_path",
     "trainer.resume_mode",
 )
+PRODUCTION_RESUME_INVOCATION_ONLY_CONFIG_FIELDS = RESUME_INVOCATION_ONLY_CONFIG_FIELDS + (
+    "trainer.production_phase",
+    "trainer.production_output",
+)
 CORE_RUNTIME_PACKAGES = (
     "datasets",
     "flash-attn",
@@ -87,8 +91,9 @@ def _resolved_config_identity(resolved_config: Mapping[str, Any]) -> dict[str, o
     ``resume_mode`` must change from ``disable``/an explicit first invocation to
     ``auto``/``resume_path`` when exercising exact resume.  The smoke-only
     per-invocation stop count is similarly not training semantics.  These are
-    the only exclusions; optimization, rollout, OPD, data, model, logging, and
-    checkpoint cadence settings remain covered.
+    the general exclusions. The production profile also excludes its report
+    output and invocation-phase label; optimization, rollout, OPD, data, model,
+    logging, and checkpoint cadence settings remain covered.
     """
 
     if not isinstance(resolved_config, Mapping):
@@ -98,13 +103,16 @@ def _resolved_config_identity(resolved_config: Mapping[str, Any]) -> dict[str, o
     trainer = normalized.get("trainer")
     if not isinstance(trainer, dict):
         raise RuntimeError("resolved Hydra config has no trainer mapping")
-    for dotted_path in RESUME_INVOCATION_ONLY_CONFIG_FIELDS:
+    invocation_fields = RESUME_INVOCATION_ONLY_CONFIG_FIELDS
+    if trainer.get("production_mode") is True and trainer.get("training_profile") == "qwen3-math-seven-arm-v1":
+        invocation_fields = PRODUCTION_RESUME_INVOCATION_ONLY_CONFIG_FIELDS
+    for dotted_path in invocation_fields:
         _, field = dotted_path.split(".", 1)
         trainer.pop(field, None)
     return {
         "full_sha256": _canonical_sha256(exact),
         "resume_semantic_sha256": _canonical_sha256(normalized),
-        "excluded_invocation_fields": list(RESUME_INVOCATION_ONLY_CONFIG_FIELDS),
+        "excluded_invocation_fields": list(invocation_fields),
     }
 
 
@@ -432,8 +440,10 @@ def validate_checkpoint_provenance(provenance: object) -> dict[str, object]:
             "resume_semantic_sha256",
             "excluded_invocation_fields",
         }
-        or config.get("excluded_invocation_fields")
-        != list(RESUME_INVOCATION_ONLY_CONFIG_FIELDS)
+        or config.get("excluded_invocation_fields") not in (
+            list(RESUME_INVOCATION_ONLY_CONFIG_FIELDS),
+            list(PRODUCTION_RESUME_INVOCATION_ONLY_CONFIG_FIELDS),
+        )
     ):
         raise RuntimeError("checkpoint provenance resolved config identity is invalid")
     _require_sha256(config.get("full_sha256"), "resolved_hydra_config.full_sha256")

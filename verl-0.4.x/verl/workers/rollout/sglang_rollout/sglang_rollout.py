@@ -148,7 +148,16 @@ sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
 # which can not call loop.run_until_complete. So we need to make the engine to be an async class
 class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        if kwargs.pop("_opd_production_engine_isolation", False):
+            from verl.workers.rollout.sglang_rollout.engine_isolation import isolated_engine_startup
+
+            if kwargs.get("tp_size", 1) != 1 or kwargs.get("nnodes", 1) != 1:
+                raise ValueError("production engine startup isolation requires local TP1")
+            with isolated_engine_startup() as port:
+                kwargs["port"] = port
+                super().__init__(**kwargs)
+        else:
+            super().__init__(**kwargs)
         # default to use dummy load format, which need to reload weights in first time
         self._need_reload = True
 
@@ -493,6 +502,7 @@ class SGLangRollout(BaseRollout):
                 # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
                 # when random.seed is being set during training
                 port=30000 + rank,
+                _opd_production_engine_isolation=self.config.get("production_engine_isolation", False),
                 **engine_options,
                 # NOTE(Chenyang): if you want to debug the SGLang engine output
                 # please set the following parameters

@@ -80,6 +80,7 @@ from verl.trainer.ppo.opd_driver import (
     training_wandb_step,
     validate_categorical_rollout_integrity,
     validate_full_dose_gradient_integrity,
+    validate_production_gradient_integrity,
     validate_iteration_metric_contract,
     validate_rollout_integrity,
     validate_validation_metric_contract,
@@ -1397,6 +1398,10 @@ class RayPPOTrainer:
         if not isinstance(resolved_config, Mapping):
             raise RuntimeError("resolved Hydra trainer config must be a mapping")
         self.checkpoint_provenance = build_checkpoint_provenance(resolved_config)
+        if config.trainer.get("production_mode", False):
+            from verl.trainer.ppo.qwen_production import attach_production_recorder
+
+            attach_production_recorder(self)
 
     def _validate_config(self):
         config = self.config
@@ -2325,6 +2330,9 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
         self._resumed = self.global_steps > 0
+        if self.global_steps >= self.total_training_steps:
+            print("Training horizon already completed; no validation or update repeated")
+            return
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -2758,6 +2766,9 @@ class RayPPOTrainer:
                                 worker_schedule["opd_schedule_multiplier"]
                             ),
                         )
+
+                    if self.config.trainer.get("production_mode", False):
+                        validate_production_gradient_integrity(metrics, standalone=self.standalone_opd)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

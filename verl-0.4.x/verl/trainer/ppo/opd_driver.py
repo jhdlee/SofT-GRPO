@@ -789,6 +789,30 @@ def validate_full_dose_gradient_integrity(
         )
 
 
+def validate_production_gradient_integrity(metrics: Mapping[str, Any], *, standalone: bool = False) -> None:
+    """Keep numerical checks while reporting production clipping frequency.
+
+    Zero component gradients can be legitimate (including a positive-advantage
+    batch with no eligible trajectories). A finite zero is not an arithmetic
+    failure. The optimizer still clips each parameter-gradient norm at 1.0.
+    """
+
+    required = ("actor/grad_norm", "actor/gradient_clipfrac", "grad/opd_norm")
+    if not standalone:
+        required += ("grad/grpo_norm",)
+    for name in required:
+        if name not in metrics:
+            raise RuntimeError("production gradient diagnostics missing " + name)
+    for name in ("actor/grad_norm", "actor/gradient_clipfrac", "grad/grpo_norm", "grad/opd_norm"):
+        if name not in metrics:
+            continue
+        value = metrics[name]
+        if isinstance(value, (bool, str)) or not isinstance(value, (int, float, np.number)) or not np.isfinite(value) or value < 0:
+            raise RuntimeError("production gradient diagnostic must be finite and nonnegative: " + name)
+    if float(metrics["actor/gradient_clipfrac"]) > 1:
+        raise RuntimeError("production gradient clipping frequency must be in [0, 1]")
+
+
 def add_canonical_metric_aliases(
     metrics: Mapping[str, Any],
     *,

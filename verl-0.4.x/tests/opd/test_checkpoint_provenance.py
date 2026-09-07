@@ -99,6 +99,44 @@ def provenance_inputs(tmp_path):
     return config, environment, model_manifest, data_manifest
 
 
+@pytest.mark.parametrize("production", [False, True])
+def test_production_phase_and_output_are_invocation_only_in_the_production_profile(provenance_inputs, production):
+    config, environment, *_ = provenance_inputs
+    config["trainer"].update(training_profile="qwen3-math-seven-arm-v1", production_mode=production,
+                             production_phase="split", production_output="/run/split.json",
+                             production_arm_id="softgrpo_math_opd_s11")
+    first = build_checkpoint_provenance(config, source_commit="1" * 40, environment_identity=environment)
+    resumed_config = deepcopy(config)
+    resumed_config["trainer"].update(production_phase="resume", production_output="/run/resume.json", resume_mode="resume_path")
+    second = build_checkpoint_provenance(resumed_config, source_commit="1" * 40, environment_identity=environment)
+    if production:
+        assert_checkpoint_provenance_matches(first, second)
+    else:
+        with pytest.raises(RuntimeError, match="resolved_hydra_config"):
+            assert_checkpoint_provenance_matches(first, second)
+    assert first["resolved_hydra_config"]["full_sha256"] != second["resolved_hydra_config"]["full_sha256"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("production_arm_id", "softgrpo_math_opd_current_s11"), ("total_training_steps", 110),
+    ("default_local_dir", "/different/training"), ("n_gpus_per_node", 2),
+    ("production_gradient_policy", "changed"),
+])
+def test_production_resume_keeps_training_semantics_bound(provenance_inputs, field, value):
+    config, environment, *_ = provenance_inputs
+    config["trainer"].update(training_profile="qwen3-math-seven-arm-v1", production_mode=True,
+                             production_phase="split", production_output="/run/split.json",
+                             production_arm_id="softgrpo_math_opd_s11", total_training_steps=109,
+                             default_local_dir="/run/training", n_gpus_per_node=4,
+                             production_gradient_policy="diagnostic_clipping")
+    first = build_checkpoint_provenance(config, source_commit="1" * 40, environment_identity=environment)
+    changed = deepcopy(config)
+    changed["trainer"][field] = value
+    second = build_checkpoint_provenance(changed, source_commit="1" * 40, environment_identity=environment)
+    with pytest.raises(RuntimeError, match="resolved_hydra_config"):
+        assert_checkpoint_provenance_matches(first, second)
+
+
 def test_changing_replay_arithmetic_rejects_exact_resume(provenance_inputs):
     config, environment, *_ = provenance_inputs
     before = build_checkpoint_provenance(config, source_commit="a" * 40, environment_identity=environment)
