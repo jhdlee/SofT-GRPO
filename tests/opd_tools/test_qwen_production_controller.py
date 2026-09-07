@@ -1,5 +1,8 @@
 import copy
 import json
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -273,18 +276,25 @@ def test_legacy_study_does_not_require_new_gpu_preflight_schema(tmp_path):
 
 @pytest.mark.parametrize('phase', ['production', 'split'])
 @pytest.mark.parametrize('revised', [False, True])
-def test_invocation_wandb_project_matches_manifest_and_phase(tmp_path, monkeypatch, phase, revised):
+def test_invocation_project_and_import_path_match_manifest_and_phase(tmp_path, monkeypatch, phase, revised):
     from opd_tools.qwen_production import PRODUCTION_PROJECT
     arm = 'hardgrpo_math_s11'
     directory = tmp_path / phase
     output = directory / 'measurement.json'
     controller = ProductionController.__new__(ProductionController)
     controller.args = SimpleNamespace(arm=arm, signal_file=tmp_path / 'signal')
-    controller.manifest = {'source_root': str(tmp_path)}
+    source_root = tmp_path / 'source'
+    source_verl = source_root / '3rdparty/SofT-GRPO/verl-0.4.x'
+    installed = tmp_path / 'environment/site-packages'
+    for root, marker in ((source_verl, 'source'), (installed, 'wheel')):
+        (root / 'verl').mkdir(parents=True)
+        (root / 'verl/__init__.py').write_text(f'identity = {marker!r}\n')
+    controller.manifest = {'source_root': str(source_root)}
     controller.row = {'wandb_run_id': 'test-run', 'phases': {
         phase: {'directory': str(directory), 'output': str(output)}}}
     if revised:
         controller.row['wandb_project'] = PRODUCTION_PROJECT + '-lora-fa3'
+        controller.manifest['profile_id'] = 'qwen3-math-seven-arm-lora-fa3-v1'
     project = controller.row.get('wandb_project', PRODUCTION_PROJECT) + ('' if phase == 'production' else '-prologue')
     controller.restart = 0
     controller.deadline = time.monotonic() + 600
@@ -292,9 +302,20 @@ def test_invocation_wandb_project_matches_manifest_and_phase(tmp_path, monkeypat
     controller.persist = lambda: None
     controller.terminate_child = lambda: None
     captured = {}
+    original_popen = subprocess.Popen
 
     def launch(command, **kwargs):
         captured.update(kwargs['env'])
+        captured['working_directory'] = kwargs['cwd']
+        assert kwargs['cwd'].is_dir()  # Created before spawning the trainer.
+        # A fresh interpreter verifies actual Python cwd precedence, without
+        # importing Torch or relying on this test process's imported modules.
+        probe = original_popen([sys.executable, '-c', 'import verl; print(verl.identity)'],
+                               cwd=kwargs['cwd'], env={**os.environ, 'PYTHONPATH': str(installed)},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = probe.communicate(timeout=10)
+        assert probe.returncode == 0, stderr
+        assert stdout.strip() == ('wheel' if revised else 'source')
         write_json(output, {'phase': phase, 'arm_id': arm, 'status': 'complete',
                             'wandb_run_id': kwargs['env']['WANDB_RUN_ID'],
                             'wandb_online': True, 'wandb_finished': True,
@@ -312,6 +333,8 @@ def test_invocation_wandb_project_matches_manifest_and_phase(tmp_path, monkeypat
     assert invocation['wandb_project'] == project
     assert controller.report['phases'][phase]['wandb_project'] == project
     assert invocation['wandb_run_id'] == captured['WANDB_RUN_ID']
+    assert captured['working_directory'] == (directory if revised else source_verl)
+    assert invocation['working_directory'] == str(captured['working_directory'])
 
 
 def test_real_admission_publishes_gpu_certificate_and_continuation_reuses_it(tmp_path, monkeypatch):

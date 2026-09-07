@@ -8,9 +8,13 @@ different compiler. A CUDA GPU is not needed to compile SM90a machine code.
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
+import sys
+import sysconfig
 
 from setuptools import setup
+import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
@@ -37,7 +41,10 @@ for binary, version in ((cuda / "bin/nvcc", "12.6.85"), (assembler, "12.8.93")):
 if (cuda / "bin/ptxas").resolve() != assembler:
     raise RuntimeError("CUDA_HOME/bin/ptxas must be the pinned assembler")
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-os.environ.setdefault("MAX_JOBS", "4")
+os.environ.setdefault("MAX_JOBS", "2")
+nvidia_includes, nvidia_libraries = runpy.run_path(
+    str(Path(__file__).with_name("build_support.py"))
+)["nvidia_library_paths"]()
 
 defines = [
     "FLASHATTENTION_DISABLE_SM8x", "FLASHATTENTION_DISABLE_FP16", "FLASHATTENTION_DISABLE_FP8",
@@ -60,15 +67,30 @@ sources = [
     )],
 ]
 common = ["-O3", "-std=c++17", *["-D" + value for value in defines]]
+extension = CUDAExtension(
+    "opd_fa3._C", sources,
+    include_dirs=[str(cuda / "include"), str(hopper), str(cutlass / "include"),
+                  str(cutlass / "tools/util/include"), *nvidia_includes],
+    library_dirs=nvidia_libraries,
+    extra_compile_args={
+        "cxx": common,
+        "nvcc": [*common, "--use_fast_math", "--expt-relaxed-constexpr", "--expt-extended-lambda",
+                 "-DCUTE_USE_PACKED_TUPLE=1", "--threads=2"],
+    },
+)
+if sys.argv[1:] == ["--opd-header-preflight"]:
+    # Compile only the CPU translation unit's syntax before expensive CUDA
+    # instantiations. This checks the real pinned ATen/CUDA header graph and
+    # binding signatures without a GPU, object files, or changed arithmetic.
+    command = [os.environ["CXX"], *common, "-fsyntax-only", "-DTORCH_EXTENSION_NAME=_C",
+               "-DTORCH_API_INCLUDE_EXTENSION_H",
+               f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+               *["-I" + path for path in [*extension.include_dirs, sysconfig.get_path("include")]],
+               str(Path(__file__).parent / "binding.cpp")]
+    print("Checking native binding headers and C++ signatures:", " ".join(command), flush=True)
+    subprocess.run(command, check=True)
+    raise SystemExit(0)
 setup(
-    ext_modules=[CUDAExtension(
-        "opd_fa3._C", sources,
-        include_dirs=[str(hopper), str(cutlass / "include"), str(cutlass / "tools/util/include")],
-        extra_compile_args={
-            "cxx": common,
-            "nvcc": [*common, "--use_fast_math", "--expt-relaxed-constexpr", "--expt-extended-lambda",
-                     "-DCUTE_USE_PACKED_TUPLE=1", "--threads=2"],
-        },
-    )],
+    ext_modules=[extension],
     cmdclass={"build_ext": BuildExtension},
 )

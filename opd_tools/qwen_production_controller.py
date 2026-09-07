@@ -364,7 +364,12 @@ class ProductionController:
                            OPD_PRODUCTION_STARTED=str(time.time()))
         if phase == "production":
             command.append("trainer.requeue_signal_file=" + json.dumps(str(self.args.signal_file)))
+        # Python -m prepends cwd to sys.path. Keep the revised study outside
+        # the source VERL tree so it imports the authenticated installed wheel.
+        working_directory = (directory if requires_semantic_checkpoint(self.manifest)
+                             else Path(self.manifest["source_root"]) / "3rdparty/SofT-GRPO/verl-0.4.x")
         invocation = {"phase": phase, "command": command, "wandb_run_id": run_id, "wandb_project": project,
+                      "working_directory": str(working_directory),
                       "submission_manifest_sha256": self.report["submission_manifest_sha256"]}
         invocation_path = directory / f"invocation-{phase}{suffix}.json"
         write_json(invocation_path, invocation)
@@ -376,7 +381,7 @@ class ProductionController:
         monitor.start()
         try:
             with log_path.open("x") as log:
-                self.child = subprocess.Popen(command, cwd=Path(self.manifest["source_root"]) / "3rdparty/SofT-GRPO/verl-0.4.x",
+                self.child = subprocess.Popen(command, cwd=working_directory,
                                               env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 remaining = None if phase == "production" else max(0.01, self.deadline - time.monotonic() - 30)
                 code = self.child.wait(timeout=remaining)
