@@ -290,9 +290,12 @@ def flash_attn_varlen_backward(
         raise ValueError("opd-fa3 training requires deterministic native backward")
     if not is_fa3_supported(q.device):
         raise ValueError("opd-fa3 requires Hopper SM90")
-    dq, dk, dv, *_ = _C.bwd(
+    # The pinned upstream ABI writes gradients into these optional output
+    # buffers and returns five scratch tensors, not dq/dk/dv.
+    dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
+    _C.bwd(
         gradient.contiguous(), q, k, v, output, lse,
-        None, None, None, cu_seqlens_q, cu_seqlens_k, None, None,
+        dq, dk, dv, cu_seqlens_q, cu_seqlens_k, None, None,
         max_seqlen_q, max_seqlen_k, softmax_scale, causal, -1, -1, 0.0, True, 0,
     )
     return dq, dk, dv

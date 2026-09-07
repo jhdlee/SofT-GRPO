@@ -56,20 +56,47 @@ def test_native_backward_returns_actual_kernel_gradients_and_fixed_determinism(i
     out, lse = torch.ones_like(q), torch.zeros(4, 5)
     gradient = torch.full_like(q, .5)
     expected = tuple(torch.full_like(t, i + 1) for i, t in enumerate((q, k, v)))
+    supplied = []
+    scratch = tuple(torch.full((7,), 90 + i, dtype=torch.float32) for i in range(5))
 
     def backward(*args):
         assert len(args) == 22
         assert args[0] is gradient and args[1] is q and args[2] is k and args[3] is v
         assert args[4] is out and args[5] is lse
-        assert args[6:9] == (None, None, None)
+        supplied.extend(args[6:9])
+        for destination, wanted, original in zip(args[6:9], expected, (q, k, v)):
+            assert destination.shape == original.shape
+            assert destination.dtype == original.dtype and destination.device == original.device
+            assert destination.data_ptr() != original.data_ptr()
+            destination.copy_(wanted)
         assert args[9] is cumulative and args[10] is cumulative
         assert args[11:] == (None, None, 5, 5, .125, True, -1, -1, 0., True, 0)
-        return (*expected, "scratch_only", "scratch_only")
+        # Model the actual pinned mha_bwd ABI: writes caller-owned gradients,
+        # returns only softmax/reduction workspaces with incompatible shapes.
+        return scratch
 
     native.bwd = backward
     actual = module.flash_attn_varlen_backward(gradient, q, k, v, out, lse, cumulative,
                                               cumulative, 5, 5, softmax_scale=.125)
-    assert all(a is b for a, b in zip(actual, expected))
+    assert all(a is b for a, b in zip(actual, supplied))
+    for result, wanted in zip(actual, expected):
+        torch.testing.assert_close(result, wanted, rtol=0, atol=0)
+    assert all(not tensor.count_nonzero() for tensor in (q, k, v))
+
+
+def test_backward_failure_does_not_return_uninitialized_gradient_buffers(interface):
+    module, native = interface
+    q, k, v = inputs()
+    cumulative = torch.tensor([0, 5], dtype=torch.int32)
+
+    def failure(*args):
+        assert all(isinstance(value, torch.Tensor) for value in args[6:9])
+        raise RuntimeError("native scheduler failed")
+
+    native.bwd = failure
+    with pytest.raises(RuntimeError, match="native scheduler failed"):
+        module.flash_attn_varlen_backward(q, q, k, v, q, torch.zeros(4, 5), cumulative,
+                                          cumulative, 5, 5, softmax_scale=.125)
 
 
 @pytest.mark.parametrize("option", [dict(num_splits=0), dict(num_splits=2), dict(softcap=1.),

@@ -13,6 +13,9 @@ EXPECTED_BUILD = {
     "dtype": "bfloat16",
     "head_dimension": 128,
     "native_backward": True,
+    "host_backward_repair": "scheduler_semaphore_and_explicit_gradients_v1",
+    "upstream_flash_api_sha256": "35f2f6f5db472886219c7391a8c4d73ef619db4c8ef97ba23a914463ccf27f15",
+    "patched_flash_api_sha256": "e989b32ee79bb31429c45be2900050e8ce45a5985601360fbc25e9cc418a5767",
 }
 
 

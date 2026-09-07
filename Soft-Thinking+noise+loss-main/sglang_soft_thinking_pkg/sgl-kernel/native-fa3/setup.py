@@ -42,9 +42,13 @@ if (cuda / "bin/ptxas").resolve() != assembler:
     raise RuntimeError("CUDA_HOME/bin/ptxas must be the pinned assembler")
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
 os.environ.setdefault("MAX_JOBS", "2")
-nvidia_includes, nvidia_libraries = runpy.run_path(
+build_support = runpy.run_path(
     str(Path(__file__).with_name("build_support.py"))
-)["nvidia_library_paths"]()
+)
+nvidia_includes, nvidia_libraries = build_support["nvidia_library_paths"]()
+host_source = build_support["prepare_host_source"](
+    attention, os.environ["OPD_FA3_HOST_BUILD_DIR"],
+)
 
 defines = [
     "FLASHATTENTION_DISABLE_SM8x", "FLASHATTENTION_DISABLE_FP16", "FLASHATTENTION_DISABLE_FP8",
@@ -69,7 +73,7 @@ sources = [
 common = ["-O3", "-std=c++17", *["-D" + value for value in defines]]
 extension = CUDAExtension(
     "opd_fa3._C", sources,
-    include_dirs=[str(cuda / "include"), str(hopper), str(cutlass / "include"),
+    include_dirs=[str(host_source.parent), str(cuda / "include"), str(hopper), str(cutlass / "include"),
                   str(cutlass / "tools/util/include"), *nvidia_includes],
     library_dirs=nvidia_libraries,
     extra_compile_args={
