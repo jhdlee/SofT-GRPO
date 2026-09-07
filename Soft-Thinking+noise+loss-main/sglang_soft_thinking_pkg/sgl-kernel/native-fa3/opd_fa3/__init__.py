@@ -1,5 +1,7 @@
 """Source-pinned Qwen3/Hopper FA3 forward and backward extension."""
 
+import torch  # Load libtorch/libc10 before the linked native extension.
+
 from . import _C
 
 EXPECTED_BUILD = {
