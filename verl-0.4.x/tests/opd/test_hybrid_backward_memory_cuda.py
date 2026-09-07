@@ -91,7 +91,13 @@ def _legacy_density(logits, layout, actions):
     selected = (base > -3).float()
     soft = ((-noise - (-noise).exp()) * selected).sum(-1) / selected.sum(-1)
     # Never allow the oracle CE backward to overwrite the shared logits.
-    hard = -cross_entropy_loss(logits, layout["labels"], inplace_backward=False)[0]
+    # The pinned raw kernel assumes contiguous labels; its wrapper does not
+    # normalize strided views. Keep the oracle independent and satisfy that
+    # precondition explicitly. The repaired public path receives the original
+    # strided support[:, 0] view, exercising its API-boundary normalization.
+    hard = -cross_entropy_loss(logits, layout["labels"].contiguous(), inplace_backward=False)[0]
+    dense_hard = logits.float().log_softmax(-1).gather(-1, layout["labels"][:, None]).squeeze(-1)
+    torch.testing.assert_close(hard, dense_hard, rtol=0, atol=2e-6)
     return torch.where((layout["support"][:, 1:] == 0).all(-1), hard, soft)
 
 

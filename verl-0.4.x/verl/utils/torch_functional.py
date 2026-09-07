@@ -183,7 +183,10 @@ def logprobs_from_logits_topk_gumbel(
 
 
 def logprobs_from_logits_flash_attn(logits, labels, inplace_backward=True):
-    output = cross_entropy_loss(logits, labels, inplace_backward=inplace_backward)
+    # FlashAttention 2.7.3 indexes labels_ptr + row without a stride argument.
+    # A view such as support_ids[:, 0] otherwise scores different token IDs;
+    # bounded row selection in backward would then disagree with forward.
+    output = cross_entropy_loss(logits, labels.contiguous(), inplace_backward=inplace_backward)
     assert isinstance(output,
                       tuple), "please make sure flash-attn>=2.4.3 where cross_entropy_loss returns Tuple[losses, z_losses]."
     return -output[0]

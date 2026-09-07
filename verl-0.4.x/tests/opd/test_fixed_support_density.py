@@ -206,6 +206,35 @@ def test_mixed_continuous_and_categorical_wrapper_preserves_legacy():
     torch.testing.assert_close(legacy, torch.stack([_old_density(logits[0], ids[0], perturbed[0]), expected_categorical]))
 
 
+def test_flash_attention_boundary_normalizes_strided_labels_before_raw_kernel():
+    path = Path(__file__).resolve().parents[2] / "verl/utils/torch_functional.py"
+    tree = ast.parse(path.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "logprobs_from_logits_flash_attn")
+    observed = []
+
+    def raw_kernel(logits, labels, **kwargs):
+        observed.append(labels)
+        assert labels.is_contiguous(), "pinned kernel does not accept a label stride"
+        return (-logits.log_softmax(-1).gather(-1, labels[:, None]).squeeze(-1), None)
+
+    namespace = {"cross_entropy_loss": raw_kernel}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), str(path), "exec"), namespace)
+    labels = torch.arange(21).reshape(7, 3)[:, 1]
+    assert labels.stride() == (3,)
+    # Emulate the raw pointer indexing to establish that ignoring this stride
+    # really selects other token IDs, instead of just checking a layout flag.
+    assert not torch.equal(labels, labels.as_strided(labels.shape, (1,)))
+    logits = torch.randn(7, 23, requires_grad=True)
+    oracle = logits.detach().clone().requires_grad_()
+    actual = namespace["logprobs_from_logits_flash_attn"](logits, labels, inplace_backward=False)
+    expected = oracle.log_softmax(-1).gather(-1, labels[:, None]).squeeze(-1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(logits.grad, oracle.grad, rtol=0, atol=0)
+    torch.testing.assert_close(observed[0], labels, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("case", ["dtype", "shape", "empty"])
 def test_invalid_behavior_mask_fails_closed(case):
     logits, ids, action = torch.zeros(2, 9), torch.zeros(2, 5, dtype=torch.long), torch.zeros(2, 5)
