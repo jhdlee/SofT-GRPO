@@ -28,9 +28,11 @@ class DifferentiableModel(Model):
 ])
 def test_update_keeps_causal_support_values_without_vocab_copy_and_only_required_graph(mode, compute_opd, monkeypatch):
     observed = []
+    inplace_flags = []
 
     def score(*, logits, **kwargs):
         observed.append(logits.requires_grad)
+        inplace_flags.append(kwargs["inplace_backward"])
         # A differentiable scoring stand-in makes retaining the unused
         # standalone policy graph observable without a GPU CE kernel.
         return logits.square().mean(-1)
@@ -83,6 +85,7 @@ def test_update_keeps_causal_support_values_without_vocab_copy_and_only_required
     )
     needs_density_grad = mode is not ObjectiveMode.STANDALONE
     assert observed == [needs_density_grad]
+    assert inplace_flags == [not compute_opd]
     assert log_probs.requires_grad == needs_density_grad
     assert diagnostic["support_logits"].shape == (2, 5)
     assert not diagnostic["support_logits"].requires_grad

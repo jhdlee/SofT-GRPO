@@ -159,12 +159,15 @@ def logprobs_from_logits_topk_gumbel(
             float_top_p_mask = (topk_log_probs.clone() > -3).float()
             output_gumbel = (output_gumbel * float_top_p_mask).sum(-1) / float_top_p_mask.sum(-1)
         else:
-            from verl.opd.density import fixed_support_gumbel_log_probs
+            from verl.opd.density import mixed_support_log_probs
 
-            output_gumbel = fixed_support_gumbel_log_probs(
+            # One backward output for the disjoint soft/hard branches. The
+            # shared logits remain intact for full-vocabulary OPD backward.
+            return mixed_support_log_probs(
                 logits, rollout_topk_ids, rollout_topk_gumbels,
-                rollout_topk_retained_mask.reshape(-1, k_num),
-            )
+                rollout_topk_retained_mask.reshape(-1, k_num), labels,
+                categorical_log_probs=logprobs_from_logits_flash_attn,
+            ).view(*batch_dim)
         ids_finish = (rollout_topk_ids[:, 1:] == 0).all(-1)
         output_answer = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
         output = torch.where(ids_finish, output_answer, output_gumbel)

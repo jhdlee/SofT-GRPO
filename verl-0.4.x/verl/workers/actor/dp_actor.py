@@ -510,7 +510,9 @@ class DataParallelPPOActor(BasePPOActor):
                         }
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
-                    if calculate_entropy:
+                    # Indexed OPD keeps the original actor logits. Legacy CE
+                    # branches must not overwrite this shared saved tensor.
+                    if calculate_entropy or compute_opd:
                         inplace_backward = False
                     # Standalone OPD differentiates its KL only.  Preserve
                     # density values for the return contract without retaining

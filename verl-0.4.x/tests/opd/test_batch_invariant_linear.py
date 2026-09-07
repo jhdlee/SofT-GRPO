@@ -3,6 +3,7 @@
 import ast
 import copy
 import importlib
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -351,3 +352,123 @@ def test_cuda_empty_dimensions(cuda_ieee, shape, features):
     assert torch.equal(output, F.linear(value, weight, bias))
     output.sum().backward()
     assert all(t.grad is not None and t.grad.shape == t.shape for t in (value, weight, bias))
+
+
+@pytest.fixture
+def small_backward_tiles(monkeypatch):
+    module = importlib.import_module("verl.opd.batch_invariant_linear")
+    monkeypatch.setattr(module, "_BACKWARD_ROW_CHUNK", 5)
+    monkeypatch.setattr(module, "_BACKWARD_OUTPUT_CHUNK", 7)
+    monkeypatch.setattr(module, "_BACKWARD_INPUT_CHUNK", 3)
+    return module
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("needs", [(True, True, True), (True, False, False), (False, True, False), (False, False, True)])
+def test_tiled_backward_matches_dense_reference_with_nonflattenable_strides(small_backward_tiles, dtype, needs):
+    torch.manual_seed(481)
+    value = torch.randn(3, 4, 13).to(dtype).transpose(0, 1).requires_grad_(needs[0])
+    weight = torch.randn(13, 17).to(dtype).T.requires_grad_(needs[1])
+    bias = torch.randn(34).to(dtype)[::2].requires_grad_(needs[2])
+    upstream = torch.randn(3, 4, 17).to(dtype).transpose(0, 1)
+    assert small_backward_tiles._flat_view(value) is None
+    assert small_backward_tiles._flat_view(upstream) is None
+    output = batch_invariant_linear(value, weight, bias)
+    output.backward(upstream)
+    accumulation = torch.float64 if dtype == torch.float64 else torch.float32
+    gradient = upstream.reshape(-1, 17).to(accumulation)
+    x = value.detach().reshape(-1, 13).to(accumulation)
+    references = ((gradient @ weight.detach().to(accumulation)).reshape_as(value).to(dtype),
+                  (gradient.T @ x).to(dtype), gradient.sum(0).to(dtype))
+    # Existing single-GEMM exact tests remain unchanged. Split reductions may
+    # move the final low-precision result by one rounding unit; FP32/64 have
+    # stricter absolute bounds against the same dense accumulation oracle.
+    tolerance = {torch.float16: (torch.finfo(dtype).eps, torch.finfo(dtype).eps / 8),
+                 torch.bfloat16: (torch.finfo(dtype).eps, torch.finfo(dtype).eps / 8),
+                 torch.float32: (1e-5, 1e-5), torch.float64: (1e-12, 1e-12)}[dtype]
+    for tensor, reference, needed in zip((value, weight, bias), references, needs):
+        if needed:
+            torch.testing.assert_close(tensor.grad, reference, rtol=tolerance[0], atol=tolerance[1])
+        else:
+            assert tensor.grad is None
+
+
+def test_tiled_backward_never_promotes_full_gradient_or_weight(small_backward_tiles):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    shapes = []
+    class ObserveFloat32Allocations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            output = func(*args, **(kwargs or {}))
+            values = output if isinstance(output, (tuple, list)) else (output,)
+            for value in values:
+                if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
+                    shapes.append(tuple(value.shape))
+            return output
+
+    # Nonflattenable strides also exercise bounded indexing rather than a
+    # whole upstream-gradient reshape copy. Returned gradients stay BF16.
+    value = torch.randn(3, 4, 13, dtype=torch.bfloat16).transpose(0, 1)
+    weight = torch.randn(17, 13, dtype=torch.bfloat16)
+    upstream = torch.randn(3, 4, 17, dtype=torch.bfloat16).transpose(0, 1)
+    context = SimpleNamespace(saved_tensors=(value, weight), needs_input_grad=(True, True, True), has_bias=True)
+    with ObserveFloat32Allocations():
+        gradients = small_backward_tiles._BatchInvariantLinear.backward(context, upstream)
+    assert shapes and max(math.prod(shape) for shape in shapes) <= 5 * 7
+    assert (12, 17) not in shapes and (17, 13) not in shapes
+    assert all(gradient.dtype == torch.bfloat16 for gradient in gradients)
+
+
+@pytest.mark.parametrize("shape,features", [((0, 13), 17), ((3, 0), 17), ((3, 13), 0), ((0,), 17)])
+def test_tiled_backward_empty_dimensions_do_not_leave_uninitialized_gradients(small_backward_tiles, shape, features):
+    value = torch.randn(shape, dtype=torch.double, requires_grad=True)
+    weight = torch.randn(features, shape[-1], dtype=torch.double, requires_grad=True)
+    bias = torch.randn(features, dtype=torch.double, requires_grad=True)
+    output = batch_invariant_linear(value, weight, bias)
+    gradients = torch.autograd.grad(output.sum(), (value, weight, bias))
+    reference = torch.autograd.grad(F.linear(value, weight, bias).sum(), (value, weight, bias))
+    for actual, expected in zip(gradients, reference):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_tiled_backward_matches_dense_reference(cuda_ieee, small_backward_tiles, dtype):
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("BF16 is unavailable on this GPU")
+    torch.manual_seed(822)
+    value = torch.randn(3, 4, 13, device="cuda", dtype=dtype).transpose(0, 1).requires_grad_()
+    weight = torch.randn(13, 17, device="cuda", dtype=dtype).T.requires_grad_()
+    bias = torch.randn(34, device="cuda", dtype=dtype)[::2].requires_grad_()
+    upstream = torch.randn(3, 4, 17, device="cuda", dtype=dtype).transpose(0, 1)
+    batch_invariant_linear(value, weight, bias).backward(upstream)
+    g, x = upstream.reshape(-1, 17).float(), value.detach().reshape(-1, 13).float()
+    references = ((g @ weight.detach().float()).reshape_as(value).to(dtype), (g.T @ x).to(dtype), g.sum(0).to(dtype))
+    for tensor, expected in zip((value, weight, bias), references):
+        torch.testing.assert_close(tensor.grad, expected, rtol=torch.finfo(dtype).eps, atol=torch.finfo(dtype).eps / 8)
+
+
+def test_cuda_large_vocabulary_backward_peak_excludes_dense_fp32_upstream(cuda_ieee):
+    """Execute the real backward at Qwen vocabulary width without a huge forward."""
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("BF16 is unavailable on this GPU")
+    module = importlib.import_module("verl.opd.batch_invariant_linear")
+    rows, outputs, inputs = 2049, 151936, 129
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < 3 * 1024**3:
+        pytest.skip("large-vocabulary backward regression needs 3 GiB headroom")
+    value = torch.randn(rows, inputs, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(outputs, inputs, device="cuda", dtype=torch.bfloat16)
+    upstream = torch.randn(rows, outputs, device="cuda", dtype=torch.bfloat16)
+    context = SimpleNamespace(saved_tensors=(value, weight), needs_input_grad=(True, True, True), has_bias=True)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    gradients = module._BatchInvariantLinear.backward(context, upstream)
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - baseline
+    # FP32 promotion of the upstream alone would require 1.16 GiB. This bound
+    # includes returned BF16 gradients, all tiles and CUDA GEMM workspace.
+    assert extra < 384 * 1024**2, f"backward used {extra / 1024**2:.1f} MiB beyond its inputs"
+    for gradient in gradients:
+        for chunk in gradient.reshape(-1).split(65536):
+            assert torch.isfinite(chunk).all()

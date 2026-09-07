@@ -282,24 +282,25 @@ class PrivilegedReplay:
         if bool((replay_mask & ~(latent_mask | answer_mask)).any().item()):
             raise ValueError("every OPD objective slot must be classified as latent or answer")
 
-        selected_student = student_logits.index_select(0, student_query_indices)
-        if not selected_student.requires_grad or selected_student.grad_fn is None:
+        if not student_logits.requires_grad:
             raise RuntimeError(
                 "OPD student logits are disconnected from the actor autograd graph"
             )
         if teacher_logits.requires_grad or teacher_logits.grad_fn is not None:
             raise RuntimeError("OPD teacher logits must be fully detached")
-        if selected_student.shape != teacher_logits.shape:
+        selected_shape = (student_query_indices.numel(), *student_logits.shape[1:])
+        if selected_shape != teacher_logits.shape:
             raise RuntimeError(
                 "student/teacher latent-query alignment differs: "
-                f"student={tuple(selected_student.shape)}, teacher={tuple(teacher_logits.shape)}"
+                f"student={selected_shape}, teacher={tuple(teacher_logits.shape)}"
             )
         token_kl, student_normalizer, teacher_normalizer, entropy = full_vocab_kl_with_statistics(
-            selected_student,
+            student_logits,
             teacher_logits,
             direction=self.config.kl_direction,
             temperature=self.config.temperature,
             vocab_chunk_size=vocab_chunk_size,
+            student_row_indices=student_query_indices,
         )
         if not token_kl.requires_grad or token_kl.grad_fn is None:
             raise RuntimeError("OPD KL is disconnected from the student logits")
@@ -309,17 +310,18 @@ class PrivilegedReplay:
             raise ValueError("latent_support_ids must provide one support row per latent query")
         if latent_support_ids.dtype != torch.long:
             raise TypeError("latent_support_ids must use torch.long token IDs")
-        if bool(((latent_support_ids < 0) | (latent_support_ids >= selected_student.shape[-1])).any().item()):
+        if bool(((latent_support_ids < 0) | (latent_support_ids >= student_logits.shape[-1])).any().item()):
             raise ValueError("latent_support_ids contain an out-of-vocabulary token ID")
-        if latent_support_ids.device != selected_student.device:
-            latent_support_ids = latent_support_ids.to(selected_student.device)
+        if latent_support_ids.device != student_logits.device:
+            latent_support_ids = latent_support_ids.to(student_logits.device)
         # Gather only the small continuous-action supports.  Advanced row
         # selection followed by a dense log_softmax would copy latent×vocab
         # logits and retain FP32 diagnostic graphs until the update finishes.
         # These diagnostics are deliberately detached from the training loss.
         with torch.no_grad():
             latent_rows = torch.nonzero(flat_latent, as_tuple=False).flatten()
-            support_student_logits = selected_student[latent_rows.unsqueeze(-1), latent_support_ids]
+            student_latent_rows = student_query_indices.index_select(0, latent_rows)
+            support_student_logits = student_logits[student_latent_rows.unsqueeze(-1), latent_support_ids]
             support_teacher_logits = teacher_logits[latent_rows.unsqueeze(-1), latent_support_ids]
             support_student_logp = (
                 support_student_logits.float() / self.config.temperature

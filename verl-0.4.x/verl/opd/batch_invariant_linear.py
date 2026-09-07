@@ -8,9 +8,12 @@ validated model-level replay parity. CPU forward delegates to ``F.linear``;
 CPU tests therefore establish interface/gradient behavior only.
 
 CUDA supports matching BF16/FP16 tensors on one NVIDIA device and TP=1 only.
-Backward uses ordinary PyTorch matrix products with FP32 accumulation (FP64
-for CPU double inputs). CUDA backward requires TF32 to have been disabled by
-the caller. No parameters are installed, replaced, or modified by this API.
+Backward uses tiled PyTorch matrix products with FP32 accumulation (FP64
+for CPU double inputs). It never promotes the full token-by-vocabulary
+upstream gradient or full weight matrix. Split reductions can change FP32
+rounding compared with a single dense GEMM; forward arithmetic is unchanged.
+CUDA backward requires TF32 to have been disabled by the caller. No parameters
+are installed, replaced, or modified by this API.
 """
 
 import math
@@ -24,6 +27,36 @@ try:
 except ImportError:  # CPU diagnostics do not require a Triton installation.
     triton = None
     tl = None
+
+
+# Bound all three matrix axes. In the Qwen LM head K=1024, so its largest
+# upstream FP32 tile is 32 MiB and its weight/gradient accumulator is 16 MiB.
+# Returned gradients keep the input dtype; GEMM library workspace is separate.
+_BACKWARD_ROW_CHUNK = 2048
+_BACKWARD_OUTPUT_CHUNK = 4096
+_BACKWARD_INPUT_CHUNK = 4096
+
+
+def _flat_view(tensor):
+    """Flatten leading dimensions only when it is a view, never a dense copy."""
+    try:
+        return tensor.view(math.prod(tensor.shape[:-1]), tensor.shape[-1])
+    except RuntimeError:
+        return None
+
+
+def _matrix_tile(tensor, flat_view, row_start, row_stop, column_start, column_stop):
+    if flat_view is not None:
+        return flat_view[row_start:row_stop, column_start:column_stop]
+    # A permuted higher-dimensional upstream gradient may not flatten as a
+    # view. Index the requested rows and columns together so that even this
+    # fallback copies only one tile, not the whole token-by-vocabulary matrix.
+    rows = torch.arange(row_start, row_stop, device=tensor.device)
+    coordinates = []
+    for dimension in reversed(tensor.shape[:-1]):
+        coordinates.append(rows.remainder(dimension))
+        rows = rows.div(dimension, rounding_mode="floor")
+    return tensor[(*reversed(coordinates), slice(column_start, column_stop))]
 
 
 if triton is not None:
@@ -123,16 +156,70 @@ class _BatchInvariantLinear(torch.autograd.Function):
             raise RuntimeError("CUDA batch_invariant_linear backward requires matmul.allow_tf32=False")
         accumulation_dtype = torch.float64 if value.dtype == torch.float64 else torch.float32
         rows = math.prod(value.shape[:-1])
+        outputs, inputs = weight.shape
         with torch.autocast(device_type=value.device.type, enabled=False):
-            gradient = grad_output.reshape(rows, weight.shape[0]).to(accumulation_dtype)
+            gradient_view = _flat_view(grad_output)
+            value_view = _flat_view(value)
             grad_value = grad_weight = grad_bias = None
             if needs_x:
-                grad_value = (gradient @ weight.to(accumulation_dtype)).reshape(value.shape).to(value.dtype)
+                grad_value_matrix = torch.empty((rows, inputs), device=value.device, dtype=value.dtype)
+                for row_start in range(0, rows, _BACKWARD_ROW_CHUNK):
+                    row_stop = min(row_start + _BACKWARD_ROW_CHUNK, rows)
+                    for input_start in range(0, inputs, _BACKWARD_INPUT_CHUNK):
+                        input_stop = min(input_start + _BACKWARD_INPUT_CHUNK, inputs)
+                        accumulator = None
+                        for output_start in range(0, outputs, _BACKWARD_OUTPUT_CHUNK):
+                            output_stop = min(output_start + _BACKWARD_OUTPUT_CHUNK, outputs)
+                            gradient = _matrix_tile(grad_output, gradient_view, row_start, row_stop, output_start, output_stop).to(accumulation_dtype)
+                            weight_tile = weight[output_start:output_stop, input_start:input_stop].to(accumulation_dtype)
+                            if accumulator is None:
+                                accumulator = gradient @ weight_tile
+                            else:
+                                accumulator.addmm_(gradient, weight_tile)
+                            del gradient, weight_tile
+                        if accumulator is None:
+                            grad_value_matrix[row_start:row_stop, input_start:input_stop].zero_()
+                        else:
+                            grad_value_matrix[row_start:row_stop, input_start:input_stop] = accumulator.to(value.dtype)
+                            del accumulator
+                grad_value = grad_value_matrix.reshape(value.shape)
             if needs_w:
-                x = value.reshape(rows, value.shape[-1]).to(accumulation_dtype)
-                grad_weight = (gradient.transpose(0, 1) @ x).to(weight.dtype)
+                grad_weight = torch.empty(weight.shape, device=weight.device, dtype=weight.dtype)
+                for output_start in range(0, outputs, _BACKWARD_OUTPUT_CHUNK):
+                    output_stop = min(output_start + _BACKWARD_OUTPUT_CHUNK, outputs)
+                    for input_start in range(0, inputs, _BACKWARD_INPUT_CHUNK):
+                        input_stop = min(input_start + _BACKWARD_INPUT_CHUNK, inputs)
+                        accumulator = None
+                        for row_start in range(0, rows, _BACKWARD_ROW_CHUNK):
+                            row_stop = min(row_start + _BACKWARD_ROW_CHUNK, rows)
+                            gradient = _matrix_tile(grad_output, gradient_view, row_start, row_stop, output_start, output_stop).to(accumulation_dtype)
+                            value_tile = _matrix_tile(value, value_view, row_start, row_stop, input_start, input_stop).to(accumulation_dtype)
+                            if accumulator is None:
+                                accumulator = gradient.transpose(0, 1) @ value_tile
+                            else:
+                                accumulator.addmm_(gradient.transpose(0, 1), value_tile)
+                            del gradient, value_tile
+                        if accumulator is None:
+                            grad_weight[output_start:output_stop, input_start:input_stop].zero_()
+                        else:
+                            grad_weight[output_start:output_stop, input_start:input_stop] = accumulator.to(weight.dtype)
+                            del accumulator
             if needs_b and ctx.has_bias:
-                grad_bias = gradient.sum(dim=0).to(value.dtype)
+                grad_bias = torch.empty(outputs, device=value.device, dtype=value.dtype)
+                for output_start in range(0, outputs, _BACKWARD_OUTPUT_CHUNK):
+                    output_stop = min(output_start + _BACKWARD_OUTPUT_CHUNK, outputs)
+                    accumulator = None
+                    for row_start in range(0, rows, _BACKWARD_ROW_CHUNK):
+                        row_stop = min(row_start + _BACKWARD_ROW_CHUNK, rows)
+                        gradient = _matrix_tile(grad_output, gradient_view, row_start, row_stop, output_start, output_stop).to(accumulation_dtype)
+                        contribution = gradient.sum(dim=0)
+                        accumulator = contribution if accumulator is None else accumulator + contribution
+                        del gradient, contribution
+                    if accumulator is None:
+                        grad_bias[output_start:output_stop].zero_()
+                    else:
+                        grad_bias[output_start:output_stop] = accumulator.to(value.dtype)
+                        del accumulator
         return grad_value, grad_weight, grad_bias
 
 
