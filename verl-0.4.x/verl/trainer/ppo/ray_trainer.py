@@ -2317,11 +2317,34 @@ class RayPPOTrainer:
                     response_mask=batch.batch["response_mask"], comparison_mask=comparison_mask,
                     responses=batch.batch["responses"], close_tag_token_id=self.close_tag_token_id,
                     prompt_indices=batch.non_tensor_batch.get("index"),
-                    rollout_ranks=batch.batch.get("rollout_rank"),
-                    rollout_sampling_seeds=batch.batch.get("rollout_sampling_seed"),
+                    # TensorDict.get raises for an absent key unless a default
+                    # is explicit. Categorical rollouts need neither rank nor
+                    # soft-support metadata to retain useful failure evidence.
+                    rollout_ranks=batch.batch.get("rollout_rank", None),
+                    rollout_sampling_seeds=batch.batch.get("rollout_sampling_seed", None),
                     actor_replay_diagnostics=actor_replay_diagnostics,
                     **support,
                 )
+                if not self.continuous_replay:
+                    details["rollout_density_kind"] = "categorical"
+                    details["density_note"] = (
+                        "All density fields are categorical token log probabilities. "
+                        "Segment names identify positions relative to the closing "
+                        "think tag, not continuous actions."
+                    )
+                    for name in ("worst_positions", "worst_hard_positions"):
+                        for record in details[name]:
+                            record["response_token_id"] = int(batch.batch["responses"][
+                                record["batch_row"], record["response_position"]
+                            ])
+                            actor_density, rollout_density = (
+                                record["actor_log_density"], record["rollout_log_density"]
+                            )
+                            record["actor_minus_rollout_log_probability"] = (
+                                actor_density - rollout_density
+                                if actor_density is not None and rollout_density is not None
+                                else None
+                            )
             except Exception as diagnostic_error:
                 # A malformed tensor must not obscure the original gate error.
                 details = {"diagnostic_error": f"{type(diagnostic_error).__name__}: {diagnostic_error}"[:2048]}
@@ -2439,7 +2462,12 @@ class RayPPOTrainer:
                 raise ValueError("trainer.max_rollout_iterations_per_invocation must be positive or null")
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            if epoch == 0 and self._resumed and self.config.trainer.get("checkpoint_semantics") == "qwen_semantic_v1":
+                from verl.opd.rng_state import resume_dataloader_iterator
+                train_iterator = resume_dataloader_iterator(self.train_dataloader)
+            else:
+                train_iterator = iter(self.train_dataloader)
+            for batch_dict in train_iterator:
                 metrics = {}
                 timing_raw = {}
                 rollout_diagnostics = None

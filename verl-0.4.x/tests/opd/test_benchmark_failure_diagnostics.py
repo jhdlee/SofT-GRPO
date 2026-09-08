@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import importlib.metadata
 import json
 import math
 import time
@@ -15,6 +16,7 @@ import torch
 from verl.trainer.ppo.opd_driver import (
     RolloutIntegrityConfig,
     build_replay_failure_diagnostics,
+    compute_categorical_rollout_diagnostics,
     compute_rollout_diagnostics,
     replay_integrity_mask,
     validate_categorical_rollout_integrity,
@@ -208,6 +210,99 @@ def test_real_pre_update_gate_allows_replayable_unfinished_prefix_without_erasin
     assert diagnostics.metrics == metrics_before
     assert diagnostics.boundary_valid_mask == (False, True)
     assert torch.equal(inputs["comparison_mask"], comparison_before)
+
+
+def _failure_tensor_container(tensors, container):
+    if container == "tensordict":
+        # Optional dependency stubs from other lightweight tests must not
+        # masquerade as the actual pinned training container.
+        try:
+            importlib.metadata.version("tensordict")
+        except importlib.metadata.PackageNotFoundError:
+            pytest.skip("actual replay container regression requires tensordict")
+        from tensordict import TensorDict
+
+        assert TensorDict is not object
+        return TensorDict(tensors, batch_size=[2])
+
+    class RequiredDefaultBatch(dict):
+        """TensorDict's absent-key semantics without the optional dependency."""
+
+        def get(self, key, *default):
+            return super().get(key, *default) if default else self[key]
+
+    return RequiredDefaultBatch(tensors)
+
+
+@pytest.mark.parametrize("container", ["required_default", "tensordict"])
+@pytest.mark.parametrize("has_rank,has_seed", [(False, True), (False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("nonfinite", [False, True])
+def test_categorical_tensordict_failure_keeps_token_evidence_without_optional_metadata(
+    tmp_path, has_rank, has_seed, nonfinite, container,
+):
+    trainer = _load_failure_methods()()
+    inputs = replay_inputs()
+    responses, mask = inputs["responses"], inputs["response_mask"]
+    actor = inputs["rollout_log_probs"].clone()
+    actor[0, 1] = float("inf") if nonfinite else math.log(3.0)
+    actor[1, 3] = math.log(2.0)
+    actor[0, 4] = float("nan")  # Padding must never contaminate diagnostics.
+    tensors = {key: inputs[key] for key in ("responses", "response_mask", "rollout_log_probs")}
+    if has_rank:
+        tensors["rollout_rank"] = inputs["rollout_ranks"]
+    if has_seed:
+        tensors["rollout_sampling_seed"] = inputs["rollout_sampling_seeds"]
+    batch = SimpleNamespace(
+        batch=_failure_tensor_container(tensors, container),
+        non_tensor_batch={"index": inputs["prompt_indices"], "gold_cot": ["SECRET GOLD"]},
+        meta_info={},
+    )
+    trainer.measurement_path = tmp_path / "measurement.json"
+    trainer.measurement = {"status": "running", "iterations": []}
+    trainer.rollout_integrity_config = RolloutIntegrityConfig(enabled=True, completion_gate_enabled=False)
+    trainer.continuous_replay, trainer.close_tag_token_id = False, 99
+    diagnostics = compute_categorical_rollout_diagnostics(
+        responses=responses, response_mask=mask, close_tag_token_id=99,
+    )
+    comparison_mask = replay_integrity_mask(response_mask=mask, continuous_replay=False)
+    mask_before = comparison_mask.clone()
+    updates = []
+    with pytest.raises(RuntimeError, match="categorical rollout/replay ratio error"):
+        trainer._validate_benchmark_before_update(
+            batch=batch, diagnostics=diagnostics,
+            replay_error=float("inf") if nonfinite else 2.0,
+            actor_log_probs=actor, comparison_mask=comparison_mask, iteration=0,
+            timing={"gen": 20, "old_log_prob": 5}, metrics=diagnostics.metrics,
+            started_at=time.perf_counter(),
+        )
+        updates.append("optimizer update")
+    assert not updates
+    measured = json.loads(trainer.measurement_path.read_text())
+    assert measured["iterations"] == []
+    failure = measured["failure"]
+    assert failure["status"] == "failed_before_update"
+    assert failure["optimizer_updates_completed"] is False
+    details = failure["diagnostics"]
+    assert "diagnostic_error" not in details
+    assert details["rollout_density_kind"] == "categorical"
+    assert details["compared_positions"] == int(mask.sum())
+    assert details["nonfinite_positions"] == int(nonfinite)
+    assert details["segments"]["boundary"]["compared_positions"] == 2
+    worst = details["worst_positions"][0]
+    assert (worst["batch_row"], worst["prompt_index"], worst["response_position"], worst["response_token_id"]) == (0, 101, 1, 99)
+    assert worst["request_seed"] == (123 if has_seed else None)
+    assert worst["rollout_rank"] == (1 if has_rank else None)
+    assert worst["actor_minus_rollout_log_probability"] == (None if nonfinite else pytest.approx(math.log(3.0)))
+    hard = details["worst_hard_positions"][0]
+    assert (hard["batch_row"], hard["response_position"], hard["response_token_id"]) == (1, 3, 8)
+    assert hard["actor_minus_rollout_log_probability"] == pytest.approx(math.log(2.0))
+    for records in (details["worst_positions"], details["worst_hard_positions"]):
+        assert len(records) <= 8
+        assert all(mask[r["batch_row"], r["response_position"]] for r in records)
+        assert all("support_ids" not in r and "perturbed_logits" not in r for r in records)
+    assert "SECRET" not in json.dumps(details, allow_nan=False)
+    assert torch.equal(comparison_mask, mask_before)
+    assert trainer.rollout_integrity_config.max_replay_ratio_abs_error == 1e-4
 
 
 def test_diagnostic_gate_precedes_worker_updates_and_legacy_without_hook_is_unchanged():

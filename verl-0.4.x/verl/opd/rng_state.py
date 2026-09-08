@@ -65,6 +65,21 @@ def preserve_training_rng():
         restore_rng_state(state)
 
 
+def resume_dataloader_iterator(dataloader):
+    """Recreate a loaded iterator without consuming the restored driver RNG.
+
+    Torch 2.6 draws a new int64 worker base seed in DataLoader iterator
+    construction, even with zero workers. StatefulDataLoader then restores its
+    saved iterator/worker state. An uninterrupted run does not recreate that
+    iterator at the checkpoint boundary, so the extra initialization draw is
+    outside the training stream. Do not protect ``next`` here: fetching the
+    next batch may legitimately consume dataset/transform/sampler randomness.
+    Call only for the first iterator after loading a checkpoint.
+    """
+    with preserve_training_rng():
+        return iter(dataloader)
+
+
 def save_worker_rng(local_actor_path, rank, world_size, rollout_manager=None):
     return collective_checkpoint_stage("worker RNG publication", lambda: _save_worker_rng(
         local_actor_path, rank, world_size, rollout_manager))
