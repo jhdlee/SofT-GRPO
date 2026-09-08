@@ -28,6 +28,7 @@ QWEN_LORA_TARGET_MODULES = (
 QWEN_LORA_MERGE_RULE = "fp32_fixed_tile_ba_scale_add_then_bf16_v1"
 _A = "qwen_lora_A"
 _B = "qwen_lora_B"
+_FROZEN_NAMES = "_opd_qwen_lora_frozen_parameter_names"
 
 
 def validate_qwen_lora_config(config):
@@ -107,6 +108,13 @@ def install_qwen_lora(model, *, rank=32, alpha=64, target_modules=QWEN_LORA_TARG
                          torch.zeros(module.out_features, rank, dtype=torch.float32, device=module.weight.device)))
     for parameter in parameters:
         parameter.requires_grad_(False)
+    # Store names, never extra Parameter references. FSDP owns and preserves
+    # the original objects; retaining our own references can become stale on
+    # reconstruction or accidentally enter serialized module state.
+    for module in model.modules():
+        names = tuple(name for name, parameter in module._parameters.items() if parameter is not None)
+        if names:
+            setattr(module, _FROZEN_NAMES, names)
     for module, a, b in prepared:
         module.register_parameter(_A, nn.Parameter(a))
         module.register_parameter(_B, nn.Parameter(b))
@@ -114,6 +122,72 @@ def install_qwen_lora(model, *, rank=32, alpha=64, target_modules=QWEN_LORA_TARG
         module._opd_lora_disabled = False
     model._opd_qwen_lora_config = config
     return model
+
+
+def native_base_parameter(module, name="weight"):
+    """Return a checked, gradient-isolated native-LoRA base parameter.
+
+    Torch 2.6 FSDP1 gives every forward view of a mixed frozen/trainable flat
+    parameter ``requires_grad=True``. Its preserved original Parameter, not
+    that transient Tensor flag, determines whether the base is frozen. Check
+    the actual owning FSDP metadata and saved forward-view identity before
+    detaching. This deliberately rejects unrelated trainable views and does
+    not infer ownership from shape, storage sharing, or ``is_leaf`` alone.
+
+    Ordinary/full-finetuning modules are returned unchanged. Only immutable
+    names are stored on modules; original references come from FSDP itself.
+    """
+    value = getattr(module, name)
+    if name not in getattr(module, _FROZEN_NAMES, ()) or value is None:
+        return value
+    if isinstance(value, nn.Parameter):
+        if value.requires_grad:
+            raise ValueError("native LoRA original base must remain frozen")
+        return value
+    from torch.distributed.fsdp import FlatParameter
+
+    flat = getattr(value, "_base", None)
+    if not isinstance(flat, FlatParameter) or getattr(flat, "_params", None) is None:
+        raise ValueError("native LoRA base view has no preserved FSDP original parameter")
+    owner, owner_name = module, name
+    alias_original = None
+    for index, info in enumerate(flat._shared_param_infos):
+        if info.module is module and info.param_name == name:
+            owner, owner_name = info.prim_module, info.prim_param_name
+            alias_original = flat._shared_params[index]
+            break
+    for index, info in enumerate(flat._param_infos):
+        if info.module is owner and info.param_name == owner_name:
+            original = flat._params[index]
+            if not isinstance(original, nn.Parameter) or original.requires_grad or (
+                    alias_original is not None and alias_original.requires_grad):
+                raise ValueError("native LoRA original base must remain frozen")
+            if flat._tensors[index] is not value:
+                raise ValueError("native LoRA base view differs from FSDP's current forward view")
+            return value.detach()
+    raise ValueError("native LoRA base view belongs to a different FSDP parameter")
+
+
+def validate_qwen_lora_frozen(model):
+    """Check the original freeze inventory without collecting/shaping shards."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    qwen_lora_config(model)
+    checked = 0
+    for module in model.modules():
+        if isinstance(module, FSDP):
+            continue
+        names = getattr(module, _FROZEN_NAMES, ())
+        actual = tuple(name for name, parameter in module._parameters.items()
+                       if parameter is not None and name not in (_A, _B, "_flat_param"))
+        if set(names) != set(actual):
+            raise ValueError("native LoRA original frozen parameter inventory differs")
+        for name in names:
+            native_base_parameter(module, name)
+            checked += 1
+    if not checked:
+        raise ValueError("native LoRA original frozen parameter inventory is missing")
+    return checked
 
 
 @contextmanager
@@ -204,11 +278,12 @@ def merged_weight_fp32(weight, a, b, scale):
 
 
 def effective_weight_fp32(module):
+    weight = native_base_parameter(module)
     if hasattr(module, _A) and not getattr(module, "_opd_lora_disabled", False):
-        return merged_weight_fp32(module.weight, getattr(module, _A), getattr(module, _B), module._opd_lora_scale)
-    if module.weight.dtype != torch.float32:
+        return merged_weight_fp32(weight, getattr(module, _A), getattr(module, _B), module._opd_lora_scale)
+    if weight.dtype != torch.float32:
         raise ValueError("v2 replay requires FP32 base/adapter masters")
-    return module.weight
+    return weight
 
 
 def effective_projection_weight(module, *, dtype=torch.bfloat16):

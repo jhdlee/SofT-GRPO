@@ -146,10 +146,13 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             self._guard_stage("entry readiness", self._require_idle)
 
         def prepare_local():
+            from verl.opd.qwen_lora import has_qwen_lora, validate_qwen_lora_frozen
             torch.cuda.empty_cache()
             log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
             if self.offload_param:
                 load_fsdp_model_to_gpu(self.module)
+            if has_qwen_lora(self.module):
+                validate_qwen_lora_frozen(self.module)
 
         # Finish local readiness on every DP rank before FSDP state_dict can
         # enter its own collectives. Fatal process/NCCL loss still requires the

@@ -1,10 +1,15 @@
 import json
 import inspect
+import ast
+import importlib.metadata
+import importlib.util
 import threading
 from contextlib import nullcontext
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
+import sys
 import warnings
 import time
 
@@ -84,7 +89,7 @@ def test_full_tuning_dense_export_casts_floats_and_preserves_integer_buffers():
         export.dense_rollout_weights(actor().state_dict())
 
 
-def native_entry_managers(dist, events, *, failure=None, lora=False):
+def native_entry_managers(dist, events, *, failure=None, lora=False, vllm_bindings=None):
     """Run actual entry/export/load methods with two real matched phase streams."""
     source = Path(__file__).resolve().parents[2] / 'verl/workers/sharding_manager/fsdp_vllm.py'
     objects = []
@@ -135,12 +140,13 @@ def native_entry_managers(dist, events, *, failure=None, lora=False):
                 event('load weights'); return list(weights)
             cls = methods(source, 'FSDPVLLMShardingManager', {'__enter__', '_enter_native', '_guard_stage', 'update_params'}, {
                 'torch': SimpleNamespace(distributed=dist), 'time': time, 'inspect': inspect,
-                'get_torch_device': lambda: device, 'vllm_version': '0.8.5', 'OrderedDict': dict,
+                'get_torch_device': lambda: device, 'vllm_version': None, 'vllm_package_version': '0.8.5', 'OrderedDict': dict,
                 'load_fsdp_model_to_gpu': lambda model: event('actor load'),
                 'offload_fsdp_model_to_cpu': lambda model: event('actor offload'),
                 'DTensor': Shard, 'patch_vllm_moe_model_weight_loader': lambda model: None,
                 'logger': SimpleNamespace(info=lambda *args: None),
                 'log_gpu_memory_usage': lambda *args, **kwargs: None,
+                **(vllm_bindings or {}),
             })
             obj = cls(); obj.module = model; obj.inference_engine = engine
             obj.model_runner = SimpleNamespace(model=SimpleNamespace(load_weights=load_weights))
@@ -150,6 +156,51 @@ def native_entry_managers(dist, events, *, failure=None, lora=False):
             return obj
         objects.append(build(rank))
     return objects
+
+
+def modern_vllm_bindings(monkeypatch, installed_version):
+    """Execute the actual version selector/imports, without loading CUDA vLLM."""
+    base = Path(__file__).resolve().parents[2] / 'verl'
+    vllm = ModuleType('vllm'); vllm.LLM = object()
+    distributed = ModuleType('vllm.distributed'); distributed.parallel_state = object()
+    monkeypatch.setitem(sys.modules, 'vllm', vllm)
+    monkeypatch.setitem(sys.modules, 'vllm.distributed', distributed)
+    original_version = importlib.metadata.version
+    monkeypatch.setattr(importlib.metadata, 'version',
+                        lambda package: installed_version if package == 'vllm' else original_version(package))
+    spec = importlib.util.spec_from_file_location('_test_modern_vllm', base / 'third_party/vllm/__init__.py')
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    assert shim.package_version == installed_version and shim.vllm_version is None
+    monkeypatch.setitem(sys.modules, 'verl.third_party.vllm', shim)
+    manager_path = base / 'workers/sharding_manager/fsdp_vllm.py'
+    imports = [node for node in ast.parse(manager_path.read_text()).body
+               if isinstance(node, ast.ImportFrom) and node.module == 'verl.third_party.vllm']
+    bindings = {}
+    exec(compile(ast.Module(body=imports, type_ignores=[]), str(manager_path), 'exec'), bindings)
+    return bindings
+
+
+def test_modern_installed_vllm_accepts_native_entry_with_none_legacy_selector(monkeypatch):
+    bindings = modern_vllm_bindings(monkeypatch, '0.8.5')
+    dist = ThreadRanks(); monkeypatch.setattr(export, 'dist', dist)
+    events = []; objects = native_entry_managers(dist, events, lora=True, vllm_bindings=bindings)
+    errors = run_ranks(dist.operations(lambda rank: objects[rank].__enter__()))
+    assert errors == [None, None], errors
+    assert sum(name == 'load weights' for _, name in events) == 2
+    assert not any(name == 'shutdown' for _, name in events)
+
+
+@pytest.mark.parametrize('installed_version,tp_size', [('0.8.4', 1), ('0.8.5.post1', 1), ('0.9.0', 1), ('0.8.5', 2)])
+def test_native_entry_rejects_wrong_installed_version_or_tp_before_transfer(monkeypatch, installed_version, tp_size):
+    bindings = modern_vllm_bindings(monkeypatch, installed_version)
+    dist = ThreadRanks(); monkeypatch.setattr(export, 'dist', dist)
+    events = []; objects = native_entry_managers(dist, events, vllm_bindings=bindings)
+    objects[1].tp_size = tp_size
+    errors = run_ranks(dist.operations(lambda rank: objects[rank].__enter__()))
+    assert all(isinstance(error, RuntimeError) and 'requires TP1 and vLLM 0.8.5' in str(error) for error in errors), errors
+    assert not any(name in ('state dict', 'gather entered', 'wake weights', 'load weights') for _, name in events)
+    assert sum(name == 'shutdown' for _, name in events) == 2
 
 
 @pytest.mark.parametrize('lora', [False, True])

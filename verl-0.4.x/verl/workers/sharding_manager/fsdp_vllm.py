@@ -34,6 +34,7 @@ from dataclasses import asdict
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM, vllm_version
+from verl.third_party.vllm import package_version as vllm_package_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from verl.utils.debug import GPUMemoryLogger, log_gpu_memory_usage
 from verl.utils.device import get_torch_device
@@ -230,11 +231,19 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         from verl.opd.qwen_weight_export import dense_rollout_weights
 
         def prepare_local():
-            if self.tp_size != 1 or vllm_version != "0.8.5":
-                raise ValueError("guarded native vLLM entry requires TP1 and vLLM 0.8.5")
+            from verl.opd.qwen_lora import validate_qwen_lora_frozen
+            # vllm_version selects legacy vendored adapters and remains None
+            # for modern vLLM. Authenticate the installed package separately.
+            if self.tp_size != 1 or vllm_package_version != "0.8.5":
+                raise ValueError(
+                    "guarded native vLLM entry requires TP1 and vLLM 0.8.5 "
+                    f"(observed TP{self.tp_size}, package {vllm_package_version!r})"
+                )
             get_torch_device().empty_cache()
             if self.offload_param:
                 load_fsdp_model_to_gpu(self.module)
+            if has_qwen_lora(self.module):
+                validate_qwen_lora_frozen(self.module)
             return "tags" in inspect.signature(self.inference_engine.wake_up).parameters
 
         tagged_wakeup = self._guard_stage("entry local preparation", prepare_local)

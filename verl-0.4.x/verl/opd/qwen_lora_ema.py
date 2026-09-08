@@ -15,7 +15,7 @@ import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from .ema import EMAUpdateReport
-from .qwen_lora import effective_weight_fp32, has_qwen_lora
+from .qwen_lora import effective_weight_fp32, has_qwen_lora, native_base_parameter
 
 
 def _canonical(name):
@@ -76,7 +76,8 @@ def _dense_pairs(teacher_unit, student_unit, *, buffers=False):
             raise ValueError(f"dense teacher and actor shape/device/dtype differ: {name}")
         if not buffers and (teacher.dtype != torch.float32 or teacher.requires_grad or teacher.grad is not None):
             raise ValueError("dense EMA teacher parameters must be isolated FP32 masters")
-        value = effective_weight_fp32(module) if not buffers and leaf == "weight" and hasattr(module, "qwen_lora_A") else student
+        value = (student if buffers else effective_weight_fp32(module)
+                 if leaf == "weight" and hasattr(module, "qwen_lora_A") else native_base_parameter(module, leaf))
         yield teacher, value.detach()
 
 

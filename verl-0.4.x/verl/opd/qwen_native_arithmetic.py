@@ -192,11 +192,12 @@ def _replay_cache_device(cache_device):
 
 def _packed_linear(value, modules, linear=F.linear, *, fp32_masters=False):
     if fp32_masters:
-        from verl.opd.qwen_lora import effective_projection_weight
+        from verl.opd.qwen_lora import effective_projection_weight, native_base_parameter
         weight = torch.cat([effective_projection_weight(module, dtype=value.dtype) for module in modules], 0)
+        biases = [None if module.bias is None else native_base_parameter(module, "bias") for module in modules]
     else:
         weight = torch.cat([module.weight for module in modules], 0)
-    biases = [module.bias for module in modules]
+        biases = [module.bias for module in modules]
     if any(bias is None for bias in biases) and not all(bias is None for bias in biases):
         raise ValueError("mixed packed-projection bias settings are unsupported")
     bias = None if biases[0] is None else torch.cat(biases, 0)
@@ -289,13 +290,16 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
             emit(name, tensor.detach().reshape(-1, tensor.shape[-1]))
 
     def norm_weight(module, dtype):
-        return module.weight.to(dtype) if fp32_masters else module.weight
+        if fp32_masters:
+            from verl.opd.qwen_lora import native_base_parameter
+            return native_base_parameter(module).to(dtype)
+        return module.weight
 
     def projection(value, module):
         if fp32_masters:
-            from verl.opd.qwen_lora import effective_projection_weight
+            from verl.opd.qwen_lora import effective_projection_weight, native_base_parameter
             weight = effective_projection_weight(module, dtype=value.dtype)
-            bias = None if module.bias is None else module.bias.to(value.dtype)
+            bias = None if module.bias is None else native_base_parameter(module, "bias").to(value.dtype)
             return linear(value, weight, bias)
         return linear(value, module.weight, module.bias)
 
@@ -405,6 +409,16 @@ def _install_native_arithmetic(model, *, emit=None, linear=F.linear, attention=N
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 
     core.forward = types.MethodType(model_forward, core)
+    if fp32_masters and getattr(model, "_opd_qwen_lora_config", None) is not None:
+        # External continuous/teacher replay also calls get_input_embeddings()
+        # directly. Keep every lookup on the checked frozen base, including
+        # FSDP's temporary views, without changing FP32 lookup/BF16 cast order.
+        def embedding_forward(embedding, input_ids):
+            from verl.opd.qwen_lora import native_base_parameter
+            return F.embedding(input_ids, native_base_parameter(embedding), embedding.padding_idx,
+                               embedding.max_norm, embedding.norm_type, embedding.scale_grad_by_freq,
+                               embedding.sparse)
+        core.embed_tokens.forward = types.MethodType(embedding_forward, core.embed_tokens)
     if linear is not F.linear or fp32_masters:
         def head_forward(head, hidden_states):
             return projection(hidden_states, head)
