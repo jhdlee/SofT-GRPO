@@ -332,6 +332,9 @@ trainer:
   # The timeout for ray worker group to wait for the register center to be ready
   ray_wait_register_center_timeout: 300
   device: cuda
+  # Empty preserves the historical allocator/host ceilings. Revised Qwen
+  # profiles explicitly select a device-capacity-based physical memory policy.
+  resource_policy: {}
   # Fail-closed checks used by the two-GPU smoke and each production job's
   # first rollout. Kept disabled in the upstream-compatible default config and
   # enabled explicitly by the seed-11 launchers.

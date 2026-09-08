@@ -228,6 +228,12 @@ def production_overrides(
             "trainer.training_profile": LORA_PROFILE_ID,
             "trainer.project_name": PRODUCTION_PROJECT + "-lora-fa3" + ("" if phase == "production" else "-prologue"),
             "trainer.checkpoint_semantics": "qwen_semantic_v1",
+            # vLLM sleep unmaps HBM while retaining logical PyTorch allocations.
+            # The revised study checks sampled physical update pressure against
+            # device capacity; historical profiles retain their allocator gate.
+            "trainer.resource_policy.mode": "physical_device_v1",
+            "trainer.resource_policy.max_device_used_fraction": 0.98,
+            "trainer.resource_policy.sample_interval_seconds": 0.1,
             "actor_rollout_ref.checkpoint_semantics": "qwen_semantic_v1",
             "actor_rollout_ref.training_seed": SEED,
             "actor_rollout_ref.model.qwen_replay_backend": "native_fa3_v2",

@@ -33,6 +33,10 @@ def test_revised_profile_composes_native_training_and_independent_reference_kl(t
         config = hydra.compose(config_name="ppo_trainer", overrides=overrides)
     assert config.trainer.training_profile == production.LORA_PROFILE_ID
     assert config.trainer.checkpoint_semantics == config.actor_rollout_ref.checkpoint_semantics == "qwen_semantic_v1"
+    assert dict(config.trainer.resource_policy) == {
+        "mode": "physical_device_v1", "max_device_used_fraction": 0.98,
+        "sample_interval_seconds": 0.1,
+    }
     assert config.actor_rollout_ref.model.lora_rank == (32 if finetuning == "lora" else 0)
     assert config.actor_rollout_ref.model.lora_alpha == 64
     assert config.actor_rollout_ref.actor.optim.lr == 1e-6
@@ -59,6 +63,7 @@ def test_revised_prologue_inherits_lora_and_kl_options(tmp_path, arm):
         assert results[phase]["actor_rollout_ref.model.lora_alpha"] == 32
         assert not results[phase]["actor_rollout_ref.actor.use_kl_loss"]
         assert results[phase]["trainer.total_training_steps"] is None
+        assert results[phase]["trainer.resource_policy.mode"] == "physical_device_v1"
     assert not results["zero_dose"]["algorithm.opd.enabled"]
     assert results["full_dose"]["algorithm.opd.schedule"] == "constant"
     assert results["full_dose"]["algorithm.opd.beta_base"] == production.resolve_arm(arm).beta_base
@@ -69,6 +74,15 @@ def test_revised_prologue_inherits_lora_and_kl_options(tmp_path, arm):
 def test_revised_options_reject_unsupported_parameterization(options):
     with pytest.raises(ValueError):
         production.TrainingOptions(**options)
+
+
+def test_physical_resource_policy_does_not_change_historical_profiles(tmp_path):
+    for arm in production.ARM_IDS:
+        historical = values(production.production_overrides(arm, tmp_path / "assets", tmp_path / arm))
+        assert not any(key.startswith("trainer.resource_policy") for key in historical)
+    for objective in ("standalone", "hybrid"):
+        benchmark = qwen_training.profile_overrides(objective, 2, tmp_path / "assets", tmp_path / objective)
+        assert not any(item.lstrip("+").startswith("trainer.resource_policy") for item in benchmark)
 
 
 def test_order_objectives_and_historical_registry_are_isolated():

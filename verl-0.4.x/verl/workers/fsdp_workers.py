@@ -717,113 +717,125 @@ class ActorRolloutRefWorker(Worker):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             worker_update_started = time.perf_counter()
-        # Support all hardwares
-        data = data.to(get_torch_device().current_device())
+        from verl.opd.resource_integrity import ResourceGuard
 
-        assert self._is_actor
-        # Recompute runs in a separate RPC.  Its input metadata mutations do
-        # not reach this call, and standalone OPD intentionally discards its
-        # old-policy output.  Set the sampling contract at the update boundary,
-        # using the same authoritative rollout config as compute_log_prob.
-        data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["add_noise_dirichlet"] = self.config.rollout.add_noise_dirichlet
-        data.meta_info["add_noise_gumbel_softmax"] = self.config.rollout.add_noise_gumbel_softmax
-        data.meta_info["continuous_replay"] = bool(
-            self.config.rollout.get("enable_soft_thinking", True)
-        )
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
-        # print(data)
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data=data)
-            # perform training
-            if benchmark_timing and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+        with ResourceGuard(self, distributed=dist, device=get_torch_device().current_device()) as resources:
+            # Support all hardwares
+            data = data.to(get_torch_device().current_device())
+
+            assert self._is_actor
+            # Recompute runs in a separate RPC.  Its input metadata mutations do
+            # not reach this call, and standalone OPD intentionally discards its
+            # old-policy output.  Set the sampling contract at the update boundary,
+            # using the same authoritative rollout config as compute_log_prob.
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            data.meta_info["add_noise_dirichlet"] = self.config.rollout.add_noise_dirichlet
+            data.meta_info["add_noise_gumbel_softmax"] = self.config.rollout.add_noise_gumbel_softmax
+            data.meta_info["continuous_replay"] = bool(
+                self.config.rollout.get("enable_soft_thinking", True)
+            )
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
+            # print(data)
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data=data)
+                # perform training
                 if benchmark_timing and torch.cuda.is_available():
                     torch.cuda.synchronize()
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-            metrics["perf/host_memory_percent"] = psutil.virtual_memory().percent
-            metrics["perf/cpu_utilization_percent"] = psutil.cpu_percent(interval=None)
+                with Timer(name="update_policy", logger=None) as timer:
+                    metrics = self.actor.update_policy(data=data)
+                    if benchmark_timing and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                delta_time = timer.last
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                def resource_metrics():
+                    host = psutil.virtual_memory()
+                    return {"perf/max_memory_allocated_gb": get_torch_device().max_memory_allocated() / (1024**3),
+                            "perf/max_memory_reserved_gb": get_torch_device().max_memory_reserved() / (1024**3),
+                            "perf/cpu_memory_used_gb": host.used / (1024**3),
+                            "perf/host_memory_percent": host.percent,
+                            "perf/cpu_utilization_percent": psutil.cpu_percent(interval=None)}
 
-            integrity = self.config.get("rollout_integrity", {})
-            if bool(integrity.get("enabled", False)):
-                # Enforce the ceilings on every rank and every iteration.  The
-                # CUDA value is a process-lifetime high-water mark, so a later
-                # longer trajectory cannot silently exceed the canary result.
-                validate_resource_limits(
-                    hbm_peak_gib=metrics["perf/max_memory_allocated_gb"],
-                    host_ram_percent=metrics["perf/host_memory_percent"],
-                )
+                # Every rank finishes this local measurement/check collectively
+                # before LR advancement, rank telemetry, or normal memory release.
+                physical_memory = resources.finish(metrics, collect_metrics=resource_metrics)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr
+                self.actor_lr_scheduler.step()
 
-            # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
+                # TODO: here, we should return all metrics
+                output = DataProto(meta_info={"metrics": metrics})
 
-            output = self.ulysses_sharding_manager.postprocess_data(data=output)
-            output = output.to("cpu")
+                output = self.ulysses_sharding_manager.postprocess_data(data=output)
+                output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
-        if benchmark_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            rank_timing = {
-                "rank": self.rank,
-                "teacher_seconds": float(metrics.get("perf/teacher_seconds", 0.0)),
-                "policy_update_seconds": float(delta_time),
-                "worker_update_seconds": time.perf_counter() - worker_update_started,
-                "optimizer_steps": float(metrics["trainer/optimizer_steps_this_iteration"]),
-                "ema_updates_this_iteration": float(metrics.get("opd/ema_updates_this_iteration", 0.0)),
-                "ema_update_count": float(metrics.get("opd/ema_update_count", 0.0)),
-                "max_memory_allocated_gib": float(metrics["perf/max_memory_allocated_gb"]),
-                "max_memory_reserved_gib": float(metrics["perf/max_memory_reserved_gb"]),
-            }
-            rank_timings = [None] * self.world_size
-            dist.all_gather_object(rank_timings, rank_timing)
-            timing = {
-                "ranks": rank_timings,
-                "teacher_seconds_max": max(item["teacher_seconds"] for item in rank_timings),
-                "policy_update_seconds_max": max(item["policy_update_seconds"] for item in rank_timings),
-                "worker_update_seconds_max": max(item["worker_update_seconds"] for item in rank_timings),
-                "max_memory_allocated_gib": max(item["max_memory_allocated_gib"] for item in rank_timings),
-                "max_memory_reserved_gib": max(item["max_memory_reserved_gib"] for item in rank_timings),
-                "memory_scope": (
-                    "Per-rank PyTorch process-lifetime CUDA peaks; summary values are maxima "
-                    "across participating ranks, not GPU-wide device usage."
-                ),
-                "timing_method": "cuda_synchronized_wall" if torch.cuda.is_available() else "cpu_wall",
-                "timing_note": (
-                    "Teacher time sums completed teacher spans per rank. Policy/worker times "
-                    "include teacher work and synchronization overhead; these nested times "
-                    "must not be added to the driver's update_actor wall duration."
-                ),
-            }
-            output.meta_info["actor_update_timing"] = timing
-            output.meta_info["metrics"]["perf/teacher_seconds_max"] = timing["teacher_seconds_max"]
-            # DataProto.concat retains the first worker's metadata, so reduce
-            # these rank-local peaks before the driver's metric reduction.
-            output.meta_info["metrics"]["perf/max_memory_allocated_gb"] = timing["max_memory_allocated_gib"]
-            output.meta_info["metrics"]["perf/max_memory_reserved_gb"] = timing["max_memory_reserved_gib"]
+            if benchmark_timing:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                rank_timing = {
+                    "rank": self.rank,
+                    "teacher_seconds": float(metrics.get("perf/teacher_seconds", 0.0)),
+                    "policy_update_seconds": float(delta_time),
+                    "worker_update_seconds": time.perf_counter() - worker_update_started,
+                    "optimizer_steps": float(metrics["trainer/optimizer_steps_this_iteration"]),
+                    "ema_updates_this_iteration": float(metrics.get("opd/ema_updates_this_iteration", 0.0)),
+                    "ema_update_count": float(metrics.get("opd/ema_update_count", 0.0)),
+                    "max_memory_allocated_gib": float(metrics["perf/max_memory_allocated_gb"]),
+                    "max_memory_reserved_gib": float(metrics["perf/max_memory_reserved_gb"]),
+                }
+                if physical_memory is not None:
+                    rank_timing["physical_memory"] = physical_memory
+                rank_timings = [None] * self.world_size
+                dist.all_gather_object(rank_timings, rank_timing)
+                timing = {
+                    "ranks": rank_timings,
+                    "teacher_seconds_max": max(item["teacher_seconds"] for item in rank_timings),
+                    "policy_update_seconds_max": max(item["policy_update_seconds"] for item in rank_timings),
+                    "worker_update_seconds_max": max(item["worker_update_seconds"] for item in rank_timings),
+                    "max_memory_allocated_gib": max(item["max_memory_allocated_gib"] for item in rank_timings),
+                    "max_memory_reserved_gib": max(item["max_memory_reserved_gib"] for item in rank_timings),
+                    "memory_scope": (
+                        "Per-rank PyTorch logical allocator high-water marks since the last allocator reset "
+                        "(vLLM startup profiling resets peaks); summary values are maxima across ranks, "
+                        "not physical GPU-wide device usage. Sleeping vLLM pools may remain logically allocated."
+                    ),
+                    "timing_method": "cuda_synchronized_wall" if torch.cuda.is_available() else "cpu_wall",
+                    "timing_note": (
+                        "Teacher time sums completed teacher spans per rank. Policy/worker times "
+                        "include teacher work and synchronization overhead; these nested times "
+                        "must not be added to the driver's update_actor wall duration."
+                    ),
+                }
+                output.meta_info["actor_update_timing"] = timing
+                if physical_memory is not None:
+                    observations = [item["physical_memory"] for item in rank_timings]
+                    timing["resource_policy"] = dict(resources.policy)
+                    timing["physical_device_used_peak_gib"] = max(item["device_used_peak_bytes"] for item in observations) / 1024**3
+                    timing["physical_device_free_min_gib"] = min(item["device_free_min_bytes"] for item in observations) / 1024**3
+                    timing["physical_device_used_fraction_peak"] = max(item["device_used_peak_bytes"] / item["device_total_bytes"] for item in observations)
+                    timing["physical_memory_scope"] = physical_memory["scope"]
+                    timing["logical_allocator_peaks_diagnostic_only"] = True
+                    for name in ("physical_device_used_peak_gib", "physical_device_free_min_gib", "physical_device_used_fraction_peak"):
+                        output.meta_info["metrics"]["perf/" + name] = timing[name]
+                output.meta_info["metrics"]["perf/teacher_seconds_max"] = timing["teacher_seconds_max"]
+                # DataProto.concat retains the first worker's metadata, so reduce
+                # these rank-local peaks before the driver's metric reduction.
+                output.meta_info["metrics"]["perf/max_memory_allocated_gb"] = timing["max_memory_allocated_gib"]
+                output.meta_info["metrics"]["perf/max_memory_reserved_gb"] = timing["max_memory_reserved_gib"]
 
-        return output
+            return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):

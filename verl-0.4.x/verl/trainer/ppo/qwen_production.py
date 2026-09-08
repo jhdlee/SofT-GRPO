@@ -88,6 +88,14 @@ class ProductionRecorder:
             raise ValueError("production completion and full-dose frequency stop rules must be disabled")
         if not config.trainer.rollout_integrity.enabled or config.actor_rollout_ref.actor.grad_clip != 1.0:
             raise ValueError("production requires replay integrity and optimizer clip norm 1.0")
+        if config.trainer.training_profile == "qwen3-math-seven-arm-lora-fa3-v1":
+            expected_resource_policy = {
+                "mode": "physical_device_v1", "max_device_used_fraction": 0.98,
+                "sample_interval_seconds": 0.1,
+            }
+            for owner in (config.trainer, config.actor_rollout_ref):
+                if OmegaConf.to_container(owner.get("resource_policy", OmegaConf.create({})), resolve=True) != expected_resource_policy:
+                    raise ValueError("revised Qwen training requires the sealed physical-device resource policy on driver and workers")
         if trainer.total_rollout_iterations != 109 or trainer.optimizer_steps_per_rollout != 2:
             raise ValueError("production must retain the 109-iteration/two-update recipe")
         if len(trainer.train_dataset) != 6985 or len(trainer.val_dataset) != 512:
@@ -120,7 +128,13 @@ class ProductionRecorder:
             "checkpoint_provenance": trainer.checkpoint_provenance,
             "wandb_run_id": os.environ.get("WANDB_RUN_ID"),
             "iterations": [], "validations": [], "checkpoints": [],
-            "acceptance_policy": {"clipping_frequency": "diagnostic", "opd_grpo_ratio": "diagnostic", "completion_rate": "diagnostic", "optimizer_clip_norm": 1.0},
+            "acceptance_policy": {
+                "clipping_frequency": "diagnostic", "opd_grpo_ratio": "diagnostic",
+                "completion_rate": "diagnostic", "optimizer_clip_norm": 1.0,
+                "resource_policy": OmegaConf.to_container(
+                    config.trainer.get("resource_policy", OmegaConf.create({})), resolve=True
+                ),
+            },
         })
 
     def stage(self, stage, iteration, timing, metrics, meta_info, *, update_state=None):

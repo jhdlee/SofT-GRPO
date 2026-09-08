@@ -119,6 +119,25 @@ def test_production_phase_and_output_are_invocation_only_in_the_production_profi
 
 
 @pytest.mark.parametrize("field,value", [
+    ("mode", "legacy_allocator_v1"),
+    ("max_device_used_fraction", 0.99),
+    ("sample_interval_seconds", 1.0),
+])
+def test_resource_policy_changes_invalidate_exact_resume(provenance_inputs, field, value):
+    config, environment, *_ = provenance_inputs
+    config["trainer"]["resource_policy"] = {
+        "mode": "physical_device_v1", "max_device_used_fraction": 0.98,
+        "sample_interval_seconds": 0.1,
+    }
+    first = build_checkpoint_provenance(config, source_commit="1" * 40, environment_identity=environment)
+    changed = deepcopy(config)
+    changed["trainer"]["resource_policy"][field] = value
+    second = build_checkpoint_provenance(changed, source_commit="1" * 40, environment_identity=environment)
+    with pytest.raises(RuntimeError, match="resolved_hydra_config"):
+        assert_checkpoint_provenance_matches(first, second)
+
+
+@pytest.mark.parametrize("field,value", [
     ("production_arm_id", "softgrpo_math_opd_current_s11"), ("total_training_steps", 110),
     ("default_local_dir", "/different/training"), ("n_gpus_per_node", 2),
     ("production_gradient_policy", "changed"),

@@ -166,6 +166,25 @@ def validate_resource_limits(
         )
 
 
+def validate_physical_resource_limits(observation: Mapping[str, Any], *, max_device_used_fraction: float) -> None:
+    """Use sampled device bytes, not live-but-unmapped allocator bookkeeping."""
+    total = observation["device_total_bytes"]
+    used = observation["device_used_peak_bytes"]
+    free = observation["device_free_min_bytes"]
+    count = observation["sample_count"]
+    if (any(type(value) is not int for value in (total, used, free, count))
+            or total <= 0 or not 0 <= used <= total or free != total - used or count < 2
+            or not math.isfinite(max_device_used_fraction) or not 0 < max_device_used_fraction < 1):
+        raise RuntimeError("physical-device resource gate received invalid sampled memory evidence")
+    if used / total >= max_device_used_fraction:
+        raise RuntimeError(
+            "physical-device resource gate failed: "
+            f"sampled used {used / 1024**3:.3f} GiB / {total / 1024**3:.3f} GiB "
+            f"({used / total:.6f}) >= {max_device_used_fraction:.6f}; "
+            f"minimum free {free / 1024**3:.3f} GiB, {count} samples"
+        )
+
+
 def opd_schedule_metrics(config: OPDConfig, rollout_iteration: int, total_iterations: int) -> dict[str, Any]:
     """Build the unambiguous schedule portion of an iteration payload."""
 

@@ -83,6 +83,14 @@ def classify_failure(error, *, stage, log_tail=""):
         category = "timeout"
     elif any(value in message for value in ("outofmemoryerror", "out of memory", "oom-kill", "oom_kill")):
         category = "oom"
+    elif any(value in message for value in (
+        "physical-device resource gate", "resource-integrity",
+        "rollout-integrity hbm gate", "rollout-integrity host-ram gate",
+    )):
+        # A policy ceiling or unavailable resource measurement is distinct
+        # from an allocator OOM. Ray wrappers retain these specific messages;
+        # generic mentions of memory must not reclassify unrelated failures.
+        category = "resource_gate"
     elif "full-dose gradient" in message or stage == "full_dose_gradient_gate":
         category = "gradient_gate"
     elif any(value in message for value in ("replay integrity", "replay acceptance", "replay ratio", "replay gate")) or stage == "old_log_prob" or stage.startswith("replay"):

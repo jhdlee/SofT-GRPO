@@ -80,9 +80,15 @@ class TaskRunner:
         OPDConfig.from_mapping(resolved_opd)
         resolved_integrity = OmegaConf.to_container(config.trainer.rollout_integrity, resolve=True)
         integrity_config = RolloutIntegrityConfig.from_mapping(resolved_integrity)
+        resolved_resource_policy = OmegaConf.to_container(
+            config.trainer.get("resource_policy", OmegaConf.create({})), resolve=True
+        )
+        from verl.opd.resource_integrity import normalize_resource_policy
+        normalize_resource_policy(resolved_resource_policy)
         with open_dict(config):
             config.actor_rollout_ref.opd = OmegaConf.create(resolved_opd)
             config.actor_rollout_ref.rollout_integrity = OmegaConf.create(resolved_integrity)
+            config.actor_rollout_ref.resource_policy = OmegaConf.create(resolved_resource_policy)
             if semantic_mode:
                 config.actor_rollout_ref.checkpoint_semantics = semantic_mode
                 config.actor_rollout_ref.training_seed = int(config.data.seed)

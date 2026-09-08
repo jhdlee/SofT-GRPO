@@ -186,4 +186,5 @@ def test_worker_preserves_sampling_contract_and_rank_timing(profile, standalone,
         assert timing["max_memory_reserved_gib"] == 19.0
         assert result.meta_info["metrics"]["perf/max_memory_allocated_gb"] == 17.0
         assert result.meta_info["metrics"]["perf/max_memory_reserved_gb"] == 19.0
-        assert "PyTorch process-lifetime" in timing["memory_scope"]
+        assert "PyTorch logical allocator high-water" in timing["memory_scope"]
+        assert "not physical GPU-wide" in timing["memory_scope"]
