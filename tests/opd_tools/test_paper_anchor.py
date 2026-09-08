@@ -2,29 +2,20 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from opd_tools.evaluation import (
-    COMMON_GENERATION_SEEDS,
-    EVALUATION_PROTOCOL,
-    EVALUATION_SCHEMA_VERSION,
-    GenerationRecord,
-    evaluation_request_seed,
-)
 from opd_tools.generate_eval import (
-    EVALUATION_SAMPLING_PROTOCOLS,
-    GENERATION_IMPLEMENTATION,
     _atomic_write,
     _canonical_json,
-    _stable_wandb_id,
-    _write_shard,
-    expected_engine_mode,
-    expected_sampling_source,
 )
 from opd_tools.graders import Grade
 from opd_tools.constants import MODEL_ID, MODEL_REVISION, SOFTGRPO_UPSTREAM_COMMIT
 from opd_tools import paper_anchor
+
+
+COMMON_GENERATION_SEEDS = paper_anchor.COMMON_GENERATION_SEEDS
 
 
 REGRADER_ENV = {
@@ -37,15 +28,19 @@ def _locked_distribution_version(distribution: str) -> str:
     return paper_anchor.UPSTREAM_GRADER_DEPENDENCY_VERSIONS[distribution]
 
 
-def _record(*, example_id: str, sample_index: int, seed: int) -> GenerationRecord:
-    return GenerationRecord(
+def _record(
+    *, example_id: str, sample_index: int, seed: int
+) -> paper_anchor.LegacyPaperAnchorRecord:
+    return paper_anchor.LegacyPaperAnchorRecord(
         model_label="initial",
         benchmark="math500",
         example_id=example_id,
         inference_mode="native_soft",
         sample_index=sample_index,
         generation_seed=seed,
-        request_seed=evaluation_request_seed(seed, "math500", example_id),
+        request_seed=paper_anchor.legacy_evaluation_request_seed(
+            seed, "math500", example_id
+        ),
         response="reasoning</think> The answer is \\boxed{1}",
         response_token_count=4,
         finish_reason="stop",
@@ -69,31 +64,82 @@ def _generation_manifest(model_path: Path) -> dict:
         "files": [],
     }
     result = {
-        "evaluation_protocol": EVALUATION_PROTOCOL,
-        "schema_version": EVALUATION_SCHEMA_VERSION,
+        "evaluation_protocol": "opd-softgrpo-seed11-evaluation-v1",
+        "schema_version": 1,
         "softgrpo_upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
-        "generation_implementation": GENERATION_IMPLEMENTATION,
-        "sampling_source": expected_sampling_source("native_soft", "released_anchor"),
-        "engine_mode": expected_engine_mode("native_soft"),
+        "generation_implementation": (
+            "Soft-Thinking+noise+loss-main/sglang_soft_thinking_pkg/python/sglang"
+        ),
+        "sampling_source": (
+            "Soft-Thinking+noise+loss-main/run_sample_gumbel_raw.sh"
+        ),
+        "engine_mode": {
+            "enable_soft_thinking": True,
+            "add_noise_gumbel_softmax": True,
+        },
         "model_label": "initial",
         "model": model,
         "mode": "native_soft",
         "benchmarks": ["math500"],
         "generation_seeds": [11, 12],
         "sampling_protocol": "released_anchor",
-        "sampling": EVALUATION_SAMPLING_PROTOCOLS["released_anchor"],
+        "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 30,
+            "gumbel_softmax_temperature": 0.5,
+            "max_new_tokens": 32_768,
+        },
         "parallelism": dict(paper_anchor.PAPER_ANCHOR_PARALLELISM),
         "batch_size": 64,
         "max_running_requests": 16,
         "gpu_memory_utilization": 0.8,
-        "context_length": 33_000,
+        "context_length": 33_581,
         "data_manifest_content_sha256": "b" * 64,
         "cuda_visible_devices_source": "slurm",
-        "parent_commit": "c" * 40,
-        "fork_commit": "d" * 40,
+        "parent_commit": "01126860d894e9a824069f43aa3c024db5136a9b",
+        "fork_commit": "7a5040686c77598e95a6e28895a869df4469d60e",
     }
-    result["wandb_run_id"] = _stable_wandb_id(result)
+    result["wandb_run_id"] = paper_anchor.legacy_generation_wandb_id(result)
     return result
+
+
+def _write_legacy_shard(
+    path: Path, records: list[paper_anchor.LegacyPaperAnchorRecord]
+) -> dict:
+    payload = b"".join(_canonical_json(record.to_dict()) for record in records)
+    _atomic_write(path, payload)
+    manifest = {
+        "schema_version": 1,
+        "protocol": "opd-softgrpo-seed11-evaluation-v1",
+        "size": path.stat().st_size,
+        "sha256": paper_anchor.file_sha256(path),
+        "row_count": len(records),
+    }
+    _atomic_write(path.with_suffix(".manifest.json"), _canonical_json(manifest))
+    return manifest
+
+
+@contextmanager
+def _small_anchor_contract(root: Path):
+    generation_path = root / "raw/initial/native_soft/generation_manifest.json"
+    completion_path = root / "raw/initial/native_soft/completion.json"
+    with (
+        patch.object(paper_anchor, "COMMON_GENERATION_SEEDS", (11, 12)),
+        patch.object(paper_anchor, "PAPER_ANCHOR_SAMPLE_COUNT", 2),
+        patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+        patch.object(
+            paper_anchor,
+            "LEGACY_GENERATION_MANIFEST_SHA256",
+            paper_anchor.file_sha256(generation_path),
+        ),
+        patch.object(
+            paper_anchor,
+            "LEGACY_COMPLETION_SHA256",
+            paper_anchor.file_sha256(completion_path),
+        ),
+    ):
+        yield
 
 
 class PaperAnchorAuthenticationTests(unittest.TestCase):
@@ -112,7 +158,7 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
                 / "raw/initial/native_soft/math500"
                 / ("seed_%d.jsonl" % seed)
             )
-            sidecar = _write_shard(
+            sidecar = _write_legacy_shard(
                 data_path,
                 [
                     _record(example_id="math500-0", sample_index=sample_index, seed=seed),
@@ -128,7 +174,7 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
                 }
             )
         completion = {
-            "evaluation_protocol": EVALUATION_PROTOCOL,
+            "evaluation_protocol": "opd-softgrpo-seed11-evaluation-v1",
             "generation_manifest_sha256": paper_anchor.file_sha256(generation_path),
             "model_label": "initial",
             "mode": "native_soft",
@@ -145,6 +191,187 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
         )
         return manifest
 
+    def test_literal_job_465717_record_uses_the_legacy_v1_seed_contract(self):
+        # These protocol/schema/request-seed values are copied literally from
+        # job 465717.  Do not derive them from the current evaluation module.
+        row = {
+            "all_soft": False,
+            "benchmark": "math500",
+            "capped": False,
+            "close_tag": True,
+            "example_id": "test/precalculus/807.json",
+            "finish_reason": "stop",
+            "generation_seed": 11,
+            "gold_answer": "\\left( 3, \\frac{\\pi}{2} \\right)",
+            "hard_token_count": 1,
+            "inference_mode": "native_soft",
+            "latent_token_count": 3,
+            "mixture_entropy_mean": 0.16,
+            "model_label": "initial",
+            "request_seed": 3146120082566018242,
+            "response": "reasoning</think> \\boxed{(3, \\pi/2)}",
+            "response_token_count": 4,
+            "sample_index": 0,
+            "schema_version": 1,
+            "soft_hard_agreement": 1.0,
+            "soft_to_hard": True,
+            "top1_weight_mean": 0.93,
+        }
+        record = paper_anchor.LegacyPaperAnchorRecord.from_mapping(row)
+        self.assertEqual(record.request_seed, 3146120082566018242)
+        self.assertEqual(
+            paper_anchor.LEGACY_EVALUATION_PROTOCOL,
+            "opd-softgrpo-seed11-evaluation-v1",
+        )
+        self.assertEqual(paper_anchor.LEGACY_EVALUATION_SCHEMA_VERSION, 1)
+        self.assertEqual(
+            paper_anchor.LEGACY_RELEASED_ANCHOR_SAMPLING,
+            {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 30,
+                "gumbel_softmax_temperature": 0.5,
+                "max_new_tokens": 32768,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "legacy generation-record schema"):
+            paper_anchor.LegacyPaperAnchorRecord.from_mapping(
+                {**row, "schema_version": 2}
+            )
+
+    def test_literal_legacy_manifest_contract_is_not_imported_from_current_eval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model"
+            model_path.mkdir()
+            manifest = _generation_manifest(model_path)
+        self.assertEqual(
+            manifest["evaluation_protocol"],
+            "opd-softgrpo-seed11-evaluation-v1",
+        )
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(
+            manifest["generation_implementation"],
+            "Soft-Thinking+noise+loss-main/sglang_soft_thinking_pkg/python/sglang",
+        )
+        self.assertEqual(
+            manifest["sampling_source"],
+            "Soft-Thinking+noise+loss-main/run_sample_gumbel_raw.sh",
+        )
+        self.assertEqual(
+            manifest["engine_mode"],
+            {
+                "enable_soft_thinking": True,
+                "add_noise_gumbel_softmax": True,
+            },
+        )
+        identity = dict(manifest)
+        observed_wandb_id = identity.pop("wandb_run_id")
+        self.assertEqual(
+            observed_wandb_id,
+            paper_anchor.legacy_generation_wandb_id(identity),
+        )
+
+    def test_job_465717_artifact_and_generation_source_pins_are_literal(self):
+        self.assertEqual(
+            paper_anchor.LEGACY_GENERATION_MANIFEST_SHA256,
+            "2d77f8a74cc17cfb8215e419dde0bfd46ab7f469e9eeef8b0949da6130b562c0",
+        )
+        self.assertEqual(
+            paper_anchor.LEGACY_COMPLETION_SHA256,
+            "2832e5bd32c162eb705b552b3b656ee89f944eb64f73a4680e64cdd8fa63ea9b",
+        )
+        self.assertEqual(
+            paper_anchor.LEGACY_GENERATING_PARENT_COMMIT,
+            "01126860d894e9a824069f43aa3c024db5136a9b",
+        )
+        self.assertEqual(
+            paper_anchor.LEGACY_GENERATING_FORK_COMMIT,
+            "7a5040686c77598e95a6e28895a869df4469d60e",
+        )
+        self.assertEqual(paper_anchor.LEGACY_CONTEXT_LENGTH, 33_581)
+
+    def test_rejects_any_change_to_exact_generation_or_completion_artifact(self):
+        for filename, pinned_name, error in (
+            (
+                "generation_manifest.json",
+                "LEGACY_GENERATION_MANIFEST_SHA256",
+                "generation manifest differs from the exact job 465717 artifact",
+            ),
+            (
+                "completion.json",
+                "LEGACY_COMPLETION_SHA256",
+                "generation completion differs from the exact job 465717 artifact",
+            ),
+        ):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self._materialize_small_anchor(root)
+                path = root / "raw/initial/native_soft" / filename
+                original_sha256 = paper_anchor.file_sha256(path)
+                with path.open("ab") as stream:
+                    stream.write(b"\n")
+                other_path = root / "raw/initial/native_soft" / (
+                    "completion.json"
+                    if filename == "generation_manifest.json"
+                    else "generation_manifest.json"
+                )
+                other_pin = (
+                    "LEGACY_COMPLETION_SHA256"
+                    if filename == "generation_manifest.json"
+                    else "LEGACY_GENERATION_MANIFEST_SHA256"
+                )
+                with (
+                    patch.object(paper_anchor, "COMMON_GENERATION_SEEDS", (11, 12)),
+                    patch.object(paper_anchor, "PAPER_ANCHOR_SAMPLE_COUNT", 2),
+                    patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+                    patch.object(paper_anchor, pinned_name, original_sha256),
+                    patch.object(
+                        paper_anchor,
+                        other_pin,
+                        paper_anchor.file_sha256(other_path),
+                    ),
+                ):
+                    with self.assertRaisesRegex(ValueError, error):
+                        paper_anchor.authenticate_input(root)
+
+    def test_rejects_mutated_generating_commits_and_context_length(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model"
+            model_path.mkdir()
+            baseline = _generation_manifest(model_path)
+            mutations = (
+                ("parent_commit", "f" * 40),
+                ("fork_commit", "e" * 40),
+                ("context_length", 33_582),
+            )
+            for field, value in mutations:
+                with self.subTest(field=field):
+                    manifest = dict(baseline)
+                    manifest[field] = value
+                    identity = dict(manifest)
+                    identity.pop("wandb_run_id")
+                    manifest["wandb_run_id"] = paper_anchor.legacy_generation_wandb_id(
+                        identity
+                    )
+                    with (
+                        patch.object(
+                            paper_anchor, "COMMON_GENERATION_SEEDS", (11, 12)
+                        ),
+                        patch.object(paper_anchor, "PAPER_ANCHOR_SAMPLE_COUNT", 2),
+                        patch.object(
+                            paper_anchor,
+                            "_authenticate_starting_model",
+                            return_value={
+                                "id": MODEL_ID,
+                                "revision": MODEL_REVISION,
+                                "inventory_sha256": "c" * 64,
+                                "tree_sha256": "a" * 64,
+                            },
+                        ),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "wrong %s" % field):
+                            paper_anchor._validate_generation_manifest(manifest)
+
     def test_authenticates_only_exact_base_native_soft_math500_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -156,9 +383,7 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
                 "tree_sha256": "a" * 64,
             }
             with (
-                patch.object(paper_anchor, "COMMON_GENERATION_SEEDS", (11, 12)),
-                patch.object(paper_anchor, "PAPER_ANCHOR_SAMPLE_COUNT", 2),
-                patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+                _small_anchor_contract(root),
                 patch.object(
                     paper_anchor,
                     "_authenticate_starting_model",
@@ -169,6 +394,30 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
                 self.assertEqual(authenticated["model"], identity)
                 self.assertEqual(authenticated["generation_seeds"], [11, 12])
                 self.assertEqual(len(authenticated["shards"]), 2)
+                self.assertEqual(
+                    authenticated["generation_source"],
+                    {
+                        "parent_commit": (
+                            "01126860d894e9a824069f43aa3c024db5136a9b"
+                        ),
+                        "fork_commit": (
+                            "7a5040686c77598e95a6e28895a869df4469d60e"
+                        ),
+                        "context_length": 33_581,
+                    },
+                )
+                self.assertEqual(
+                    authenticated["generation_manifest"]["sha256"],
+                    paper_anchor.file_sha256(
+                        root / "raw/initial/native_soft/generation_manifest.json"
+                    ),
+                )
+                self.assertEqual(
+                    authenticated["generation_completion"]["sha256"],
+                    paper_anchor.file_sha256(
+                        root / "raw/initial/native_soft/completion.json"
+                    ),
+                )
 
                 # A seemingly useful extra cell is still forbidden: this report
                 # has one paper-anchor cell, not an open-ended evaluation tree.
@@ -188,9 +437,7 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
             path = root / "raw/initial/native_soft/generation_manifest.json"
             _atomic_write(path, _canonical_json(manifest))
             with (
-                patch.object(paper_anchor, "COMMON_GENERATION_SEEDS", (11, 12)),
-                patch.object(paper_anchor, "PAPER_ANCHOR_SAMPLE_COUNT", 2),
-                patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+                _small_anchor_contract(root),
                 patch.object(
                     paper_anchor,
                     "_authenticate_starting_model",
@@ -214,9 +461,7 @@ class PaperAnchorAuthenticationTests(unittest.TestCase):
             completion["rows_committed"] -= 1
             _atomic_write(path, _canonical_json(completion))
             with (
-                patch.object(paper_anchor, "COMMON_GENERATION_SEEDS", (11, 12)),
-                patch.object(paper_anchor, "PAPER_ANCHOR_SAMPLE_COUNT", 2),
-                patch.object(paper_anchor, "PAPER_ANCHOR_EXAMPLE_COUNT", 2),
+                _small_anchor_contract(root),
                 patch.object(
                     paper_anchor,
                     "_authenticate_starting_model",
@@ -309,6 +554,21 @@ class PaperAnchorStatisticsTests(unittest.TestCase):
         self.assertTrue(row["correct"])
         self.assertFalse(row["upstream_rule_correct"])
         self.assertEqual(row["upstream_extracted_answer"], "0")
+
+    def test_historical_pass_metrics_are_vendored_and_exact(self):
+        source = Path(paper_anchor.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("from .evaluation import", source)
+        outcomes = {
+            "two_correct": (1,) * 2 + (0,) * 30,
+            "sixteen_correct": (1,) * 16 + (0,) * 16,
+        }
+        means = paper_anchor.legacy_example_level_metric(outcomes, "mean_at_32")
+        passes = paper_anchor.legacy_example_level_metric(outcomes, "pass_at_8")
+        self.assertEqual(
+            means, {"two_correct": 0.0625, "sixteen_correct": 0.5}
+        )
+        self.assertEqual(passes["two_correct"], 0.44354838709677424)
+        self.assertEqual(passes["sixteen_correct"], 0.9987764182424916)
 
     def test_upstream_rule_judge_calls_the_authenticated_released_api(self):
         class Evaluator:

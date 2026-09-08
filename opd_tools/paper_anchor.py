@@ -30,6 +30,7 @@ import os
 import re
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Mapping, MutableMapping, Sequence
@@ -43,25 +44,10 @@ from .constants import (
     MODEL_REVISION,
     SOFTGRPO_UPSTREAM_COMMIT,
 )
-from .evaluation import (
-    BOOTSTRAP_RESAMPLES,
-    BOOTSTRAP_SEED,
-    COMMON_GENERATION_SEEDS,
-    EVALUATION_PROTOCOL,
-    EVALUATION_SCHEMA_VERSION,
-    GenerationRecord,
-    example_level_metric,
-)
 from .generate_eval import (
-    EVALUATION_SAMPLING_PROTOCOLS,
-    GENERATION_IMPLEMENTATION,
     _atomic_write,
     _canonical_json,
-    _stable_wandb_id,
     _tree_fingerprint,
-    _verify_shard,
-    expected_engine_mode,
-    expected_sampling_source,
 )
 from .graders import math_verify_full_response_grade
 from .manifest import file_sha256
@@ -79,6 +65,37 @@ PAPER_ANCHOR_SAMPLING_PROTOCOL = "released_anchor"
 PAPER_ANCHOR_EXAMPLE_COUNT = 500
 PAPER_ANCHOR_SAMPLE_COUNT = 32
 PAPER_ANCHOR_GROUP = "paper-anchor-base"
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_SEED = 11
+LEGACY_EVALUATION_SCHEMA_VERSION = 1
+LEGACY_EVALUATION_PROTOCOL = "opd-softgrpo-seed11-evaluation-v1"
+LEGACY_GENERATING_PARENT_COMMIT = "01126860d894e9a824069f43aa3c024db5136a9b"
+LEGACY_GENERATING_FORK_COMMIT = "7a5040686c77598e95a6e28895a869df4469d60e"
+LEGACY_CONTEXT_LENGTH = 33_581
+LEGACY_GENERATION_MANIFEST_SHA256 = (
+    "2d77f8a74cc17cfb8215e419dde0bfd46ab7f469e9eeef8b0949da6130b562c0"
+)
+LEGACY_COMPLETION_SHA256 = (
+    "2832e5bd32c162eb705b552b3b656ee89f944eb64f73a4680e64cdd8fa63ea9b"
+)
+COMMON_GENERATION_SEEDS = tuple(range(11, 43))
+LEGACY_GENERATION_IMPLEMENTATION = (
+    "Soft-Thinking+noise+loss-main/sglang_soft_thinking_pkg/python/sglang"
+)
+LEGACY_SAMPLING_SOURCE = (
+    "Soft-Thinking+noise+loss-main/run_sample_gumbel_raw.sh"
+)
+LEGACY_ENGINE_MODE = {
+    "enable_soft_thinking": True,
+    "add_noise_gumbel_softmax": True,
+}
+LEGACY_RELEASED_ANCHOR_SAMPLING = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 30,
+    "gumbel_softmax_temperature": 0.5,
+    "max_new_tokens": 32_768,
+}
 PAPER_ANCHOR_PARALLELISM = {
     "tensor_parallel_size": 1,
     "data_parallel_size": 8,
@@ -98,6 +115,222 @@ UPSTREAM_GRADER_DEPENDENCY_VERSIONS = {
     "latex2sympy2-extended": "1.10.2",
 }
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def legacy_stable_int63(*parts: Any) -> int:
+    encoded = json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big") & (
+        (1 << 63) - 1
+    )
+
+
+def legacy_evaluation_request_seed(
+    generation_seed: int, benchmark: str, example_id: str
+) -> int:
+    if generation_seed not in COMMON_GENERATION_SEEDS:
+        raise ValueError("generation seed is outside the legacy paper-anchor set")
+    if benchmark != PAPER_ANCHOR_BENCHMARK:
+        raise ValueError("paper anchor accepts only MATH-500")
+    if not isinstance(example_id, str) or not example_id:
+        raise ValueError("example_id must be non-empty")
+    return legacy_stable_int63(
+        LEGACY_EVALUATION_PROTOCOL,
+        "request-seed",
+        int(generation_seed),
+        benchmark,
+        example_id,
+    )
+
+
+def legacy_pass_at_k(n: int, correct: int, k: int) -> float:
+    """Historical unbiased pass@k estimator used by job 465717."""
+
+    if not isinstance(n, int) or not isinstance(correct, int) or not isinstance(k, int):
+        raise TypeError("n, correct, and k must be integers")
+    if n <= 0 or not 0 <= correct <= n or not 1 <= k <= n:
+        raise ValueError("require n > 0, 0 <= correct <= n, and 1 <= k <= n")
+    if n - correct < k:
+        return 1.0
+    failure = 1.0
+    for index in range(k):
+        failure *= (n - correct - index) / (n - index)
+    return 1.0 - failure
+
+
+def legacy_example_level_metric(
+    outcomes: Mapping[str, Sequence[int]], metric: str
+) -> Dict[str, float]:
+    """Historical example-level metric, independent of the live evaluator."""
+
+    if not outcomes:
+        raise ValueError("outcomes cannot be empty")
+    result: Dict[str, float] = {}
+    for example_id, values in outcomes.items():
+        vector = tuple(int(value) for value in values)
+        if not vector or any(value not in (0, 1) for value in vector):
+            raise ValueError("outcomes must be non-empty binary sequences")
+        n = len(vector)
+        correct = sum(vector)
+        if metric in {"mean_at_32", "accuracy"}:
+            result[example_id] = correct / n
+        elif metric.startswith("pass_at_"):
+            k = int(metric.rsplit("_", 1)[1])
+            result[example_id] = legacy_pass_at_k(n, correct, k)
+        else:
+            raise ValueError("unknown evaluation metric: %r" % metric)
+    return result
+
+
+@dataclass(frozen=True)
+class LegacyPaperAnchorRecord:
+    """The immutable schema used by job 465717, independent of current evals."""
+
+    model_label: str
+    benchmark: str
+    example_id: str
+    inference_mode: str
+    sample_index: int
+    generation_seed: int
+    request_seed: int
+    response: str
+    response_token_count: int
+    finish_reason: str
+    capped: bool
+    latent_token_count: int
+    hard_token_count: int
+    close_tag: bool
+    soft_to_hard: bool
+    all_soft: bool
+    mixture_entropy_mean: float | None
+    top1_weight_mean: float | None
+    soft_hard_agreement: float | None
+    gold_answer: str
+    schema_version: int = LEGACY_EVALUATION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != LEGACY_EVALUATION_SCHEMA_VERSION:
+            raise ValueError("unsupported legacy generation-record schema")
+        if self.model_label != PAPER_ANCHOR_MODEL_LABEL:
+            raise ValueError("legacy paper anchor accepts only the initial model")
+        if self.benchmark != PAPER_ANCHOR_BENCHMARK:
+            raise ValueError("legacy paper anchor accepts only MATH-500")
+        if self.inference_mode != PAPER_ANCHOR_MODE:
+            raise ValueError("legacy paper anchor accepts only native-soft responses")
+        if type(self.sample_index) is not int or not 0 <= self.sample_index < len(
+            COMMON_GENERATION_SEEDS
+        ):
+            raise ValueError("sample_index is outside the legacy protocol")
+        if (
+            type(self.generation_seed) is not int
+            or self.generation_seed != COMMON_GENERATION_SEEDS[self.sample_index]
+        ):
+            raise ValueError("generation_seed does not match sample_index")
+        if type(self.request_seed) is not int or self.request_seed < 0:
+            raise ValueError("request_seed must be a nonnegative integer")
+        if self.request_seed != legacy_evaluation_request_seed(
+            self.generation_seed, self.benchmark, self.example_id
+        ):
+            raise ValueError("request_seed does not match the legacy derivation")
+        if not isinstance(self.response, str):
+            raise TypeError("response must be a string")
+        if not isinstance(self.finish_reason, str) or not self.finish_reason:
+            raise ValueError("finish_reason must be non-empty")
+        if not isinstance(self.gold_answer, str) or not self.gold_answer.strip():
+            raise ValueError("gold_answer must be non-empty")
+        for name in (
+            "response_token_count",
+            "latent_token_count",
+            "hard_token_count",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError("%s cannot be negative" % name)
+        for name in ("capped", "close_tag", "soft_to_hard", "all_soft"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError("%s must be bool" % name)
+        if self.latent_token_count + self.hard_token_count != self.response_token_count:
+            raise ValueError("latent and hard counts must partition the response")
+        for name, value in (
+            ("mixture_entropy_mean", self.mixture_entropy_mean),
+            ("top1_weight_mean", self.top1_weight_mean),
+            ("soft_hard_agreement", self.soft_hard_agreement),
+        ):
+            if self.latent_token_count and (
+                value is None or not math.isfinite(float(value))
+            ):
+                raise ValueError("%s must be finite for a soft trajectory" % name)
+        if self.latent_token_count == 0 and any(
+            value is not None
+            for value in (
+                self.mixture_entropy_mean,
+                self.top1_weight_mean,
+                self.soft_hard_agreement,
+            )
+        ):
+            raise ValueError("a trajectory without latent tokens has diagnostics")
+        if self.soft_to_hard and not (
+            self.latent_token_count > 0 and self.hard_token_count > 0
+        ):
+            raise ValueError("soft_to_hard requires latent and hard tokens")
+        if self.all_soft != (
+            self.response_token_count > 0
+            and self.latent_token_count == self.response_token_count
+        ):
+            raise ValueError("all_soft disagrees with the token partition")
+        if self.mixture_entropy_mean is not None and self.mixture_entropy_mean < 0:
+            raise ValueError("mixture entropy cannot be negative")
+        for name in ("top1_weight_mean", "soft_hard_agreement"):
+            value = getattr(self, name)
+            if value is not None and not 0.0 <= float(value) <= 1.0:
+                raise ValueError("%s must be in [0, 1]" % name)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "LegacyPaperAnchorRecord":
+        if not isinstance(value, Mapping):
+            raise TypeError("legacy generation record must be a mapping")
+        expected = set(cls.__dataclass_fields__)
+        unknown = set(value) - expected
+        missing = expected - set(value)
+        if unknown or missing:
+            raise ValueError(
+                "legacy generation-record fields differ: missing=%s unknown=%s"
+                % (sorted(missing), sorted(unknown))
+            )
+        return cls(**dict(value))
+
+
+def legacy_generation_wandb_id(config: Mapping[str, Any]) -> str:
+    if "wandb_run_id" in config:
+        raise ValueError("W&B identity input may not contain its own run ID")
+    digest = hashlib.sha256(_canonical_json(dict(config))).hexdigest()[:16]
+    return "eval-%s-%s-%s" % (
+        config["model_label"],
+        str(config["mode"]).replace("_", "-"),
+        digest,
+    )
+
+
+def _verify_legacy_shard(data_path: Path, manifest_path: Path) -> Dict[str, Any]:
+    if not data_path.is_file() or not manifest_path.is_file():
+        raise ValueError("legacy generation shard is only partially committed")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("legacy generation shard manifest is unreadable") from error
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != LEGACY_EVALUATION_SCHEMA_VERSION
+        or manifest.get("protocol") != LEGACY_EVALUATION_PROTOCOL
+        or manifest.get("sha256") != file_sha256(data_path)
+        or manifest.get("size") != data_path.stat().st_size
+    ):
+        raise ValueError("legacy generation shard authentication failed: %s" % data_path)
+    return manifest
 
 
 def _required_commit_from_environment(
@@ -329,21 +562,22 @@ def _authenticate_starting_model(model: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _validate_generation_manifest(value: Mapping[str, Any]) -> Dict[str, Any]:
     expected = {
-        "evaluation_protocol": EVALUATION_PROTOCOL,
-        "schema_version": EVALUATION_SCHEMA_VERSION,
+        "evaluation_protocol": LEGACY_EVALUATION_PROTOCOL,
+        "schema_version": LEGACY_EVALUATION_SCHEMA_VERSION,
         "softgrpo_upstream_commit": SOFTGRPO_UPSTREAM_COMMIT,
-        "generation_implementation": GENERATION_IMPLEMENTATION,
-        "sampling_source": expected_sampling_source(
-            PAPER_ANCHOR_MODE, PAPER_ANCHOR_SAMPLING_PROTOCOL
-        ),
-        "engine_mode": expected_engine_mode(PAPER_ANCHOR_MODE),
+        "generation_implementation": LEGACY_GENERATION_IMPLEMENTATION,
+        "sampling_source": LEGACY_SAMPLING_SOURCE,
+        "engine_mode": LEGACY_ENGINE_MODE,
         "model_label": PAPER_ANCHOR_MODEL_LABEL,
         "mode": PAPER_ANCHOR_MODE,
         "benchmarks": [PAPER_ANCHOR_BENCHMARK],
         "generation_seeds": list(COMMON_GENERATION_SEEDS),
         "sampling_protocol": PAPER_ANCHOR_SAMPLING_PROTOCOL,
-        "sampling": EVALUATION_SAMPLING_PROTOCOLS[PAPER_ANCHOR_SAMPLING_PROTOCOL],
+        "sampling": LEGACY_RELEASED_ANCHOR_SAMPLING,
         "parallelism": PAPER_ANCHOR_PARALLELISM,
+        "context_length": LEGACY_CONTEXT_LENGTH,
+        "parent_commit": LEGACY_GENERATING_PARENT_COMMIT,
+        "fork_commit": LEGACY_GENERATING_FORK_COMMIT,
     }
     for field, required in expected.items():
         if value.get(field) != required:
@@ -354,28 +588,13 @@ def _validate_generation_manifest(value: Mapping[str, Any]) -> Dict[str, Any]:
         value.get("data_manifest_content_sha256"),
         "data_manifest_content_sha256",
     )
-    for field in ("parent_commit", "fork_commit"):
-        commit = value.get(field)
-        if (
-            not isinstance(commit, str)
-            or len(commit) != 40
-            or any(character not in "0123456789abcdef" for character in commit)
-        ):
-            raise ValueError("generation manifest %s must be a full Git SHA" % field)
-    context_length = value.get("context_length")
-    if (
-        isinstance(context_length, bool)
-        or not isinstance(context_length, int)
-        or context_length <= int(value["sampling"]["max_new_tokens"])
-    ):
-        raise ValueError("generation manifest has an invalid context length")
     model = value.get("model")
     if not isinstance(model, Mapping):
         raise ValueError("generation manifest has no model fingerprint")
     model_identity = _authenticate_starting_model(model)
     wandb_identity = dict(value)
     wandb_identity.pop("wandb_run_id", None)
-    expected_wandb_id = _stable_wandb_id(wandb_identity)
+    expected_wandb_id = legacy_generation_wandb_id(wandb_identity)
     if value.get("wandb_run_id") != expected_wandb_id:
         raise ValueError("generation manifest has the wrong stable W&B run ID")
     return {"data_manifest_content_sha256": data_hash, "model": model_identity}
@@ -405,6 +624,13 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
     if any(path.is_symlink() for path in observed_paths):
         raise ValueError("paper-anchor inputs may not be symlinks")
 
+    observed_generation_manifest_sha256 = file_sha256(manifest_path)
+    if observed_generation_manifest_sha256 != LEGACY_GENERATION_MANIFEST_SHA256:
+        raise ValueError("generation manifest differs from the exact job 465717 artifact")
+    observed_completion_sha256 = file_sha256(completion_path)
+    if observed_completion_sha256 != LEGACY_COMPLETION_SHA256:
+        raise ValueError("generation completion differs from the exact job 465717 artifact")
+
     try:
         generation_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -417,17 +643,17 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
     expected_gold: Dict[str, str] = {}
     shard_inventory = []
     for sample_index, (data_path, sidecar_path, seed) in enumerate(shards):
-        sidecar = _verify_shard(data_path, sidecar_path)
+        sidecar = _verify_legacy_shard(data_path, sidecar_path)
         if set(sidecar) != {"schema_version", "protocol", "size", "sha256", "row_count"}:
             raise ValueError("generation shard sidecar has an unexpected schema")
-        if sidecar.get("protocol") != EVALUATION_PROTOCOL:
+        if sidecar.get("protocol") != LEGACY_EVALUATION_PROTOCOL:
             raise ValueError("generation shard has the wrong protocol")
         if sidecar.get("row_count") != PAPER_ANCHOR_EXAMPLE_COUNT:
             raise ValueError("generation shard must contain exactly 500 MATH examples")
 
         ids: set[str] = set()
         for value in _read_jsonl(data_path):
-            record = GenerationRecord.from_mapping(value)
+            record = LegacyPaperAnchorRecord.from_mapping(value)
             if (
                 record.model_label != PAPER_ANCHOR_MODEL_LABEL
                 or record.inference_mode != PAPER_ANCHOR_MODE
@@ -465,7 +691,7 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("generation completion record is unreadable") from error
     expected_completion = {
-        "evaluation_protocol": EVALUATION_PROTOCOL,
+        "evaluation_protocol": LEGACY_EVALUATION_PROTOCOL,
         "generation_manifest_sha256": file_sha256(manifest_path),
         "model_label": PAPER_ANCHOR_MODEL_LABEL,
         "mode": PAPER_ANCHOR_MODE,
@@ -492,16 +718,21 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
         "input_dir": str(root),
         "generation_manifest": {
             "path": manifest_path.relative_to(root).as_posix(),
-            "sha256": file_sha256(manifest_path),
+            "sha256": observed_generation_manifest_sha256,
         },
         "generation_completion": {
             "path": completion_path.relative_to(root).as_posix(),
-            "sha256": file_sha256(completion_path),
+            "sha256": observed_completion_sha256,
+        },
+        "generation_source": {
+            "parent_commit": LEGACY_GENERATING_PARENT_COMMIT,
+            "fork_commit": LEGACY_GENERATING_FORK_COMMIT,
+            "context_length": LEGACY_CONTEXT_LENGTH,
         },
         "model": identity["model"],
         "data_manifest_content_sha256": identity["data_manifest_content_sha256"],
         "sampling": dict(
-            EVALUATION_SAMPLING_PROTOCOLS[PAPER_ANCHOR_SAMPLING_PROTOCOL]
+            LEGACY_RELEASED_ANCHOR_SAMPLING
         ),
         "generation_seeds": list(COMMON_GENERATION_SEEDS),
         "example_count": PAPER_ANCHOR_EXAMPLE_COUNT,
@@ -511,7 +742,7 @@ def authenticate_input(input_dir: Path) -> Dict[str, Any]:
 
 
 def _score_record(value: Mapping[str, Any]) -> Dict[str, Any]:
-    record = GenerationRecord.from_mapping(value)
+    record = LegacyPaperAnchorRecord.from_mapping(value)
     math_verify_correct = math_verify_full_response_grade(
         record.response, record.gold_answer
     ).correct
@@ -641,7 +872,7 @@ def _aggregate_binary_outcomes(
     metric_rows: list[Dict[str, Any]] = []
     wandb_metrics: Dict[str, float] = {}
     for name in ("mean_at_32", "pass_at_8", "pass_at_16", "pass_at_32"):
-        result = bootstrap_mean(example_level_metric(outcomes, name))
+        result = bootstrap_mean(legacy_example_level_metric(outcomes, name))
         estimator = (
             "mean correctness over 32 samples per example; estimates pass@1"
             if name == "mean_at_32"
@@ -823,7 +1054,7 @@ def aggregate(
         for example_id, by_seed in grouped.items()
     }
     invalid_as_incorrect = bootstrap_mean(
-        example_level_metric(upstream_invalid_as_incorrect, "mean_at_32")
+        legacy_example_level_metric(upstream_invalid_as_incorrect, "mean_at_32")
     )
     invalid_as_incorrect["estimator"] = (
         "mean correctness over all 32 samples after assigning zero to capped/all-soft "
