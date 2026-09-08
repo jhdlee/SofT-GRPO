@@ -85,8 +85,8 @@ def test_v2_identity_and_runtime_pin_native_backward_and_merge(monkeypatch):
     identity = qwen_replay_arithmetic_identity(backend="native_fa3_v2")
     assert identity["attention_backward"] == "native_fa3"
     assert identity["master_dtype"] == "float32"
-    assert {"qwen_lora.py", "qwen_lora_ema.py", "qwen_vllm_arithmetic.py"} <= identity["implementation_sha256"].keys()
-    assert identity["categorical_rollout_arithmetic"] == "qwen3_vllm_native_nonattention_v1"
+    assert {"qwen_lora.py", "qwen_lora_ema.py", "qwen_vllm_arithmetic.py", "qwen_vllm_attention.py"} <= identity["implementation_sha256"].keys()
+    assert identity["categorical_rollout_arithmetic"] == "qwen3_vllm_native_attention_v2"
     assert "qwen_lora.py" not in qwen_replay_arithmetic_identity()["implementation_sha256"]
     with pytest.raises(RuntimeError):
         validate_qwen_replay_runtime(lambda key: "wrong" if key == "opd-fa3" else QWEN_REPLAY_RUNTIME_V2[key], backend="native_fa3_v2")

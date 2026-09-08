@@ -186,6 +186,11 @@ class vLLMRollout(BaseRollout):
             # Instance arithmetic hooks must be executed on every prefill/decode
             # call, including after the frozen actor's inference weights change.
             engine_kwargs["compilation_config"] = 0
+            if engine_kwargs.get("disable_cascade_attn", True) is not True:
+                raise ValueError("native Qwen categorical replay requires cascade attention disabled")
+            # Shared-prefix cascade separately normalizes and merges attention
+            # partitions. Packed actor replay uses one causal FA3 reduction.
+            engine_kwargs["disable_cascade_attn"] = True
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
@@ -514,6 +519,10 @@ class vLLMRollout(BaseRollout):
 
         result = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
         if self._frozen_batch_guard:
+            # Tensor metadata follows every subsequent shuffle and microbatch,
+            # preserving the origin of a failed density comparison.
+            result.batch["rollout_rank"] = torch.full(
+                (batch_size,), torch.distributed.get_rank(), dtype=torch.int64, device=idx.device)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             result.meta_info["rollout_timing"] = {

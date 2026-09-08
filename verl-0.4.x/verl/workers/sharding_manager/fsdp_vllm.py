@@ -271,12 +271,17 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         def install_arithmetic():
             from verl.opd.qwen_vllm_arithmetic import install_qwen_vllm_replay_arithmetic, verify_qwen_vllm_weights
+            from verl.opd.qwen_vllm_attention import install_qwen_vllm_attention, qwen_vllm_attention_telemetry
             identity = install_qwen_vllm_replay_arithmetic(
                 self.model_runner.model, self.model_config, backend="native_fa3_v2",
                 tensor_parallel_size=self.tp_size,
                 engine_config=self.inference_engine.llm_engine.get_vllm_config(),
             )
             identity.update(verify_qwen_vllm_weights(self.model_runner.model, params))
+            attention = [install_qwen_vllm_attention(layer.self_attn.attn.impl, telemetry_limit=32 if index == 0 else 0)
+                         for index, layer in enumerate(self.model_runner.model.model.layers)]
+            qwen_vllm_attention_telemetry(self.model_runner.model, reset=True)
+            identity.update(attention="opd_fa3_one_split", attention_layers=attention)
             self.inference_engine._opd_qwen_vllm_arithmetic = identity
 
         # Eager hooks live on the actual external-launcher worker model. This
@@ -330,6 +335,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             # and TP1 postprocessing contain no competing world collectives.
             # Even a fast healthy rank must wait here before sleeping its engine.
             self._guard_stage("rollout completion", completed)
+            from verl.opd.qwen_vllm_attention import qwen_vllm_attention_telemetry
+            self.last_rollout_timing["categorical_attention"] = self._guard_stage(
+                "attention telemetry", lambda: qwen_vllm_attention_telemetry(self.model_runner.model))
             started = time.perf_counter()
             self._guard_stage("memory release", self._release_after_rollout)
             self.last_rollout_timing["release_memory_seconds"] = time.perf_counter() - started

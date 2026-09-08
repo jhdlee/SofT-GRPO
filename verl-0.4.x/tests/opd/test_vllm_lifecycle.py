@@ -18,6 +18,13 @@ from test_deterministic_sampling import seed_module
 ROOT = Path(__file__).resolve().parents[2] / 'verl/workers'
 
 
+@pytest.fixture(autouse=True)
+def categorical_origin_rank(monkeypatch):
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 1)
+    from verl.opd import qwen_vllm_attention
+    monkeypatch.setattr(qwen_vllm_attention, 'qwen_vllm_attention_telemetry', lambda *args, **kwargs: [])
+
+
 def methods(path, name, names, namespace):
     tree = ast.parse(path.read_text())
     original = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
@@ -61,6 +68,7 @@ def manager(rank, exchange, events, *, enabled=True, sleep_error=False):
     obj = cls(); obj.inference_engine = engine; obj._frozen_batch_guard = enabled
     obj._opd_rng_switched = True; obj.torch_random_states = 'actor'; obj.device_mesh = object()
     obj.module = SimpleNamespace(train=lambda: events.append((rank, 'train')))
+    obj.model_runner = SimpleNamespace(model=object())
     obj.last_rollout_timing = {}
     return obj
 
@@ -193,6 +201,7 @@ def test_real_adapter_preserves_seed_groups_densities_and_metadata(groups):
     assert len(seeds) == len(set(seeds)) == 2 * groups
     assert all(params.n == 1 for _, params in obj.requests)
     assert result.batch['rollout_sampling_seed'].tolist() == seeds
+    assert result.batch['rollout_rank'].tolist() == [1] * (2 * groups)
     assert result.non_tensor_batch['privileged'].tolist() == ['gold-a'] * groups + ['gold-b'] * groups
     assert result.batch['rollout_log_probs'].shape == (2 * groups, 4)
     assert result.meta_info['rollout_timing']['generated_tokens'] == 4 * groups
