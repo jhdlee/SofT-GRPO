@@ -70,11 +70,12 @@ def qwen_replay_arithmetic_identity(*, backend="native_fa3_v1"):
     if backend not in ("native_fa3_v1", "native_fa3_v2"):
         raise ValueError("arithmetic identity requires a native Qwen backend")
     if backend == "native_fa3_v2":
-        names += ("qwen_lora.py", "qwen_lora_ema.py")
+        names += ("qwen_lora.py", "qwen_lora_ema.py", "qwen_vllm_arithmetic.py")
         return {"recipe": backend, "attention_backend": "opd_fa3", "attention_backward": "native_fa3",
                 "attention_num_splits": 1, "projection_tile": [32, 64, 32],
                 "forward_dtype": "bfloat16", "master_dtype": "float32", "rope_cache_dtype": "float32",
                 "adapter_merge": "fp32_fixed_tile_ba_scale_add_then_bf16_v1", "teacher_ema_space": "dense_effective_fp32",
+                "categorical_rollout_arithmetic": "qwen3_vllm_native_nonattention_v1",
                 "required_runtime_versions": dict(QWEN_REPLAY_RUNTIME_V2),
                 "implementation_sha256": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in names}}
     return {"recipe": "native_fa3_v1", "attention_backend": "fa3", "attention_num_splits": 1,

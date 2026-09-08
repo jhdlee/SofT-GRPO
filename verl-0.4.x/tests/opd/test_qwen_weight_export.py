@@ -18,6 +18,7 @@ import torch
 from safetensors.torch import load_file
 
 from verl.opd import qwen_weight_export as export
+from verl.opd import qwen_vllm_arithmetic
 from verl.opd.checkpoint_semantics import collective_checkpoint_stage
 from verl.opd.provenance import _canonical_sha256, _model_identity
 from verl.opd.qwen_lora import effective_projection_weight, qwen_lora_config
@@ -30,6 +31,12 @@ def cpu_fault_injection(monkeypatch):
     # These threaded stand-ins exercise collective ordering and local files.
     # Native CUDA export/merge arithmetic has its own real GPU acceptance.
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    # Structural/numerical installer contracts have their own CPU references.
+    # These stand-ins isolate matched entry phases and injected rank failures.
+    monkeypatch.setattr(qwen_vllm_arithmetic, 'install_qwen_vllm_replay_arithmetic',
+                        lambda model, *args, **kwargs: model.test_install_arithmetic())
+    monkeypatch.setattr(qwen_vllm_arithmetic, 'verify_qwen_vllm_weights',
+                        lambda model, weights: model.test_verify_weights(weights))
 
 
 class ThreadRanks:
@@ -119,6 +126,7 @@ def native_entry_managers(dist, events, *, failure=None, lora=False, vllm_bindin
             model.state_dict = state_dict
             def wake_up(tags=None): event('wake ' + tags[0])
             engine = SimpleNamespace(wake_up=wake_up, shutdown=lambda: events.append((rank, 'shutdown')))
+            engine.llm_engine = SimpleNamespace(get_vllm_config=lambda: object())
             cache_calls = 0
             rng = 'actor'
             def empty_cache():
@@ -149,7 +157,11 @@ def native_entry_managers(dist, events, *, failure=None, lora=False, vllm_bindin
                 **(vllm_bindings or {}),
             })
             obj = cls(); obj.module = model; obj.inference_engine = engine
-            obj.model_runner = SimpleNamespace(model=SimpleNamespace(load_weights=load_weights))
+            def install_arithmetic(): event('arithmetic install'); return {'recipe': 'test'}
+            def verify_weights(weights): event('weights verified'); return {'loaded_weights_exact': True}
+            obj.model_runner = SimpleNamespace(model=SimpleNamespace(load_weights=load_weights,
+                test_install_arithmetic=install_arithmetic, test_verify_weights=verify_weights))
+            obj.model_config = object()
             obj._frozen_batch_guard = True; obj._opd_rng_switched = False
             obj.tp_size = 1; obj.offload_param = True; obj.device_mesh = object(); obj.full_params = False
             obj.gen_random_states = 'generation'; obj.torch_random_states = 'actor'
@@ -215,6 +227,10 @@ def test_native_entry_materializes_full_and_lora_weights_before_local_loader(mon
         index for index, (_, name) in enumerate(events) if name == 'load weights')
     assert all(obj._opd_rng_switched and obj.base_sync_done for obj in objects)
     assert all(obj.last_rollout_timing['weight_transfer_seconds'] >= 0 for obj in objects)
+    assert all(obj.last_rollout_timing['categorical_arithmetic']['loaded_weights_exact'] for obj in objects)
+    for rank in range(2):
+        sequence = [name for r, name in events if r == rank]
+        assert sequence.index('load weights') < sequence.index('arithmetic install') < sequence.index('weights verified') < sequence.index('generation allowed')
     assert not any(name == 'shutdown' for _, name in events)
 
 
@@ -234,7 +250,7 @@ def test_legacy_entry_does_not_use_native_collective_export_or_entry_guards(monk
 
 @pytest.mark.parametrize('failure', [
     'actor load', 'state dict', 'configuration', 'local transfer', 'gather completed',
-    'wake weights', 'load weights', 'actor offload', 'empty final', 'wake kv_cache',
+    'wake weights', 'load weights', 'arithmetic install', 'weights verified', 'actor offload', 'empty final', 'wake kv_cache',
     'RNG switch', 'synchronize',
 ])
 def test_native_entry_failure_poisoned_collectively_before_generation(monkeypatch, failure):

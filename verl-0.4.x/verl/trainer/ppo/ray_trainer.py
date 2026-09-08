@@ -2503,7 +2503,7 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 iteration_started_at = time.perf_counter()
-                capacity_stage("generation", rollout_iteration, timing_raw, metrics, gen_batch.meta_info)
+                capacity_stage("generation", rollout_iteration, timing_raw, metrics, gen_batch.meta_info, update_state="not_started")
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):

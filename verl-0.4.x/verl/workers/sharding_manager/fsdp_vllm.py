@@ -268,6 +268,20 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.update_params(params, peft_config=None)
 
         self._guard_stage("dense weight update", update_local)
+
+        def install_arithmetic():
+            from verl.opd.qwen_vllm_arithmetic import install_qwen_vllm_replay_arithmetic, verify_qwen_vllm_weights
+            identity = install_qwen_vllm_replay_arithmetic(
+                self.model_runner.model, self.model_config, backend="native_fa3_v2",
+                tensor_parallel_size=self.tp_size,
+                engine_config=self.inference_engine.llm_engine.get_vllm_config(),
+            )
+            identity.update(verify_qwen_vllm_weights(self.model_runner.model, params))
+            self.inference_engine._opd_qwen_vllm_arithmetic = identity
+
+        # Eager hooks live on the actual external-launcher worker model. This
+        # matched phase finishes on every rank before any new requests start.
+        self._guard_stage("native rollout arithmetic", install_arithmetic)
         del params
         self._guard_stage("actor offload", lambda: offload_fsdp_model_to_cpu(self.module) if self.offload_param else None)
         self._guard_stage("entry cache release", lambda: get_torch_device().empty_cache())
@@ -283,7 +297,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self._guard_stage("entry RNG switch", switch_rng)
         self._guard_stage("entry synchronization", lambda: get_torch_device().synchronize())
         self.last_rollout_timing = {"weight_transfer_seconds": time.perf_counter() - transfer_started,
-                                   "sharding_enter_seconds": time.perf_counter() - entered_at}
+                                   "sharding_enter_seconds": time.perf_counter() - entered_at,
+                                   "categorical_arithmetic": dict(self.inference_engine._opd_qwen_vllm_arithmetic)}
 
     def _guard_stage(self, stage, operation):
         from verl.opd.vllm_lifecycle import finish_vllm_stage

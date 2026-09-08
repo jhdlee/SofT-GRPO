@@ -180,6 +180,12 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        if self._frozen_batch_guard:
+            if config.enforce_eager is not True or engine_kwargs.get("compilation_config", 0) != 0:
+                raise ValueError("native Qwen categorical replay requires eager execution without compilation")
+            # Instance arithmetic hooks must be executed on every prefill/decode
+            # call, including after the frozen actor's inference weights change.
+            engine_kwargs["compilation_config"] = 0
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
