@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.util
 import json
 import math
 import os
@@ -17,6 +18,8 @@ import sys
 import time
 
 from .manifest import canonical_sha256, file_sha256, validate_sealed_content, write_manifest_atomic
+from .qwen_acceptance import validate_fsdp_probe, validate_measurement_physical_memory
+from .qwen_site import site_from_manifest, validate_artifact_path, validate_scheduler_allocation
 from .training_capacity import classify_failure, finite_snapshot
 
 
@@ -74,6 +77,11 @@ def validate_iteration(record, *, arm_id, phase):
         raise ValueError("invalid student gradient norm")
     if not 0 <= number(metrics, "actor/gradient_clipfrac") <= 1:
         raise ValueError("invalid clipping-frequency diagnostic")
+    if hard:
+        if number(metrics, "integrity/continuous_replay_active") != 0:
+            raise ValueError("hard production requires categorical replay")
+        if not 0 <= number(metrics, "replay/ratio_abs_error_max") <= 1e-4:
+            raise ValueError("categorical replay acceptance exceeds existing 1e-4 tolerance")
     if not hard:
         if number(metrics, "integrity/continuous_replay_active") != 1 or number(metrics, "replay/fallback_count") != 0:
             raise ValueError("native continuous replay is required without fallback")
@@ -117,6 +125,35 @@ def validate_iteration(record, *, arm_id, phase):
 
 def requires_semantic_checkpoint(manifest):
     return manifest.get("profile_id") == "qwen3-math-seven-arm-lora-fa3-v1"
+
+
+def validate_measurement(measured, manifest, row, phase, arguments):
+    """Independently validate complete phase output and its sealed memory policy."""
+    suffix = "resume" if phase in {"split", "resume"} else phase
+    run_id = row["wandb_run_id"] + ("" if phase == "production" else "-" + suffix)
+    if measured.get("phase") != phase or measured.get("arm_id") != row["arm_id"]:
+        raise ValueError("phase measurement identity differs")
+    if measured.get("status") != "complete":
+        raise ValueError(f"{phase} did not publish completed measurement")
+    if (measured.get("wandb_run_id") != run_id or measured.get("wandb_online") is not True
+            or measured.get("wandb_finished") is not True):
+        raise ValueError("phase lacks finished online W&B identity")
+    records = measured.get("iterations")
+    if not isinstance(records, list) or not records or any(not isinstance(item, dict) for item in records):
+        raise ValueError("phase returned without accepted iteration evidence")
+    indices = [record.get("rollout_iteration") for record in records]
+    if phase != "production":
+        expected = {"uninterrupted": [0, 1], "split": [0], "resume": [1],
+                    "full_dose": [0], "zero_dose": [0]}[phase]
+        if indices != expected:
+            raise ValueError("prologue invocation did not complete the expected iterations")
+    elif (any(type(index) is not int or not 0 <= index < 109 for index in indices)
+          or indices != list(range(indices[0], indices[0] + len(indices)))):
+        raise ValueError("production iteration evidence is not a consecutive bounded segment")
+    for record in records:
+        validate_iteration(record, arm_id=row["arm_id"], phase=phase)
+    validate_measurement_physical_memory(measured, arguments, world_size=4,
+                                         required=requires_semantic_checkpoint(manifest))
 
 
 def authenticate_checkpoint(root, step, *, arm_id, teacher=True, require_semantic=False):
@@ -179,6 +216,55 @@ def select_arm(manifest, arm):
     return matches[0]
 
 
+def verify_hard_long_replay(manifest_path, manifest, row, record):
+    """Recompute the diagnostic gates and bind their files to this allocation."""
+    if row["arm_id"] != "hardgrpo_math_s11":
+        return
+    evidence = record.get("runtime", {}).get("hard_long_replay_acceptance")
+    if not isinstance(evidence, dict):
+        raise ValueError("GPU allocation lacks categorical long replay acceptance")
+    expected = {"job_id": record["job_id"], "restart_count": record["restart_count"],
+                "arm_id": row["arm_id"], "manifest_sha256": file_sha256(manifest_path),
+                "parent_commit": manifest["parent_commit"], "fork_commit": manifest["fork_commit"]}
+    if (evidence.get("binding") != expected
+            or type(evidence.get("binding", {}).get("restart_count")) is not int):
+        raise ValueError("categorical long replay belongs to a different source or allocation")
+    relative = evidence.get("path")
+    if not isinstance(relative, str) or Path(relative).is_absolute():
+        raise ValueError("invalid categorical long replay evidence path")
+    root = Path(row["run_root"]).resolve()
+    path = root / relative
+    segment = root / "segments" / f"preflight-{record['job_id']}-{record['restart_count']}"
+    if (path.is_symlink() or not path.resolve().is_relative_to(segment)
+            or not path.is_file() or file_sha256(path) != evidence.get("sha256")):
+        raise ValueError("categorical long replay evidence changed or escapes its allocation")
+    log = path.with_name("probe.log")
+    if log.is_symlink() or not log.is_file() or file_sha256(log) != evidence.get("log_sha256"):
+        raise ValueError("categorical long replay log evidence changed")
+    diagnostic = read_json(path)
+    budget = evidence.get("time_limit_seconds")
+    if (type(budget) is not int or not 60 <= budget <= 1170
+            or type(diagnostic.get("time_limit_seconds")) is not int
+            or diagnostic["time_limit_seconds"] != budget or diagnostic.get("job_id") != record["job_id"]):
+        raise ValueError("categorical long replay report job or preflight budget differs")
+    runtime = diagnostic.get("runtime", {})
+    runtime_root = Path(row["environment_root"]).resolve()
+    if (runtime.get("root") != str(runtime_root)
+            or runtime.get("manifest_sha256") != file_sha256(runtime_root / "opd-runtime-manifest.json")
+            or runtime.get("source") != {key: manifest[key] for key in ("parent_commit", "fork_commit")}
+            or diagnostic.get("assets_manifest_sha256") != file_sha256(Path(manifest["assets_root"]) / "manifest.json")
+            or runtime.get("verifier_sha256") != file_sha256(Path(manifest["source_root"]) / "scripts/qwen_runtime.py")):
+        raise ValueError("categorical long replay runtime or assets differ from the sealed study")
+    source = Path(manifest["source_root"]) / "scripts/qwen_vllm_long_replay_diagnostic.py"
+    if evidence.get("probe_sha256") != file_sha256(source) or diagnostic.get("source_sha256") != evidence["probe_sha256"]:
+        raise ValueError("categorical long replay probe source differs from the sealed study")
+    spec = importlib.util.spec_from_file_location("sealed_production_long_replay", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if module.validate_report(path) != evidence.get("acceptance"):
+        raise ValueError("categorical long replay acceptance differs from recomputed evidence")
+
+
 def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count):
     """Bind four real GPU preflight results to this source and Slurm segment."""
     if not requires_semantic_checkpoint(manifest):
@@ -194,9 +280,15 @@ def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count
                 "arm_id": row["arm_id"], "manifest_sha256": file_sha256(manifest_path)}
     if any(record.get(key) != value for key, value in expected.items()):
         raise ValueError("GPU allocation does not match the current job, source manifest, and arm")
+    if "site" in manifest:
+        site = site_from_manifest(manifest)
+        if record.get("site") != site:
+            raise ValueError("GPU allocation differs from the sealed site")
+        validate_scheduler_allocation(record.get("scheduler"), site, account=row["account"])
     runtime = record.get("runtime", {})
     if not isinstance(runtime, dict):
         raise ValueError("GPU allocation runtime record is malformed")
+    validate_fsdp_probe(runtime.get("native_lora_fsdp_acceptance"), world_size=4)
     unified = runtime.get("unified")
     if not isinstance(unified, dict):
         raise ValueError("GPU allocation lacks the sealed unified runtime")
@@ -214,12 +306,15 @@ def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count
                 "dtype": "bfloat16", "head_dimension": 128,
                 "vllm_flash_attention_version": 3, "vllm_kernel": "vllm._vllm_fa3_C",
                 "packed_causal_gradient_isolation": True, "long_packed_lengths": [8192, 8192]}
+    gpu = site_from_manifest(manifest)["gpu"]
     for item in acceptance:
         device = devices[item["device"]]
-        if (not isinstance(device, dict) or "H100" not in str(device.get("name"))
+        if (not isinstance(device, dict) or gpu["name_contains"] not in str(device.get("name"))
                 or item.get("name") != device.get("name") or any(item.get(key) != value for key, value in required.items())
                 or any(item.get(key) is not value for key, value in required.items() if isinstance(value, bool))):
             raise ValueError("GPU allocation native FA3 kernel, shape, or device acceptance differs")
+        if "site" in manifest and device.get("compute_capability") != gpu["compute_capability"]:
+            raise ValueError("GPU allocation compute capability differs from the sealed site")
         hashes = item.get("long_output_gradient_sha256")
         if not isinstance(hashes, list) or len(hashes) != 4 or any(
                 not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value) for value in hashes):
@@ -230,11 +325,16 @@ def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count
                 "frozen_base_unchanged": True, "dense_export_weight_exact": True,
                 "dense_export_projection_exact": True, "teacher_or_training_data_used": False}.items()):
             raise ValueError("GPU allocation lacks controlled native LoRA acceptance")
+        if any(lora.get(key) is not expected for key, expected in {
+                "frozen_base_unchanged": True, "dense_export_weight_exact": True,
+                "dense_export_projection_exact": True, "teacher_or_training_data_used": False}.items()):
+            raise ValueError("controlled LoRA acceptance booleans differ")
         norms = lora.get("adapter_gradient_norms")
         if (not isinstance(norms, list) or len(norms) != 2
                 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in norms)
                 or number(lora.get("effective_update", {}), "changed_elements") <= 0):
             raise ValueError("GPU allocation lacks finite controlled LoRA gradients and an effective BF16 update")
+    verify_hard_long_replay(manifest_path, manifest, row, record)
     return {"path": relative, "sha256": file_sha256(path), "job_id": job_id,
             "restart_count": restart_count, "device_count": 4}
 
@@ -258,14 +358,30 @@ def verify_admission(manifest_path, manifest, row):
         raise ValueError("missing source-bound exact-resume admission")
     # Check durable comparison evidence, not only a mutable boolean.
     for relative, digest in admission["evidence_files"].items():
+        if not isinstance(relative, str) or Path(relative).is_absolute():
+            raise ValueError("invalid admission evidence path")
         path = Path(row["run_root"]) / relative
-        if path.is_symlink() or not path.is_file() or file_sha256(path) != digest:
+        if (path.is_symlink() or not path.resolve().is_relative_to(Path(row["run_root"]).resolve())
+                or not path.is_file() or file_sha256(path) != digest):
             raise ValueError("admission evidence changed")
     if admission["resume_parity"].get("passed") is not True:
         raise ValueError("exact next-update resume was not accepted")
     if requires_semantic_checkpoint(manifest) and admission["resume_parity"].get("schema") != "qwen_semantic_v1":
         raise ValueError("this production profile requires semantic next-update admission")
     verify_gpu_evidence(manifest_path, manifest, row, admission, restart_count=0)
+    if requires_semantic_checkpoint(manifest):
+        phases = ["uninterrupted", "split", "resume"]
+        if row["arm_id"].startswith("softgrpo_math_opd"):
+            phases.extend(["full_dose", "zero_dose"])
+            if (admission.get("zero_dose_parity", {}).get("passed") is not True
+                    or admission["zero_dose_parity"].get("schema") != "qwen_semantic_v1"):
+                raise ValueError("this production profile requires semantic zero-dose admission")
+        for phase in phases:
+            output = Path(row["phases"][phase]["output"])
+            relative = str(output.relative_to(Path(row["run_root"])))
+            if admission["evidence_files"].get(relative) != file_sha256(output):
+                raise ValueError("admission phase measurement is not authenticated")
+            validate_measurement(read_json(output), manifest, row, phase, row["production_overrides"])
     return admission
 
 
@@ -279,6 +395,19 @@ def verify_continuation(manifest_path, manifest, row):
     if type(step) is not int or not 0 < step < 109:
         raise ValueError("invalid continuation boundary")
     verify_gpu_evidence(manifest_path, manifest, row, continuation, restart_count=continuation.get("restart_count"))
+    if requires_semantic_checkpoint(manifest):
+        output = Path(row["phases"]["production"]["output"])
+        if continuation["restart_count"]:
+            output = output.with_name(f"measurement-{continuation['restart_count']}.json")
+        relative = str(output.relative_to(Path(row["run_root"])))
+        digest = file_sha256(output)
+        if (continuation.get("production_measurement") != {"path": relative, "sha256": digest}
+                or continuation.get("evidence_files", {}).get(relative) != digest):
+            raise ValueError("continuation production measurement is not authenticated")
+        measured = read_json(output)
+        validate_measurement(measured, manifest, row, "production", row["production_overrides"])
+        if measured["iterations"][-1]["rollout_iteration"] + 1 != step:
+            raise ValueError("continuation measurement differs from the checkpoint boundary")
     checkpoint = authenticate_checkpoint(row["phases"]["production"]["run_dir"], step, arm_id=row["arm_id"],
                                          require_semantic=requires_semantic_checkpoint(manifest))
     path = Path(row["phases"]["production"]["run_dir"]) / f"global_step_{step}" / "checkpoint_manifest.json"
@@ -294,11 +423,17 @@ class ProductionController:
         self.manifest = verify_manifest(args.manifest)
         self.row = select_arm(self.manifest, args.arm)
         self.root = Path(self.row["run_root"])
+        validate_artifact_path(self.root, site_from_manifest(self.manifest), label="production run root")
         self.root.mkdir(parents=True, exist_ok=True)
         self.child = None
         self.phase = "initialization"
         self.started = time.monotonic()
-        self.deadline = self.started + args.prologue_limit_seconds - max(0.0, time.time() - float(os.environ.get("OPD_PROLOGUE_STARTED_EPOCH", time.time())))
+        limit = self.manifest.get("prologue_limit_seconds", 7200)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("invalid authenticated production prologue budget")
+        if getattr(args, "prologue_limit_seconds", None) not in (None, limit):
+            raise ValueError("prologue budget differs from the authenticated manifest")
+        self.deadline = self.started + limit - max(0.0, time.time() - float(os.environ.get("OPD_PROLOGUE_STARTED_EPOCH", time.time())))
         self.restart = int(os.environ.get("SLURM_RESTART_COUNT", "0"))
         self.report = {"schema_version": 1, "arm_id": args.arm, "status": "running",
                        "job_id": os.environ.get("SLURM_JOB_ID"), "restart_count": self.restart,
@@ -388,19 +523,7 @@ class ProductionController:
             if code:
                 raise RuntimeError(f"{phase} trainer exited with code {code}")
             measured = read_json(output)
-            if measured.get("phase") != phase or measured.get("arm_id") != self.args.arm:
-                raise ValueError("phase measurement identity differs")
-            if measured.get("status") != "complete":
-                raise ValueError(f"{phase} did not publish completed measurement")
-            if measured.get("wandb_run_id") != run_id or measured.get("wandb_online") is not True or measured.get("wandb_finished") is not True:
-                raise ValueError("phase lacks finished online W&B identity")
-            records = measured.get("iterations", [])
-            if phase != "production":
-                expected_indices = {"uninterrupted": [0, 1], "split": [0], "resume": [1], "full_dose": [0], "zero_dose": [0]}[phase]
-                if [record.get("rollout_iteration") for record in records] != expected_indices:
-                    raise ValueError("prologue invocation did not complete the expected iterations")
-            for record in records:
-                validate_iteration(record, arm_id=self.args.arm, phase=phase)
+            validate_measurement(measured, self.manifest, self.row, phase, command[3:])
             self.report["phases"][phase].update(status="complete", measurement_sha256=file_sha256(output))
             return measured
         except BaseException as error:
@@ -453,7 +576,7 @@ class ProductionController:
             hybrid = authenticate_checkpoint(self.row["phases"]["uninterrupted"]["run_dir"], 1, arm_id=self.args.arm, require_semantic=requires_semantic_checkpoint(self.manifest))
             result["zero_dose_parity"] = compare_checkpoints(baseline, hybrid, include_teacher=False, require_semantic=requires_semantic_checkpoint(self.manifest))
         if time.monotonic() > self.deadline:
-            raise TimeoutError("two-hour correctness prologue exceeded its allocation budget")
+            raise TimeoutError("correctness prologue exceeded its authenticated allocation budget")
         result["wall_seconds"] = time.monotonic() - self.started
         result["evidence_files"] = {}
         for phase in self.report["phases"]:
@@ -472,7 +595,7 @@ class ProductionController:
         old_handlers = {}
         def interrupted(signum, frame):
             if signum == signal.SIGALRM:
-                raise TimeoutError("two-hour correctness prologue deadline reached")
+                raise TimeoutError("correctness prologue authenticated deadline reached")
             raise RuntimeError(f"production controller interrupted by signal {signum}")
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
             old_handlers[signum] = signal.signal(signum, interrupted)
@@ -517,6 +640,10 @@ class ProductionController:
                     raise ValueError("GPU allocation evidence changed during production")
                 continuation["gpu_allocation"] = allocation
                 continuation["evidence_files"] = {allocation["path"]: allocation["sha256"]}
+                output = Path(self.report["phases"]["production"]["output"])
+                relative, digest = str(output.relative_to(self.root)), file_sha256(output)
+                continuation["production_measurement"] = {"path": relative, "sha256": digest}
+                continuation["evidence_files"][relative] = digest
             write_json(self.root / "continuation.json", continuation, seal=True)
             self.report["status"] = "continuation_ready"
             return 75
@@ -538,11 +665,9 @@ def main(argv=None):
     parser.add_argument("command", choices=("run", "verify-continuation"))
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--arm", required=True)
-    parser.add_argument("--prologue-limit-seconds", type=int, default=7200)
+    parser.add_argument("--prologue-limit-seconds", type=int)
     parser.add_argument("--signal-file", type=Path)
     args = parser.parse_args(argv)
-    if args.prologue_limit_seconds != 7200:
-        parser.error("production correctness prologue is capped at exactly two hours")
     from .qwen_production import verify_manifest
     if args.command == "verify-continuation":
         manifest = verify_manifest(args.manifest)

@@ -12,21 +12,23 @@ import pytest
 from opd_tools.qwen_production_controller import (
     compare_checkpoints, validate_iteration, verify_admission,
     verify_continuation, ProductionController, write_json, requires_semantic_checkpoint,
-    verify_gpu_allocation, verify_gpu_evidence,
+    verify_gpu_allocation, verify_gpu_evidence, validate_measurement, verify_hard_long_replay,
 )
 from opd_tools.manifest import file_sha256
+from opd_tools.qwen_acceptance import PHYSICAL_RESOURCE_POLICY, validate_fsdp_probe, validate_physical_memory
 
 
 def iteration(arm='softgrpo_math_opd_s11', index=0, phase='full_dose'):
+    arm = 'softgrpo_math_s11' if phase == 'zero_dose' else arm
     standalone = arm == 'softopd_math_s11'
     enabled = standalone or arm.startswith('softgrpo_math_opd')
     ema = enabled and arm != 'softgrpo_math_opd_current_s11'
     base = .1 if arm.endswith('beta0p1_s11') else 1
-    beta = base if enabled and (phase == 'full_dose' or standalone) else base * index / 11 if enabled else 0
+    beta = base if enabled and (phase == 'full_dose' or standalone) else base * min(1, index / 11) if enabled else 0
     return {'rollout_iteration': index, 'trajectory_count': 64 if standalone else 512,
             'metrics': {'trainer/rollout_iteration': index, 'trainer/optimizer_steps_this_iteration': 2,
                         'trainer/optimizer_step': 2*(index+1), 'grad/total_norm': 1.6,
-                        'actor/gradient_clipfrac': 1, 'integrity/continuous_replay_active': 1,
+                        'actor/gradient_clipfrac': 1, 'integrity/continuous_replay_active': int(arm != 'hardgrpo_math_s11'),
                         'replay/fallback_count': 0, 'replay/ratio_abs_error_max': 2e-6,
                         'latent/soft_to_hard_rate': .8, 'opd/beta_effective': beta,
                         'opd/ema_updates_this_iteration': int(ema),
@@ -37,6 +39,48 @@ def iteration(arm='softgrpo_math_opd_s11', index=0, phase='full_dose'):
                  'ema_updates_this_iteration': int(ema), 'ema_update_count': index+1 if ema else 0,
                  'worker_update_seconds': 10, 'policy_update_seconds': 8,
                  'max_memory_allocated_gib': 61, 'max_memory_reserved_gib': 75} for rank in range(4)]}}
+
+
+def physical_iteration(arm='softgrpo_math_opd_s11', index=0, phase='full_dose'):
+    record = iteration(arm, index, phase)
+    timing = record['actor_update_timing']
+    scope = 'update_actor entry through policy completion; excludes rollout and final offload'
+    for rank in timing['ranks']:
+        total, used = 80 * 1024**3, (74 + rank['rank']) * 1024**3
+        rank['physical_memory'] = {
+            'source': 'cuda_mem_get_info', 'scope': scope,
+            'sampling': 'start, periodic, final; observed peak may miss sub-interval spikes',
+            'sample_interval_seconds': .1, 'sample_count': 6,
+            'device_total_bytes': total, 'device_used_peak_bytes': used,
+            'device_free_min_bytes': total - used, 'start_free_bytes': 20 * 1024**3,
+            'final_free_bytes': 6 * 1024**3, 'observed_seconds': .42,
+            'host_ram_scope': 'whole-node utilization is diagnostic; Slurm enforces the job memory allocation'}
+    timing.update(resource_policy=copy.deepcopy(PHYSICAL_RESOURCE_POLICY), physical_memory_scope=scope,
+                  logical_allocator_peaks_diagnostic_only=True, physical_device_used_peak_gib=77.,
+                  physical_device_free_min_gib=3., physical_device_used_fraction_peak=77/80)
+    return record
+
+
+def measured_phase(row, phase):
+    suffix = 'resume' if phase in ('split', 'resume') else phase
+    indices = {'production': [0], 'uninterrupted': [0, 1], 'split': [0], 'resume': [1],
+               'full_dose': [0], 'zero_dose': [0]}[phase]
+    return {'phase': phase, 'arm_id': row['arm_id'], 'status': 'complete',
+            'wandb_run_id': row['wandb_run_id'] + ('' if phase == 'production' else '-' + suffix),
+            'wandb_online': True, 'wandb_finished': True,
+            'configuration': {key: {'resource_policy': copy.deepcopy(PHYSICAL_RESOURCE_POLICY)}
+                              for key in ('trainer', 'actor_rollout_ref')},
+            'acceptance_policy': {'resource_policy': copy.deepcopy(PHYSICAL_RESOURCE_POLICY)},
+            'iterations': [physical_iteration(row['arm_id'], index, phase) for index in indices]}
+
+
+def fsdp_acceptance(world_size=4):
+    return {'schema_version': 1, 'status': 'passed', 'world_size': world_size, 'ranks': [
+        {'rank': rank, 'optimizer_steps': 2, 'dense_ema_updates': 1, 'wrapper_count': 3,
+         'frozen_base_unchanged': True, 'base_gradients_absent': True,
+         'adapter_gradients_finite': True, 'adapter_update_nonzero': True,
+         'disabled_reference_exact': True, 'dense_export_exact': True,
+         'current_actor_detached': True} for rank in range(world_size)]}
 
 
 @pytest.mark.parametrize('arm', ['hardgrpo_math_s11','softgrpo_math_s11','softopd_math_s11',
@@ -170,11 +214,16 @@ def gpu_allocation(tmp_path, *, job_id='470999', restart=0):
     unified = write_json(tmp_path / 'runtime.json', {'build_record': {'source': {
         key: manifest[key] for key in ('parent_commit', 'fork_commit')}}}, seal=True)
     manifest['runtime_manifest'] = {'manifest_content_sha256': unified['manifest_content_sha256']}
-    row = {'run_root': str(tmp_path), 'arm_id': 'softgrpo_math_opd_s11'}
+    row = {'run_root': str(tmp_path), 'arm_id': 'softgrpo_math_opd_s11', 'wandb_run_id': 'test-run',
+           'production_overrides': ['++trainer.resource_policy=' + json.dumps(PHYSICAL_RESOURCE_POLICY)],
+           'phases': {phase: {'output': str(tmp_path / phase / 'measurement.json')}
+                      for phase in ('production', 'uninterrupted', 'split', 'resume', 'full_dose', 'zero_dose')}}
+    for phase in row['phases']:
+        write_json(row['phases'][phase]['output'], measured_phase(row, phase))
     devices = [{'name': 'NVIDIA H100 80GB HBM3', 'total_memory_bytes': 80 * 1024**3} for _ in range(4)]
     result = {'status': 'passed', 'job_id': job_id, 'restart_count': restart,
               'arm_id': row['arm_id'], 'manifest_sha256': file_sha256(manifest_path), 'devices': devices,
-              'runtime': {'unified': unified, 'native_fa3_acceptance': [{
+              'runtime': {'unified': unified, 'native_lora_fsdp_acceptance': fsdp_acceptance(), 'native_fa3_acceptance': [{
                   'device': index, 'name': devices[index]['name'], 'native_fa3_forward_backward': True,
                   'fresh_process_exact_match': True,
                   'native_kernel': 'opd_fa3._C', 'dtype': 'bfloat16', 'head_dimension': 128,
@@ -236,7 +285,10 @@ def test_new_admission_seals_gpu_file_and_rechecks_it_for_continuation(tmp_path)
                  'submission_manifest_sha256': file_sha256(manifest_path),
                  'parent_commit': manifest['parent_commit'], 'fork_commit': manifest['fork_commit'],
                  'resume_parity': {'passed': True, 'schema': 'qwen_semantic_v1'},
+                 'zero_dose_parity': {'passed': True, 'schema': 'qwen_semantic_v1'},
                  'gpu_allocation': allocation, 'evidence_files': {allocation['path']: allocation['sha256']}}
+    admission['evidence_files'].update({str(Path(details['output']).relative_to(tmp_path)): file_sha256(details['output'])
+                                       for phase, details in row['phases'].items() if phase != 'production'})
     write_json(tmp_path / 'admission.json', admission, seal=True)
     assert verify_admission(manifest_path, manifest, row)['gpu_allocation'] == allocation
     missing = copy.deepcopy(admission); missing['evidence_files'] = {}
@@ -290,7 +342,7 @@ def test_invocation_project_and_import_path_match_manifest_and_phase(tmp_path, m
         (root / 'verl').mkdir(parents=True)
         (root / 'verl/__init__.py').write_text(f'identity = {marker!r}\n')
     controller.manifest = {'source_root': str(source_root)}
-    controller.row = {'wandb_run_id': 'test-run', 'phases': {
+    controller.row = {'arm_id': arm, 'wandb_run_id': 'test-run', 'phases': {
         phase: {'directory': str(directory), 'output': str(output)}}}
     if revised:
         controller.row['wandb_project'] = PRODUCTION_PROJECT + '-lora-fa3'
@@ -316,13 +368,11 @@ def test_invocation_project_and_import_path_match_manifest_and_phase(tmp_path, m
         stdout, stderr = probe.communicate(timeout=10)
         assert probe.returncode == 0, stderr
         assert stdout.strip() == ('wheel' if revised else 'source')
-        write_json(output, {'phase': phase, 'arm_id': arm, 'status': 'complete',
-                            'wandb_run_id': kwargs['env']['WANDB_RUN_ID'],
-                            'wandb_online': True, 'wandb_finished': True,
-                            'iterations': [] if phase == 'production' else [iteration(arm, phase=phase)]})
+        write_json(output, measured_phase(controller.row, phase))
         return SimpleNamespace(wait=lambda timeout: 0)
 
-    monkeypatch.setattr('opd_tools.qwen_production.phase_command', lambda *args, **kwargs: ['python', 'trainer'])
+    monkeypatch.setattr('opd_tools.qwen_production.phase_command', lambda *args, **kwargs: ['python', '-m', 'trainer',
+        '++trainer.resource_policy=' + json.dumps(PHYSICAL_RESOURCE_POLICY)])
     monkeypatch.setattr('opd_tools.qwen_production_controller.subprocess.Popen', launch)
     monkeypatch.setattr('opd_tools.icl_resource_monitor.ResourceMonitor', lambda **kwargs: SimpleNamespace(
         start=lambda: None, stop=lambda: SimpleNamespace(to_dict=lambda: {})))
@@ -349,7 +399,7 @@ def test_real_admission_publishes_gpu_certificate_and_continuation_reuses_it(tmp
     controller.report = {'submission_manifest_sha256': file_sha256(manifest_path), 'job_id': '470999', 'phases': {}}
     def invoke(phase, **kwargs):
         output = Path(row['phases'][phase]['output']); output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text('{}'); controller.report['phases'][phase] = {}
+        write_json(output, measured_phase(row, phase)); controller.report['phases'][phase] = {}
     controller.invoke = invoke
     monkeypatch.setattr('opd_tools.qwen_production_controller.authenticate_checkpoint', lambda *args, **kw: semantic_checkpoint())
     admission = controller.admission()
@@ -363,6 +413,13 @@ def test_real_admission_publishes_gpu_certificate_and_continuation_reuses_it(tmp
                     'admission_sha256': accepted['manifest_content_sha256'],
                     'checkpoint_manifest_sha256': file_sha256(checkpoint_path),
                     'gpu_allocation': allocation, 'evidence_files': {allocation['path']: allocation['sha256']}}
+    measured = measured_phase(row, 'production')
+    measured['iterations'] = [physical_iteration(row['arm_id'], 24, 'production')]
+    output = Path(row['phases']['production']['output'])
+    write_json(output, measured)
+    relative, digest = str(output.relative_to(tmp_path)), file_sha256(output)
+    continuation['production_measurement'] = {'path': relative, 'sha256': digest}
+    continuation['evidence_files'][relative] = digest
     write_json(tmp_path / 'continuation.json', continuation, seal=True)
     monkeypatch.setattr('opd_tools.qwen_production_controller.authenticate_checkpoint', lambda *args, **kw: {'reason': 'requeue_signal'})
     assert verify_continuation(manifest_path, manifest, row)['global_step'] == 25
@@ -370,3 +427,218 @@ def test_real_admission_publishes_gpu_certificate_and_continuation_reuses_it(tmp
     write_json(tmp_path / 'continuation.json', continuation, seal=True)
     with pytest.raises(ValueError, match='sealed evidence'):
         verify_continuation(manifest_path, manifest, row)
+
+
+@pytest.mark.parametrize('phase', ['split', 'production'])
+@pytest.mark.parametrize('field,value', [('integrity/continuous_replay_active', 1),
+                                       ('replay/ratio_abs_error_max', 1.001e-4),
+                                       ('replay/ratio_abs_error_max', float('nan'))])
+def test_hard_categorical_replay_checked_in_prologue_and_production(phase, field, value):
+    record = iteration('hardgrpo_math_s11', phase=phase)
+    record['metrics'][field] = value
+    with pytest.raises(ValueError, match='replay'):
+        validate_iteration(record, arm_id='hardgrpo_math_s11', phase=phase)
+
+
+@pytest.mark.parametrize('world_size', [2, 4])
+@pytest.mark.parametrize('mutation', ['missing', 'world_size', 'duplicate', 'rank_bool', 'rank_failure', 'cadence_bool'])
+def test_shared_fsdp_probe_rejects_missing_or_wrong_rank_evidence(world_size, mutation):
+    value = fsdp_acceptance(world_size)
+    assert validate_fsdp_probe(value, world_size=world_size) == value
+    if mutation == 'missing': value['ranks'].pop()
+    elif mutation == 'world_size': value['world_size'] = 4 if world_size == 2 else 2
+    elif mutation == 'duplicate': value['ranks'][-1]['rank'] = 0
+    elif mutation == 'rank_bool': value['ranks'][0]['rank'] = False
+    elif mutation == 'rank_failure': value['ranks'][-1]['dense_export_exact'] = False
+    elif mutation == 'cadence_bool': value['ranks'][-1]['dense_ema_updates'] = True
+    with pytest.raises(ValueError, match='LoRA/FSDP'):
+        validate_fsdp_probe(value, world_size=world_size)
+
+
+@pytest.mark.parametrize('mutation', ['missing_fsdp', 'two_ranks', 'fourth_rank_failed'])
+def test_production_allocation_requires_real_four_rank_fsdp(tmp_path, mutation):
+    path, manifest, row, certificate_path, certificate = gpu_allocation(tmp_path)
+    runtime = certificate['runtime']
+    if mutation == 'missing_fsdp': del runtime['native_lora_fsdp_acceptance']
+    elif mutation == 'two_ranks': runtime['native_lora_fsdp_acceptance'] = fsdp_acceptance(2)
+    else: runtime['native_lora_fsdp_acceptance']['ranks'][3]['frozen_base_unchanged'] = False
+    write_json(certificate_path, certificate)
+    with pytest.raises(ValueError, match='LoRA/FSDP'):
+        verify_gpu_allocation(path, manifest, row, job_id='470999', restart_count=0)
+
+
+@pytest.mark.parametrize('phase', ['production', 'uninterrupted', 'split', 'resume', 'full_dose', 'zero_dose'])
+@pytest.mark.parametrize('mutation', ['missing_rank', 'duplicate_rank', 'missing_policy', 'fraction', 'aggregate', 'scope'])
+def test_every_phase_independently_checks_four_rank_physical_memory(tmp_path, phase, mutation):
+    _, manifest, row, _, _ = gpu_allocation(tmp_path)
+    measured = measured_phase(row, phase)
+    validate_measurement(measured, manifest, row, phase, row['production_overrides'])
+    timing = measured['iterations'][-1]['actor_update_timing']
+    if mutation == 'missing_rank': del timing['ranks'][3]['physical_memory']
+    elif mutation == 'duplicate_rank': timing['ranks'][3]['rank'] = 2
+    elif mutation == 'missing_policy': del measured['configuration']['actor_rollout_ref']['resource_policy']
+    elif mutation == 'fraction':
+        observation = timing['ranks'][3]['physical_memory']
+        observation.update(device_total_bytes=100, device_used_peak_bytes=98, device_free_min_bytes=2,
+                           start_free_bytes=20, final_free_bytes=6)
+    elif mutation == 'aggregate': timing['physical_device_used_fraction_peak'] = .8
+    else: timing['physical_memory_scope'] = 'rollout only'
+    with pytest.raises(ValueError):
+        validate_measurement(measured, manifest, row, phase, row['production_overrides'])
+
+
+def test_production_cannot_infer_or_downgrade_missing_sealed_policy(tmp_path):
+    _, manifest, row, _, _ = gpu_allocation(tmp_path)
+    measured = measured_phase(row, 'production')
+    with pytest.raises(ValueError, match='missing sealed'):
+        validate_measurement(measured, manifest, row, 'production', [])
+    arguments = ['++trainer.resource_policy=' + json.dumps({**PHYSICAL_RESOURCE_POLICY, 'max_device_used_fraction': 1})]
+    with pytest.raises(ValueError, match='unsupported sealed'):
+        validate_measurement(measured, manifest, row, 'production', arguments)
+
+
+def test_prologue_budget_is_read_from_sealed_manifest(tmp_path, monkeypatch):
+    path, manifest, row, _, _ = gpu_allocation(tmp_path)
+    manifest.update(prologue_limit_seconds=10800, arms=[row])
+    monkeypatch.setattr('opd_tools.qwen_production.verify_manifest', lambda path: manifest)
+    monkeypatch.setenv('SLURM_JOB_ID', '470999')
+    monkeypatch.setenv('SLURM_RESTART_COUNT', '0')
+    monkeypatch.delenv('OPD_PROLOGUE_STARTED_EPOCH', raising=False)
+    args = SimpleNamespace(manifest=path, arm=row['arm_id'], prologue_limit_seconds=None)
+    controller = ProductionController(args)
+    assert 10799 < controller.deadline - controller.started <= 10800
+    args.prologue_limit_seconds = 7200
+    with pytest.raises(ValueError, match='budget differs'):
+        ProductionController(args)
+
+
+def long_replay_fixture(tmp_path):
+    source, runtime, assets = [tmp_path / name for name in ('source', 'runtime', 'assets')]
+    for path in (source / 'scripts', runtime, assets): path.mkdir(parents=True)
+    (source / 'scripts/qwen_runtime.py').write_text('# sealed runtime verifier\n')
+    (source / 'scripts/qwen_vllm_long_replay_diagnostic.py').write_text(
+        'import json\ndef validate_report(path):\n    result = json.loads(path.read_text())["acceptance"]\n'
+        '    if not result["candidate_passed"]: raise ValueError("candidate failed")\n    return result\n')
+    (runtime / 'opd-runtime-manifest.json').write_text('{}')
+    (assets / 'manifest.json').write_text('{}')
+    manifest_path = tmp_path / 'manifest.json'; manifest_path.write_text('{}')
+    manifest = {'source_root': str(source), 'assets_root': str(assets),
+                'parent_commit': 'a' * 40, 'fork_commit': 'b' * 40}
+    row = {'run_root': str(tmp_path / 'run'), 'environment_root': str(runtime), 'arm_id': 'hardgrpo_math_s11'}
+    path = Path(row['run_root']) / 'segments/preflight-42-1/categorical-long-replay/measurement.json'
+    acceptance = {'candidate_passed': True, 'candidate_sampled_max_ratio_error': 1e-6}
+    report = {'runtime': {'root': str(runtime), 'manifest_sha256': file_sha256(runtime / 'opd-runtime-manifest.json'),
+                         'source': {key: manifest[key] for key in ('parent_commit', 'fork_commit')},
+                         'verifier_sha256': file_sha256(source / 'scripts/qwen_runtime.py')},
+              'assets_manifest_sha256': file_sha256(assets / 'manifest.json'), 'acceptance': acceptance,
+              'job_id': '42', 'time_limit_seconds': 1170,
+              'source_sha256': file_sha256(source / 'scripts/qwen_vllm_long_replay_diagnostic.py')}
+    write_json(path, report)
+    log = path.with_name('probe.log'); log.write_text('diagnostic completed\n')
+    evidence = {'path': str(path.relative_to(row['run_root'])), 'sha256': file_sha256(path),
+                'time_limit_seconds': 1170, 'acceptance': copy.deepcopy(acceptance),
+                'log_sha256': file_sha256(log),
+                'probe_sha256': file_sha256(source / 'scripts/qwen_vllm_long_replay_diagnostic.py'),
+                'binding': {'job_id': '42', 'restart_count': 1, 'arm_id': row['arm_id'],
+                            'manifest_sha256': file_sha256(manifest_path),
+                            **{key: manifest[key] for key in ('parent_commit', 'fork_commit')}}}
+    record = {'job_id': '42', 'restart_count': 1, 'runtime': {'hard_long_replay_acceptance': evidence}}
+    return manifest_path, manifest, row, record, path, report
+
+
+def test_long_replay_is_bound_to_source_allocation_runtime_and_assets(tmp_path):
+    path, manifest, row, record, _, _ = long_replay_fixture(tmp_path)
+    verify_hard_long_replay(path, manifest, row, record)
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'job_id', 'restart_count', 'arm_id', 'manifest_sha256',
+    'parent_commit', 'fork_commit', 'absolute_path', 'escape', 'hash', 'runtime', 'runtime_source',
+    'assets', 'verifier', 'candidate', 'acceptance', 'budget', 'log_hash', 'log_missing', 'log_symlink',
+    'probe_hash', 'report_source', 'report_job', 'report_budget', 'budget_too_short'])
+def test_long_replay_rejects_reused_tampered_and_failed_evidence(tmp_path, mutation):
+    path, manifest, row, record, output, report = long_replay_fixture(tmp_path)
+    evidence = record['runtime']['hard_long_replay_acceptance']
+    if mutation == 'missing': del record['runtime']['hard_long_replay_acceptance']
+    elif mutation in evidence['binding']: evidence['binding'][mutation] = 'changed'
+    elif mutation == 'absolute_path': evidence['path'] = str(output)
+    elif mutation == 'escape': evidence['path'] = '../measurement.json'
+    elif mutation == 'hash': output.write_text(output.read_text() + '\n')
+    elif mutation == 'runtime': report['runtime']['root'] = '/other/runtime'
+    elif mutation == 'runtime_source': report['runtime']['source']['fork_commit'] = 'f' * 40
+    elif mutation == 'assets': report['assets_manifest_sha256'] = 'f' * 64
+    elif mutation == 'verifier': report['runtime']['verifier_sha256'] = 'f' * 64
+    elif mutation == 'candidate': report['acceptance']['candidate_passed'] = False
+    elif mutation == 'acceptance': evidence['acceptance']['candidate_sampled_max_ratio_error'] = 0
+    elif mutation == 'budget': evidence['time_limit_seconds'] = 1171
+    elif mutation == 'budget_too_short': evidence['time_limit_seconds'] = report['time_limit_seconds'] = 59
+    elif mutation == 'log_hash': output.with_name('probe.log').write_text('changed')
+    elif mutation == 'log_missing': output.with_name('probe.log').unlink()
+    elif mutation == 'log_symlink':
+        log = output.with_name('probe.log'); log.unlink()
+        elsewhere = tmp_path / 'other.log'; elsewhere.write_text('diagnostic completed\n')
+        log.symlink_to(elsewhere)
+    elif mutation == 'probe_hash': evidence['probe_sha256'] = 'f' * 64
+    elif mutation == 'report_source': report['source_sha256'] = 'f' * 64
+    elif mutation == 'report_job': report['job_id'] = '43'
+    elif mutation == 'report_budget': report['time_limit_seconds'] = 1169
+    if mutation in ('runtime', 'runtime_source', 'assets', 'verifier', 'candidate',
+                     'report_source', 'report_job', 'report_budget', 'budget_too_short'):
+
+        write_json(output, report); evidence['sha256'] = file_sha256(output)
+    with pytest.raises(ValueError):
+        verify_hard_long_replay(path, manifest, row, record)
+
+
+@pytest.mark.parametrize('mutation', [None, 'missing_site', 'gpu_name', 'capability', 'missing_capability',
+                                     'partition', 'qos', 'account', 'constraint'])
+def test_local_allocation_checks_sealed_h200_site_and_scheduler(tmp_path, monkeypatch, mutation):
+    from opd_tools.qwen_site import resolve_site
+    monkeypatch.setattr('opd_tools.qwen_site.shared_storage_root', lambda: tmp_path)
+    root = tmp_path / 'artifacts'; root.mkdir()
+    path, manifest, row, certificate_path, certificate = gpu_allocation(root)
+    site = resolve_site('mbzuai-h200', artifact_root=root)
+    manifest['site'] = site
+    row['account'] = 'k2m'
+    certificate.update(site=copy.deepcopy(site), scheduler={
+        'Partition': 'main', 'QOS': 'k2m', 'Account': 'k2m', 'Features': 'nvidia_h200'})
+    for device, acceptance in zip(certificate['devices'], certificate['runtime']['native_fa3_acceptance']):
+        device.update(name='NVIDIA H200', compute_capability=[9, 0])
+        acceptance['name'] = device['name']
+    if mutation == 'missing_site': del certificate['site']
+    elif mutation == 'gpu_name': certificate['devices'][3]['name'] = 'NVIDIA H100'
+    elif mutation == 'capability': certificate['devices'][3]['compute_capability'] = [8, 0]
+    elif mutation == 'missing_capability': del certificate['devices'][3]['compute_capability']
+    elif mutation == 'partition': certificate['scheduler']['Partition'] = 'batch'
+    elif mutation == 'qos': certificate['scheduler']['QOS'] = 'medium'
+    elif mutation == 'account': certificate['scheduler']['Account'] = 'other'
+    elif mutation == 'constraint': certificate['scheduler']['Features'] = 'nvidia_h200|nvidia_h100'
+    write_json(certificate_path, certificate)
+    if mutation is None:
+        assert verify_gpu_allocation(path, manifest, row, job_id='470999', restart_count=0)['device_count'] == 4
+    else:
+        with pytest.raises(ValueError):
+            verify_gpu_allocation(path, manifest, row, job_id='470999', restart_count=0)
+
+
+def test_resealed_admission_cannot_hide_missing_physical_rank_evidence(tmp_path):
+    path, manifest, row, certificate_path, _ = gpu_allocation(tmp_path)
+    allocation = verify_gpu_allocation(path, manifest, row, job_id='470999', restart_count=0)
+    evidence = {str(Path(details['output']).relative_to(tmp_path)): file_sha256(details['output'])
+                for phase, details in row['phases'].items() if phase != 'production'}
+    evidence[allocation['path']] = file_sha256(certificate_path)
+    admission = {'status': 'passed', 'arm_id': row['arm_id'], 'job_id': '470999',
+                 'submission_manifest_sha256': file_sha256(path),
+                 'parent_commit': manifest['parent_commit'], 'fork_commit': manifest['fork_commit'],
+                 'resume_parity': {'passed': True, 'schema': 'qwen_semantic_v1'},
+                 'zero_dose_parity': {'passed': True, 'schema': 'qwen_semantic_v1'},
+                 'gpu_allocation': allocation, 'evidence_files': evidence}
+    write_json(tmp_path / 'admission.json', admission, seal=True)
+    verify_admission(path, manifest, row)
+    output = Path(row['phases']['full_dose']['output'])
+    measured = json.loads(output.read_text())
+    del measured['iterations'][0]['actor_update_timing']['ranks'][3]['physical_memory']
+    write_json(output, measured)
+    admission['evidence_files'][str(output.relative_to(tmp_path))] = file_sha256(output)
+    write_json(tmp_path / 'admission.json', admission, seal=True)
+    with pytest.raises(ValueError, match='missing physical memory'):
+        verify_admission(path, manifest, row)

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from opd_tools import qwen_production as production
-from opd_tools import qwen_training, study
+from opd_tools import qwen_site, qwen_training, study
 from opd_tools.manifest import canonical_sha256
 
 
@@ -361,3 +361,117 @@ def test_cli_manifest_verify_and_phase_argv(manifest_inputs, capsys):
     assert values(command[3:])["algorithm.opd.beta_base"] == 1.0
     assert production.main(["overrides", "--manifest", str(path), "--arm", production.ARM_IDS[2]]) == 0
     assert values(json.loads(capsys.readouterr().out))["actor_rollout_ref.rollout.n"] == 1
+
+
+@pytest.fixture
+def local_manifest_inputs(manifest_inputs, tmp_path, monkeypatch):
+    monkeypatch.setattr(qwen_site, "shared_storage_root", lambda: tmp_path.parent)
+    return {**manifest_inputs, "site": qwen_site.resolve_site("mbzuai-h200", tmp_path)}
+
+
+def test_local_manifest_seals_cluster_storage_tracking_and_budget(local_manifest_inputs):
+    manifest = production.materialize_manifest(**local_manifest_inputs)
+    assert production.verify_manifest(Path(manifest["study_root"]) / "manifest.json") == manifest
+    assert manifest["site"] == local_manifest_inputs["site"]
+    assert manifest["prologue_limit_seconds"] == 10800
+    for row in manifest["arms"]:
+        assert row["account"] == row["contract"]["account"] == "k2m"
+        assert row["wandb_entity"] is None
+        command = production.phase_command(manifest, row["arm_id"], "production")
+        assert row["production_overrides_sha256"] == canonical_sha256(command[3:])
+        overrides = values(command[3:])
+        assert overrides["hydra.run.dir"] == str(Path(row["run_root"]) / "production/hydra")
+    shorter = production.build_manifest(**local_manifest_inputs, prologue_limit_seconds=7200)
+    assert shorter["prologue_limit_seconds"] == 7200
+    assert shorter["arms"][0]["wandb_run_id"] != manifest["arms"][0]["wandb_run_id"]
+    different_entity = {**local_manifest_inputs["site"], "wandb_entity": "research-team"}
+    other = production.build_manifest(**{**local_manifest_inputs, "site": different_entity})
+    assert other["arms"][0]["wandb_run_id"] != manifest["arms"][0]["wandb_run_id"]
+    assert other["arms"][0]["wandb_entity"] == "research-team"
+
+
+@pytest.mark.parametrize("key", ["assets_root", "study_root", "source_root", "soft_env", "hard_env"])
+def test_local_manifest_rejects_any_input_outside_artifact_root(local_manifest_inputs, key):
+    root = Path(local_manifest_inputs["site"]["artifact_root"])
+    kwargs = {**local_manifest_inputs, key: root.parent / "outside"}
+    # Test the contract builder directly: reject storage before requiring files
+    # at the deliberately invalid root.
+    asset_manifest = production._seal({"profile_id": qwen_training.PROFILE_ID, "model": production.MODEL})
+    with pytest.raises(ValueError, match="sealed artifact root"):
+        production._build_manifest(**kwargs, parent_gitlink=kwargs["fork_commit"], assets_manifest=asset_manifest)
+
+
+def test_local_phase_refuses_resolved_checkpoint_and_output_escapes(local_manifest_inputs):
+    manifest = production.materialize_manifest(**local_manifest_inputs)
+    row = manifest["arms"][0]
+    outside = Path(manifest["site"]["artifact_root"]).parent / "outside"
+    with pytest.raises(ValueError, match="resume checkpoint"):
+        production.phase_command(manifest, row["arm_id"], "resume", resume_from_path=outside)
+    phase_dir = Path(row["run_root"]) / "production"
+    phase_dir.symlink_to(outside)
+    with pytest.raises(ValueError, match="sealed artifact root"):
+        production.phase_command(manifest, row["arm_id"], "production")
+
+
+@pytest.mark.parametrize("tamper", ["account", "hardware", "storage", "budget", "entity"])
+def test_local_resealed_manifest_cannot_drift_from_site_contract(local_manifest_inputs, tamper):
+    manifest = production.materialize_manifest(**local_manifest_inputs)
+    if tamper == "account":
+        manifest["arms"][0]["account"] = "marlowe-m000120-pm06"
+    elif tamper == "hardware":
+        manifest["site"]["gpu"]["name_contains"] = "H100"
+    elif tamper == "storage":
+        manifest["site"]["artifact_root"] = str(Path(manifest["site"]["artifact_root"]).parent / "different")
+    elif tamper == "budget":
+        manifest["prologue_limit_seconds"] = 7200  # Commands and run IDs remain bound to the old budget.
+    else:
+        manifest["site"]["wandb_entity"] = "different-team"
+    manifest.pop("manifest_content_sha256")
+    path = Path(manifest["study_root"]) / "manifest.json"
+    path.write_text(json.dumps(production._seal(manifest)))
+    with pytest.raises(ValueError):
+        production.verify_manifest(path)
+
+
+def test_omitted_site_retains_historical_manifest_and_override_contract(manifest_inputs):
+    manifest = production.build_manifest(**manifest_inputs)
+    assert "site" not in manifest
+    assert manifest["prologue_limit_seconds"] == 7200
+    for row in manifest["arms"]:
+        assert "wandb_entity" not in row
+        assert row["account"] == study.resolve_arm(row["arm_id"]).spec.account
+        assert "hydra.run.dir" not in values(row["production_overrides"])
+    with pytest.raises(ValueError, match="explicitly sealed"):
+        production.build_manifest(**manifest_inputs, prologue_limit_seconds=10800)
+
+
+def test_local_site_keeps_every_phase_numerical_recipe_unchanged(local_manifest_inputs):
+    inputs = local_manifest_inputs
+    for arm in production.ARM_IDS:
+        run_root = inputs["study_root"] / "arms" / arm
+        for phase in production.PHASES:
+            metadata = production.phase_metadata(arm, run_root, phase)
+            if not metadata["applicable"]:
+                continue
+            kwargs = dict(phase=phase, training_options=production.TrainingOptions(),
+                          source_root=inputs["source_root"],
+                          resume_from_path=run_root / "checkpoint" if phase == "resume" else None)
+            historical = values(production.production_overrides(arm, inputs["assets_root"], run_root, **kwargs))
+            local = values(production.production_overrides(arm, inputs["assets_root"], run_root, site=inputs["site"], **kwargs))
+            assert local.pop("hydra.run.dir") == str(Path(metadata["directory"]) / "hydra")
+            assert local == historical, (arm, phase)
+            assert local["trainer.default_local_dir"] == metadata["run_dir"]
+
+
+def test_local_hydra_output_override_composes_with_revised_profile(local_manifest_inputs):
+    import hydra
+
+    inputs = local_manifest_inputs
+    overrides = production.production_overrides(
+        production.ARM_IDS[0], inputs["assets_root"], inputs["study_root"] / "run",
+        source_root=inputs["source_root"], training_options=production.TrainingOptions(), site=inputs["site"])
+    directory = Path(qwen_training.__file__).resolve().parents[1] / "verl-0.4.x/verl/trainer/config"
+    with hydra.initialize_config_dir(config_dir=str(directory), version_base=None):
+        config = hydra.compose(config_name="ppo_trainer", overrides=overrides, return_hydra_config=True)
+    assert config.hydra.run.dir == str(inputs["study_root"] / "run/production/hydra")
+    assert config.trainer.default_local_dir == str(inputs["study_root"] / "run/production/training")

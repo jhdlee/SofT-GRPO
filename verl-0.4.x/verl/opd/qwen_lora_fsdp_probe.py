@@ -1,4 +1,4 @@
-"""Disposable two-rank native-LoRA/FSDP admission; no training assets or Ray."""
+"""Disposable two- or four-rank native-LoRA/FSDP admission; no training assets or Ray."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ import tempfile
 import time
 
 
-def _rank_probe(rank, directory, expected_module_path):
+def _rank_probe(rank, directory, expected_module_path, world_size=2):
     if str(Path(__file__).resolve()) != expected_module_path:
         raise RuntimeError("native LoRA FSDP child imported a different source module")
     if not __debug__:
@@ -33,7 +33,7 @@ def _rank_probe(rank, directory, expected_module_path):
     torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device("cuda", rank)
     dist.init_process_group("nccl", init_method=(Path(directory) / "rendezvous").as_uri(),
-                            rank=rank, world_size=2, timeout=timedelta(seconds=60))
+                            rank=rank, world_size=world_size, timeout=timedelta(seconds=60))
     try:
         torch.manual_seed(3187)
         config = Qwen3Config(vocab_size=64, hidden_size=256, intermediate_size=512, num_hidden_layers=2,
@@ -122,25 +122,27 @@ def _rank_probe(rank, directory, expected_module_path):
         dist.destroy_process_group()
 
 
-def validate_native_lora_fsdp_cuda():
-    """Run a fresh bounded two-rank probe before any rollout engines start."""
+def validate_native_lora_fsdp_cuda(*, world_size=2):
+    """Run a fresh bounded distributed probe before any rollout engines start."""
+    if type(world_size) is not int or world_size not in (2, 4):
+        raise ValueError("native LoRA FSDP admission supports world size two or four")
     import torch
     import torch.distributed as dist
 
-    if dist.is_initialized() or torch.cuda.device_count() != 2 or torch.version.hip is not None:
-        raise RuntimeError("native LoRA FSDP admission requires exactly two isolated NVIDIA GPUs")
-    if any(torch.cuda.get_device_capability(rank) != (9, 0) for rank in range(2)):
-        raise RuntimeError("native LoRA FSDP admission requires two Hopper SM90 GPUs")
+    if dist.is_initialized() or torch.cuda.device_count() != world_size or torch.version.hip is not None:
+        raise RuntimeError(f"native LoRA FSDP admission requires exactly {world_size} isolated NVIDIA GPUs")
+    if any(torch.cuda.get_device_capability(rank) != (9, 0) for rank in range(world_size)):
+        raise RuntimeError("native LoRA FSDP admission requires Hopper SM90 GPUs")
     with tempfile.TemporaryDirectory(prefix="opd-lora-fsdp-", dir=os.environ.get("TMPDIR")) as directory:
-        context = torch.multiprocessing.spawn(_rank_probe, args=(directory, str(Path(__file__).resolve())),
-                                               nprocs=2, join=False)
+        context = torch.multiprocessing.spawn(_rank_probe, args=(directory, str(Path(__file__).resolve()), world_size),
+                                               nprocs=world_size, join=False)
         try:
             deadline = time.monotonic() + 120
             while not context.join(timeout=1):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("native LoRA two-rank FSDP admission exceeded 120 seconds")
-            ranks = [json.loads((Path(directory) / f"rank-{rank}.json").read_text()) for rank in range(2)]
-            return {"schema_version": 1, "status": "passed", "world_size": 2, "ranks": ranks}
+                    raise TimeoutError("native LoRA distributed FSDP admission exceeded 120 seconds")
+            ranks = [json.loads((Path(directory) / f"rank-{rank}.json").read_text()) for rank in range(world_size)]
+            return {"schema_version": 1, "status": "passed", "world_size": world_size, "ranks": ranks}
         finally:
             for process in context.processes:
                 if process.is_alive():

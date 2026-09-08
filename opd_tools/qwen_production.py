@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 from typing import Any, Mapping, Sequence
 
-from . import qwen_training, study
+from . import qwen_site, qwen_training, study
 from .manifest import canonical_sha256, file_sha256, validate_sealed_content
 
 
@@ -167,12 +167,25 @@ def production_overrides(
     identifier: str, assets_root: Path | str, run_root: Path | str, *,
     phase: str = "production", resume_from_path: Path | str | None = None,
     source_root: Path | str | None = None,
-    training_options=None, runtime_manifest=None,
+    training_options=None, runtime_manifest=None, site=None,
 ) -> list[str]:
     """Emit unique Hydra overrides; invocation limits never shorten the horizon."""
     spec = resolve_arm(identifier)
     options = _options(training_options)
+    if site is not None:
+        site = qwen_site.validate_site(site)
+        qwen_site.validate_artifact_path(assets_root, site, "assets root")
+        qwen_site.validate_artifact_path(run_root, site, "run root")
+        if source_root is not None:
+            qwen_site.validate_artifact_path(source_root, site, "source snapshot")
+        if resume_from_path is not None:
+            qwen_site.validate_artifact_path(resume_from_path, site, "resume checkpoint")
+        if runtime_manifest is not None:
+            qwen_site.validate_artifact_path(runtime_manifest["path"], site, "runtime manifest")
     metadata = phase_metadata(identifier, run_root, phase)
+    if site is not None:
+        for key in ("directory", "run_dir", "output"):
+            qwen_site.validate_artifact_path(metadata[key], site, key)
     if not metadata["applicable"]:
         raise ValueError(f"{phase} only applies to hybrid OPD arms")
     if phase == "resume" and resume_from_path is None:
@@ -221,6 +234,9 @@ def production_overrides(
     })
     if source_root is not None:
         values["custom_reward_function.path"] = str(_absolute(source_root) / "3rdparty/SofT-GRPO/opd_tools/reward.py")
+    if site is not None and site["artifact_root"] is not None:
+        values["hydra.run.dir"] = str(qwen_site.validate_artifact_path(
+            Path(metadata["directory"]) / "hydra", site, "Hydra outputs"))
     extra_keys = set()
     if options is not None:
         reference = options.reference_kl == "recipe" and spec.opd_mode != "standalone"
@@ -284,7 +300,8 @@ def _seal(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
-                    parent_gitlink, soft_env, hard_env, assets_manifest, training_options=None) -> dict[str, Any]:
+                    parent_gitlink, soft_env, hard_env, assets_manifest, training_options=None,
+                    site=None, prologue_limit_seconds=None) -> dict[str, Any]:
     options = _options(training_options)
     profile_id = _profile(options)
     for name, value in (("parent_commit", parent_commit), ("fork_commit", fork_commit), ("parent_gitlink", parent_gitlink)):
@@ -295,6 +312,16 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
     if assets_manifest.get("profile_id") != PROMPT_PROFILE_ID or assets_manifest.get("model") != MODEL:
         raise ValueError("production assets must use the authenticated pinned Qwen profile")
     assets_root, study_root, source_root, soft_env, hard_env = map(_absolute, (assets_root, study_root, source_root, soft_env, hard_env))
+    if site is not None:
+        site = qwen_site.validate_site(site)
+        for label, path in (("assets root", assets_root), ("study root", study_root),
+                            ("source snapshot", source_root), ("soft environment", soft_env),
+                            ("hard environment", hard_env)):
+            qwen_site.validate_artifact_path(path, site, label)
+    effective_site = qwen_site.resolve_site() if site is None else site
+    if prologue_limit_seconds is None:
+        prologue_limit_seconds = effective_site["production_prologue_limit_seconds"]
+    qwen_site.validate_prologue_limit(prologue_limit_seconds, effective_site)
     runtime_manifest = None
     if options is not None:
         if soft_env != hard_env:
@@ -319,10 +346,12 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
         "asset_profile_id": PROMPT_PROFILE_ID, "model": dict(MODEL),
         "runtime_environments": {"soft": str(soft_env), "hard": str(hard_env)},
         "runtime_package_pins": {kind: dict(pins) for kind, pins in RUNTIME_PACKAGE_PINS.items()},
-        "resources": dict(RESOURCES), "prologue_limit_seconds": PROLOGUE_LIMIT_SECONDS,
+        "resources": dict(RESOURCES), "prologue_limit_seconds": prologue_limit_seconds,
         "base_config_sha256": file_sha256(source_root / "3rdparty/SofT-GRPO/verl-0.4.x/verl/trainer/config/ppo_trainer.yaml"),
         "arm_order": list(ARM_IDS), "arms": [],
     }
+    if site is not None:
+        base["site"] = site
     if options is not None:
         base.update(training_options=options.as_manifest(), runtime_manifest=runtime_manifest,
                     runtime_package_pins={kind: dict(SHARED_RUNTIME_PINS) for kind in ("soft", "hard")})
@@ -331,13 +360,18 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
         run_root = study_root / "arms" / identifier
         environment = soft_env if spec.rollout_kind == "native_soft" else hard_env
         contract = arm_contract(identifier, options)
-        identity = canonical_sha256([profile_id, identifier, parent_commit, fork_commit,
-                                     assets_manifest["manifest_content_sha256"], str(run_root), str(environment), contract])
+        if site is not None and site["scheduler"]["account"] is not None:
+            contract["account"] = site["scheduler"]["account"]
+        identity_inputs = [profile_id, identifier, parent_commit, fork_commit,
+                           assets_manifest["manifest_content_sha256"], str(run_root), str(environment), contract]
+        if site is not None:
+            identity_inputs.append({"site": site, "prologue_limit_seconds": prologue_limit_seconds})
+        identity = canonical_sha256(identity_inputs)
         phases = {phase: phase_metadata(identifier, run_root, phase) for phase in PHASES}
         production = production_overrides(identifier, assets_root, run_root, source_root=source_root,
-                                          training_options=options, runtime_manifest=runtime_manifest)
+                                          training_options=options, runtime_manifest=runtime_manifest, site=site)
         base["arms"].append({
-            "arm_id": identifier, "account": spec.account, "run_root": str(run_root),
+            "arm_id": identifier, "account": contract["account"], "run_root": str(run_root),
             "environment_root": str(environment), "python_bin": str(environment / "bin/python"),
             "runtime_packages": dict(base["runtime_package_pins"]["soft" if spec.rollout_kind == "native_soft" else "hard"]),
             "wandb_run_id": "qprod-" + identity[:24], "wandb_project": PRODUCTION_PROJECT + ("-lora-fa3" if options else ""),
@@ -345,18 +379,21 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
             "phases": phases, "production_overrides": production,
             "production_overrides_sha256": canonical_sha256(production),
         })
+        if site is not None:
+            base["arms"][-1]["wandb_entity"] = site["wandb_entity"]
     return _seal(base)
 
 
 def build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
-                   soft_env, hard_env, parent_gitlink=None, training_options=None) -> dict[str, Any]:
+                   soft_env, hard_env, parent_gitlink=None, training_options=None,
+                   site=None, prologue_limit_seconds=None) -> dict[str, Any]:
     assets = qwen_training.verify(assets_root)
     _verify_source(_absolute(source_root), parent_commit, fork_commit)
     return _build_manifest(assets_root=assets_root, study_root=study_root, source_root=source_root,
                            parent_commit=parent_commit, fork_commit=fork_commit,
                            parent_gitlink=fork_commit if parent_gitlink is None else parent_gitlink,
                            soft_env=soft_env, hard_env=hard_env, assets_manifest=assets,
-                           training_options=training_options)
+                           training_options=training_options, site=site, prologue_limit_seconds=prologue_limit_seconds)
 
 
 def _write_immutable(path: Path, payload: Mapping[str, Any]) -> None:
@@ -417,7 +454,8 @@ def verify_manifest(path: Path | str, *, verify_assets: bool = True, verify_sour
         _verify_source(Path(manifest["source_root"]), manifest["parent_commit"], manifest["fork_commit"])
     expected = _build_manifest(**{key: manifest[key] for key in ("assets_root", "study_root", "source_root", "parent_commit", "fork_commit", "parent_gitlink")},
                                soft_env=manifest["runtime_environments"]["soft"], hard_env=manifest["runtime_environments"]["hard"], assets_manifest=assets,
-                               training_options=manifest.get("training_options"))
+                               training_options=manifest.get("training_options"), site=manifest.get("site"),
+                               prologue_limit_seconds=manifest["prologue_limit_seconds"])
     if manifest != expected:
         raise ValueError("production manifest differs from the source/profile/asset contract")
     for arm in manifest["arms"]:
@@ -445,6 +483,7 @@ def phase_command(manifest: Mapping[str, Any], identifier: str, phase: str, *, r
         identifier, manifest["assets_root"], arm["run_root"], phase=phase, resume_from_path=resume_from_path,
         source_root=manifest["source_root"],
         training_options=manifest.get("training_options"), runtime_manifest=manifest.get("runtime_manifest"),
+        site=manifest.get("site"),
     )]
 
 
@@ -470,6 +509,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in ("parent-commit", "fork-commit"):
         sub.add_argument("--" + name, required=True)
     sub.add_argument("--parent-gitlink")
+    sub.add_argument("--site", choices=qwen_site.SITE_IDS,
+                     help="explicit cluster contract; omission preserves historical Marlowe manifests")
+    sub.add_argument("--artifact-root", type=Path)
+    sub.add_argument("--wandb-entity", help="explicit W&B account/team; H200 default uses the authenticated user")
+    sub.add_argument("--prologue-limit-seconds", type=int, choices=(7200, 10800),
+                     help="seal a reviewed startup budget; H200 defaults to 10800 seconds")
     for name in ("verify", "overrides", "command"):
         sub = commands.add_parser(name)
         sub.add_argument("--manifest", type=Path, required=True)
@@ -485,6 +530,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "materialize":
         kwargs = vars(args).copy()
         kwargs.pop("command")
+        site_id = kwargs.pop("site")
+        artifact_root, wandb_entity = kwargs.pop("artifact_root"), kwargs.pop("wandb_entity")
+        if site_id is not None:
+            kwargs["site"] = qwen_site.resolve_site(site_id, artifact_root, wandb_entity)
+        elif artifact_root is not None or wandb_entity is not None:
+            parser.error("--artifact-root and --wandb-entity require --site")
         revised = kwargs.pop("profile") == LORA_PROFILE_ID
         shared = kwargs.pop("shared_env")
         choices = {key: kwargs.pop(key) for key in ("finetuning", "lora_rank", "lora_alpha", "lora_target_modules", "reference_kl")}
