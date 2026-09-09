@@ -3036,6 +3036,9 @@ class RayPPOTrainer:
                     save_freq = int(self.config.trainer.save_freq)
                     scheduled_checkpoint = save_freq > 0 and (
                         is_last_step or self.global_steps % save_freq == 0
+                        or (self.config.trainer.get("production_mode", False)
+                            and self.config.trainer.get("production_save_first_iteration", False)
+                            and self.global_steps == 1)
                     )
                     must_stop = requeue_requested or invocation_limit_reached
                     if scheduled_checkpoint or must_stop:

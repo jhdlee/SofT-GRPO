@@ -123,7 +123,7 @@ def arm_contract(identifier: str, training_options=None) -> dict[str, Any]:
                   validation_examples=512, prompt_batch_size=64, response_token_cap=8192,
                   micro_batch_size_per_gpu=2, tensor_parallel_size=1,
                   resources=dict(RESOURCES), validation_iterations=[0, 25, 50, 75, 100, 109],
-                  checkpoint_iterations=[25, 50, 75, 100, 109],
+                  checkpoint_iterations=[1, 25, 50, 75, 100, 109],
                   qwen_replay_backend="native_fa3_v1" if spec.rollout_kind == "native_soft" else "disabled",
                   gradient_policy="diagnostic_clipping", completion_gate_enabled=False,
                   ratio_range_gate_enabled=False, clipping_frequency_gate_enabled=False)
@@ -225,6 +225,7 @@ def production_overrides(
         "trainer.val_before_train": phase == "production",
         "trainer.test_freq": 25 if phase == "production" else -1,
         "trainer.save_freq": 25 if phase == "production" else 1,
+        "trainer.production_save_first_iteration": phase == "production",
         "trainer.logger": ["console", "wandb"],
         "trainer.resume_mode": "resume_path" if resume_from_path is not None else "disable",
         "trainer.resume_from_path": str(_absolute(resume_from_path)) if resume_from_path is not None else None,

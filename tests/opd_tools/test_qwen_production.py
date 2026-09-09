@@ -139,6 +139,9 @@ def test_production_preserves_full_training_recipe_and_backend(tmp_path, arm):
     assert config["trainer.rollout_integrity.gate_first_n_iterations"] == 109
     assert config["trainer.val_before_train"] and config["trainer.test_freq"] == 25
     assert config["trainer.save_freq"] == 25
+    assert config["trainer.production_save_first_iteration"] is True
+    assert production.arm_contract(arm)["checkpoint_iterations"] == [1, 25, 50, 75, 100, 109]
+    assert production.arm_contract(arm)["validation_iterations"] == [0, 25, 50, 75, 100, 109]
     assert config["trainer.validation_seed"] == 11 and config["trainer.validation_seed_iteration"] == 0
     assert not any("benchmark" in key or "capacity" in key for key in config)
     if spec.rollout_kind == "categorical":
@@ -186,6 +189,7 @@ def test_actual_hydra_composition_and_resume_horizon(tmp_path, arm, phase):
     if phase == "resume":
         assert config.trainer.resume_mode == "resume_path"
         assert config.trainer.resume_from_path == str(resume)
+    assert config.trainer.production_save_first_iteration is (phase == "production")
 
 
 @pytest.mark.parametrize("arm", production.ARM_IDS[3:])

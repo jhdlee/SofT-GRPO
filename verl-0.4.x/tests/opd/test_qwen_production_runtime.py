@@ -1,6 +1,7 @@
 """Production-only trainer instrumentation, numerical policy and invocation semantics."""
 
 import ast
+from contextlib import contextmanager
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ def trainer_stub(tmp_path, phase="uninterrupted"):
                     "rollout_integrity": {"enabled": True, "completion_gate_enabled": False, "full_dose_gradient_gate_enabled": False},
                     "val_before_train": phase == "production", "test_freq": 25 if phase == "production" else -1,
                     "save_freq": 25 if phase == "production" else 1,
+                    "production_save_first_iteration": phase == "production",
                     "max_rollout_iterations_per_invocation": None if phase == "production" else 2,
                     "default_local_dir": str(tmp_path / "training")},
         "actor_rollout_ref": {"actor": {"grad_clip": 1.0}}, "data": {"val_batch_size": 128},
@@ -90,6 +92,8 @@ def test_recorder_preserves_failure_without_claiming_update_or_checkpoint(tmp_pa
     ("actor_rollout_ref.actor.grad_clip", 0.5),
     ("trainer.production_phase", "unknown"),
     ("trainer.test_freq", 10), ("trainer.save_freq", 10),
+    ("trainer.production_save_first_iteration", False),
+    ("trainer.production_save_first_iteration", 1),
     ("trainer.max_rollout_iterations_per_invocation", 3), ("data.val_batch_size", 512),
 ])
 def test_production_admission_rejects_changed_recipe_and_policies(tmp_path, key, value):
@@ -191,7 +195,7 @@ def test_production_retains_finite_gradient_and_metric_checks(name, bad):
         validate_production_gradient_integrity(metrics)
 
 
-@pytest.mark.parametrize("completed,continues", [(108, True), (109, False), (110, False)])
+@pytest.mark.parametrize("completed,continues", [(1, True), (108, True), (109, False), (110, False)])
 @pytest.mark.parametrize("semantic_mode", [None, "qwen_semantic_v1"])
 def test_real_fit_resume_guard_stops_before_duplicate_validation_or_rollout(completed, continues, semantic_mode, monkeypatch):
     source = Path(__file__).resolve().parents[2] / "verl/trainer/ppo/ray_trainer.py"
@@ -253,3 +257,97 @@ def test_remaining_runtime_counts_only_future_validation_and_save_events(complet
     assert result["remaining_scheduled_validations"] == result["remaining_scheduled_checkpoints"] == events
     if completed == 109:
         assert result["complete"] and result["scenarios"]["central"]["remaining_seconds"] == 0
+
+
+def test_early_checkpoint_estimate_does_not_add_a_validation():
+    measurement = {"completed_rollout_iterations": 0,
+                   "configuration": {"trainer": {"production_save_first_iteration": True}}}
+    result = remaining_runtime_estimate(measurement, gpus=4)
+    assert result["remaining_scheduled_validations"] == 5
+    assert result["remaining_scheduled_checkpoints"] == 6
+    measurement["completed_rollout_iterations"] = 1
+    result = remaining_runtime_estimate(measurement, gpus=4)
+    assert result["remaining_scheduled_validations"] == result["remaining_scheduled_checkpoints"] == 5
+
+
+@pytest.fixture
+def real_checkpoint_schedule():
+    """Execute the real fit-loop validation/save branch without model workers."""
+    source = Path(__file__).resolve().parents[2] / "verl/trainer/ppo/ray_trainer.py"
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RayPPOTrainer")
+    fit = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "fit")
+    body = next(node.body for node in ast.walk(fit) if isinstance(getattr(node, "body", None), list)
+                and any(isinstance(child, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "save_freq"
+                    for target in child.targets) for child in node.body))
+    start = next(index for index, node in enumerate(body) if isinstance(node, ast.If) and "self.val_reward_fn" in ast.unparse(node.test))
+    stop = next(index for index, node in enumerate(body) if isinstance(node, ast.If) and ast.unparse(node.test) == "scheduled_checkpoint or must_stop")
+    setup = ast.parse("timing_raw = {}\nmetrics = {}\nval_metrics_this_iteration = None\ncheckpoint_committed = False\nrollout_iteration = self.global_steps - 1\nbatch = SimpleNamespace(meta_info={})\n").body
+    method = ast.FunctionDef(name="schedule", args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=name)
+        for name in ("self", "is_last_step", "invocation_limit", "iterations_this_invocation")],
+        kwonlyargs=[], kw_defaults=[], defaults=[]),
+        body=setup + body[start:stop + 1] + [ast.Return(value=ast.Name(id="checkpoint_committed", ctx=ast.Load()))], decorator_list=[])
+    @contextmanager
+    def timer(name, timing):
+        yield
+        timing[name] = .01
+    namespace = {"SimpleNamespace": SimpleNamespace, "_timer": timer, "capacity_stage": lambda *args: None,
+                 "_requeue_requested": lambda path: bool(path and Path(path).exists()),
+                 "_consume_requeue_request": lambda path: Path(path).unlink()}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(source), "exec"), namespace)
+    return namespace["schedule"]
+
+
+@pytest.mark.parametrize("resumed_after", [0, 1, 25])
+def test_real_loop_early_checkpoint_uses_normal_recorder_without_extra_validation(tmp_path, real_checkpoint_schedule, resumed_after):
+    trainer = trainer_stub(tmp_path, "production")
+    trainer.val_reward_fn = object()
+    saves = []
+    def save(**kwargs):
+        manifest = {"global_step": trainer.global_steps, "reason": kwargs["reason"]}
+        path = Path(trainer.config.trainer.default_local_dir) / f"global_step_{trainer.global_steps}"
+        path.mkdir(parents=True)
+        (path / "checkpoint_manifest.json").write_text(json.dumps(manifest))
+        saves.append((trainer.global_steps, kwargs))
+        return manifest
+    trainer._save_checkpoint = save
+    trainer._validate = lambda: {"val/math_verify/mean_at_1": .5, "val/released_reward/mean_at_1": .6}
+    attach_production_recorder(trainer)
+    for step in range(resumed_after + 1, 110):
+        trainer.global_steps = step
+        committed = real_checkpoint_schedule(trainer, step == 109, None, step - resumed_after - 1)
+        assert committed is (step in (1, 25, 50, 75, 100, 109))
+    expected = [step for step in (1, 25, 50, 75, 100, 109) if step > resumed_after]
+    assert [step for step, _ in saves] == expected
+    measured = json.loads((tmp_path / "measurement.json").read_text())
+    assert [row["manifest"]["global_step"] for row in measured["checkpoints"]] == expected
+    assert all(row["authenticated"] and row["payload_rehashed"] for row in measured["checkpoints"])
+    assert [row["completed_rollout_iterations"] for row in measured["validations"]] == [step for step in (25, 50, 75, 100, 109) if step > resumed_after]
+    if resumed_after == 0:
+        assert saves[0][1]["reason"] == "scheduled"
+        assert saves[0][1]["selection_metric_value"] is None  # No stale step-zero BEST score.
+
+
+def test_first_checkpoint_preserves_signal_reason_and_consumption(tmp_path, real_checkpoint_schedule):
+    trainer = trainer_stub(tmp_path, "production")
+    trainer.val_reward_fn = object()
+    trainer.global_steps = 1
+    signal = tmp_path / "checkpoint.request"
+    signal.write_text("checkpoint and requeue")
+    trainer.config.trainer.requeue_signal_file = str(signal)
+    saves = []
+    trainer._save_checkpoint = lambda **kwargs: saves.append(kwargs)
+    assert real_checkpoint_schedule(trainer, False, None, 0)
+    assert len(saves) == 1 and saves[0]["reason"] == "requeue_signal"
+    assert not signal.exists()
+
+
+@pytest.mark.parametrize("production_mode,early_save", [(False, True), (True, False)])
+def test_early_checkpoint_flag_cannot_change_unselected_training(tmp_path, real_checkpoint_schedule, production_mode, early_save):
+    trainer = trainer_stub(tmp_path, "production")
+    trainer.val_reward_fn = object()
+    trainer.global_steps = 1
+    trainer.config.trainer.production_mode = production_mode
+    trainer.config.trainer.production_save_first_iteration = early_save
+    trainer._save_checkpoint = lambda **kwargs: pytest.fail("early checkpoint was not selected")
+    assert not real_checkpoint_schedule(trainer, False, None, 0)

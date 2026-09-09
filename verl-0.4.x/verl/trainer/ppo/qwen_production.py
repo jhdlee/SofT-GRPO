@@ -23,6 +23,8 @@ def remaining_runtime_estimate(measurement, *, gpus):
     completed = int(measurement["completed_rollout_iterations"])
     remaining = max(0, 109 - completed)
     scheduled = sum(step > completed for step in (25, 50, 75, 100, 109))
+    scheduled_checkpoints = scheduled + int(completed < 1 and measurement.get("configuration", {}).get(
+        "trainer", {}).get("production_save_first_iteration") is True)
     active, zero_dose, saves = [], [], []
     for row in measurement.get("iterations", []):
         timing = row.get("timing_s", {})
@@ -50,19 +52,20 @@ def remaining_runtime_estimate(measurement, *, gpus):
         missing.append("active_iteration")
     if scheduled and not validations:
         missing.append("validation")
-    if scheduled and not saves:
+    if scheduled_checkpoints and not saves:
         missing.append("checkpoint")
     scenarios = {}
     for name, multiplier in (("central", 1.0), ("token_1p5x", 1.5), ("token_2x", 2.0)):
         iteration_cost = mean([row["fixed"] + multiplier * row["token"] for row in active])
-        known = remaining * (iteration_cost or 0) + scheduled * ((mean(validations) or 0) * multiplier + (mean(saves) or 0))
+        known = (remaining * (iteration_cost or 0) + scheduled * (mean(validations) or 0) * multiplier
+                 + scheduled_checkpoints * (mean(saves) or 0))
         scenarios[name] = {"token_stage_multiplier": multiplier, "known_remaining_seconds": known,
                            "remaining_seconds": None if missing else known,
                            "remaining_gpu_hours": None if missing else known * gpus / 3600}
     return {
         "preliminary": True, "complete": not missing, "gpus": gpus,
         "remaining_rollout_iterations": remaining, "remaining_scheduled_validations": scheduled,
-        "remaining_scheduled_checkpoints": scheduled, "missing_stage_measurements": missing,
+        "remaining_scheduled_checkpoints": scheduled_checkpoints, "missing_stage_measurements": missing,
         "active_iteration_samples": len(active), "zero_dose_iteration_samples": len(zero_dose),
         "active_core_mean_seconds": mean([row["core"] for row in active]),
         "zero_dose_core_mean_seconds": mean([row["core"] for row in zero_dose]),
@@ -108,9 +111,11 @@ class ProductionRecorder:
             if (config.trainer.get("max_rollout_iterations_per_invocation") is not None
                     or not config.trainer.val_before_train
                     or config.trainer.test_freq != 25 or config.trainer.save_freq != 25
+                    or config.trainer.get("production_save_first_iteration") is not True
                     or config.data.val_batch_size != 128):
                 raise ValueError("production must preserve the full validation/checkpoint schedule")
-        elif config.trainer.val_before_train or config.trainer.test_freq > 0:
+        elif (config.trainer.val_before_train or config.trainer.test_freq > 0
+              or config.trainer.get("production_save_first_iteration", False) is not False):
             raise ValueError("disposable production prologues cannot run validation")
         output = config.trainer.get("production_output")
         if not isinstance(output, str) or not Path(output).is_absolute():
