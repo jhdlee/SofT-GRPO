@@ -38,6 +38,7 @@ RESOURCES = {"gpus": 4, "cpus": 56, "memory_gib": 768,
              "time_limit_seconds": 36 * 3600, "exclusive": False}
 PROLOGUE_LIMIT_SECONDS = 7200
 PRODUCTION_PROJECT = "opd-qwen3-math-seven-arm"
+LOCAL_PRODUCTION_PROJECT = "soft-opd"
 RUNTIME_PACKAGE_PINS = {
     "soft": {"torch": "2.6.0", "transformers": "4.51.1", "ray": "2.49.2",
              "sglang": "0.4.6.post1", "xgrammar": "0.1.17", "numpy": "2.3.3",
@@ -280,6 +281,8 @@ def production_overrides(
             additions["trainer.runtime_source_root"] = str(_absolute(source_root) / "3rdparty/SofT-GRPO")
         extra_keys.update(additions)
         values.update(additions)
+    if site is not None and site["site_id"] == "mbzuai-h200":
+        values["trainer.project_name"] = LOCAL_PRODUCTION_PROJECT
     return [("++" if key in extra_keys or key.startswith("trainer.production_") or key == "actor_rollout_ref.rollout.production_engine_isolation" else "") + key + "="
             + json.dumps(value, separators=(",", ":")) for key, value in values.items()]
 
@@ -391,7 +394,7 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
             "arm_id": identifier, "account": contract["account"], "run_root": str(run_root),
             "environment_root": str(environment), "python_bin": str(environment / "bin/python"),
             "runtime_packages": dict(base["runtime_package_pins"]["soft" if spec.rollout_kind == "native_soft" else "hard"]),
-            "wandb_run_id": "qprod-" + identity[:24], "wandb_project": PRODUCTION_PROJECT + ("-lora-fa3" if options else ""),
+            "wandb_run_id": "qprod-" + identity[:24], "wandb_project": _values(production)["trainer.project_name"],
             "contract": contract, "contract_sha256": canonical_sha256(contract),
             "phases": phases, "production_overrides": production,
             "production_overrides_sha256": canonical_sha256(production),
@@ -531,7 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_argument("--site", choices=qwen_site.SITE_IDS,
                      help="explicit cluster contract; omission preserves historical Marlowe manifests")
     sub.add_argument("--artifact-root", type=Path)
-    sub.add_argument("--wandb-entity", help="explicit W&B account/team; H200 default uses the authenticated user")
+    sub.add_argument("--wandb-entity", help="explicit W&B account/team; H200 defaults to columbia-homies")
     sub.add_argument("--prologue-limit-seconds", type=int, choices=(7200, 10800),
                      help="seal a reviewed startup budget; H200 defaults to 10800 seconds")
     sub.add_argument("--admission-mode", choices=ADMISSION_MODES, default="diagnostics",

@@ -16,14 +16,14 @@ def shared(tmp_path, monkeypatch):
     return root
 
 
-def test_h200_profile_resolves_shared_storage_and_does_not_guess_wandb_identity(shared):
+def test_h200_profile_resolves_shared_storage_and_configured_wandb_team(shared):
     site = qwen_site.resolve_site("mbzuai-h200")
     assert site["artifact_root"] == str(shared / "opd-latent-reasoning")
     assert site["scheduler"] == dict(account="k2m", partition="main", qos="k2m", constraint="nvidia_h200")
     assert site["gpu"] == dict(name_contains="H200", compute_capability=[9, 0])
     assert site["modules"] == []
     assert site["production_prologue_limit_seconds"] == 10800
-    assert site["wandb_entity"] is None
+    assert site["wandb_entity"] == "columbia-homies"
     explicit = qwen_site.resolve_site("mbzuai-h200", shared / "custom", "research-team")
     assert explicit["wandb_entity"] == "research-team"
     assert qwen_site.site_from_manifest({"site": explicit}) == explicit

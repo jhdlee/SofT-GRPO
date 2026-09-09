@@ -772,7 +772,9 @@ class ProductionController:
         if log_path.exists() or (output.exists() and phase != "production"):
             raise ValueError(f"phase already attempted: {phase}")
         run_id = self.row["wandb_run_id"] if phase == "production" else self.row["wandb_run_id"] + "-" + ("resume" if phase in {"split", "resume"} else phase)
-        project = self.row.get("wandb_project", PRODUCTION_PROJECT) + ("" if phase == "production" else "-prologue")
+        project = self.row.get("wandb_project", PRODUCTION_PROJECT)
+        if phase != "production" and self.manifest.get("site", {}).get("site_id") != "mbzuai-h200":
+            project += "-prologue"
         command = phase_command(self.manifest, self.args.arm, phase, resume_from_path=resume_from_path)
         if phase == "production" and self.restart:
             command.append("++trainer.production_output=" + json.dumps(str(output)))

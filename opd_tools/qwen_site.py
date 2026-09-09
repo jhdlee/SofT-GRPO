@@ -49,7 +49,7 @@ def resolve_site(site_id: str = "marlowe-h100", artifact_root=None, wandb_entity
         artifact_root = shared_storage_root() / "opd-latent-reasoning"
     result = {"schema_version": 1, "site_id": site_id, **copy.deepcopy(_PROFILES[site_id]),
               "artifact_root": str(Path(artifact_root).expanduser().resolve()) if artifact_root is not None else None,
-              "wandb_entity": ("jhdlee" if site_id == "marlowe-h100" else None) if wandb_entity is None else wandb_entity}
+              "wandb_entity": ("jhdlee" if site_id == "marlowe-h100" else "columbia-homies") if wandb_entity is None else wandb_entity}
     return validate_site(result)
 
 

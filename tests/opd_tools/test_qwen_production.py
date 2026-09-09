@@ -408,7 +408,8 @@ def test_local_manifest_seals_cluster_storage_tracking_and_budget(local_manifest
     assert manifest["prologue_limit_seconds"] == 10800
     for row in manifest["arms"]:
         assert row["account"] == row["contract"]["account"] == "k2m"
-        assert row["wandb_entity"] is None
+        assert row["wandb_entity"] == "columbia-homies"
+        assert row["wandb_project"] == "soft-opd"
         command = production.phase_command(manifest, row["arm_id"], "production")
         assert row["production_overrides_sha256"] == canonical_sha256(command[3:])
         overrides = values(command[3:])
@@ -491,6 +492,8 @@ def test_local_site_keeps_every_phase_numerical_recipe_unchanged(local_manifest_
             historical = values(production.production_overrides(arm, inputs["assets_root"], run_root, **kwargs))
             local = values(production.production_overrides(arm, inputs["assets_root"], run_root, site=inputs["site"], **kwargs))
             assert local.pop("hydra.run.dir") == str(Path(metadata["directory"]) / "hydra")
+            assert local.pop("trainer.project_name") == "soft-opd"
+            historical.pop("trainer.project_name")
             assert local == historical, (arm, phase)
             assert local["trainer.default_local_dir"] == metadata["run_dir"]
 
