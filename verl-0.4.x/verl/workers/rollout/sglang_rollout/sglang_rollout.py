@@ -85,12 +85,21 @@ from verl.workers.rollout.sglang_rollout.request_dispatch import (
     benchmark_response_cap,
     check_collective_error,
     dispatch_generation,
+    expanded_requests,
     positive_integer,
+    poison_engine,
     require_healthy_engine,
     require_idle_engine,
     validate_dispatch_options,
 )
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
+from verl.workers.rollout.sglang_rollout.shared_queue import dispatch_shared_generation
+from verl.workers.rollout.sglang_rollout.shared_queue_transport import (
+    RayQueueClient,
+    abort_shared_queue,
+    close_shared_queue,
+    create_shared_queue,
+)
 
 try:
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -441,6 +450,8 @@ class SGLangRollout(BaseRollout):
             self.config.get("async_queue_size", 32),
             self.config.get("max_running_requests"),
         )
+        if self.config.get("dispatch_mode") == "shared_queue":
+            self._shared_queue_capacity()
         engine_options = {}
         from verl.opd.qwen_replay_backend import validate_qwen_replay_backend
         arithmetic = validate_qwen_replay_backend(self.config.get("qwen_replay_backend", "disabled"))
@@ -670,6 +681,51 @@ class SGLangRollout(BaseRollout):
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
 
+    def _shared_queue_capacity(self):
+        """Shared dispatch is confined to synchronous, single-turn TP1 engines."""
+        if self.config.get("tensor_model_parallel_size", 1) != 1 or self._tp_size != 1:
+            raise ValueError("shared_queue requires tensor_model_parallel_size=1")
+        if self.config.get("mode", "sync") != "sync" or self.config.get("multi_turn", {}).get("enable", False):
+            raise ValueError("shared_queue requires synchronous single-turn rollout")
+        if not self.config.get("deterministic_sampling", False):
+            raise ValueError("shared_queue requires deterministic per-response sampling seeds")
+        # Keep unstarted work in the common queue instead of reserving a second
+        # local wave behind each engine's active requests.
+        return min(
+            positive_integer(self.config.get("async_queue_size", 32), "async_queue_size"),
+            positive_integer(self.config.get("max_running_requests"), "max_running_requests"),
+        )
+
+    def _open_shared_queue(self):
+        """Create one actor inside the already-synchronized frozen-policy phase."""
+        actor, error = None, None
+        try:
+            capacity = self._shared_queue_capacity()
+            if not dist.is_initialized():
+                raise RuntimeError("shared_queue requires initialized distributed rollout workers")
+            if self._rank == 0:
+                actor = create_shared_queue(dist.get_world_size(), capacity)
+        except BaseException as failure:
+            error = failure
+        try:
+            check_collective_error(self._engine, dist, error, "shared queue creation")
+            handles, error = [actor], None
+            try:
+                dist.broadcast_object_list(handles, src=0)
+                if handles[0] is None:
+                    raise RuntimeError("shared queue actor was not broadcast")
+            except BaseException as failure:
+                error = failure
+            check_collective_error(self._engine, dist, error, "shared queue broadcast")
+            return handles[0]
+        except BaseException:
+            if self._rank == 0 and actor is not None:
+                try:
+                    close_shared_queue(actor)
+                except Exception:
+                    pass  # Preserve the collective failure; engines are retired.
+            raise
+
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -809,6 +865,9 @@ class SGLangRollout(BaseRollout):
             generation_error = None
             engine_timing = {}
             output = None
+            shared_actor = None
+            execution_ranks = None
+            shared_mode = self.config.get("dispatch_mode") == "shared_queue"
             try:
                 request_sampling_params = self.sampling_params
                 expanded_sampling_seeds = None
@@ -840,23 +899,75 @@ class SGLangRollout(BaseRollout):
                         base_sampling_seeds,
                         int(self.sampling_params.get("n", 1)),
                     )
-
-                if self._tp_rank == 0:
-                    loop = asyncio.get_event_loop()
-                    output, engine_timing = loop.run_until_complete(dispatch_generation(
-                        self._engine,
-                        mode=self.config.get("dispatch_mode", "legacy_batch"),
-                        queue_size=self.config.get("async_queue_size", 32),
-                        input_ids=idx_list,
-                        image_data=image_list,
-                        sampling_params=request_sampling_params,
-                        expanded_sampling_seeds=expanded_sampling_seeds,
-                    ))
+                if shared_mode:
+                    shared_requests = expanded_requests(
+                        idx_list, image_list, request_sampling_params, expanded_sampling_seeds,
+                    )
+                    policy_identity = {
+                        "rollout_iteration": prompts.meta_info.get("rollout_iteration"),
+                        "rollout_seed": prompts.meta_info.get("rollout_seed"),
+                        "validate": is_validate,
+                        "do_sample": do_sample,
+                        "sampling_params": dict(self.sampling_params),
+                    }
             except BaseException as error:
                 generation_error = error
+
+            if shared_mode:
+                # Local seed/descriptor errors must be synchronized before any
+                # rank enters the actor-creation and broadcast collectives.
+                check_collective_error(self._engine, dist, generation_error, "shared queue preparation")
+                shared_actor = self._open_shared_queue()
+            try:
+                if generation_error is None and self._tp_rank == 0:
+                    loop = asyncio.get_event_loop()
+                    if shared_mode:
+                        output, engine_timing, execution_ranks = loop.run_until_complete(dispatch_shared_generation(
+                            self._engine, RayQueueClient(shared_actor), shared_requests,
+                            queue_size=self._shared_queue_capacity(), rank=self._rank,
+                            policy_identity=policy_identity,
+                        ))
+                    else:
+                        output, engine_timing = loop.run_until_complete(dispatch_generation(
+                            self._engine,
+                            mode=self.config.get("dispatch_mode", "legacy_batch"),
+                            queue_size=self.config.get("async_queue_size", 32),
+                            input_ids=idx_list,
+                            image_data=image_list,
+                            sampling_params=request_sampling_params,
+                            expanded_sampling_seeds=expanded_sampling_seeds,
+                        ))
+            except BaseException as error:
+                generation_error = error
+                if shared_actor is not None:
+                    # Failures constructing the client/event loop can happen
+                    # before the consumer can notify peers itself.
+                    poison_engine(self._engine, f"shared queue generation failed: {error}")
+                    try:
+                        abort_shared_queue(shared_actor, self._rank, f"{type(error).__name__}: {error}")
+                    except Exception:
+                        pass  # A dead coordinator is observed by every consumer.
             # Every DP/TP rank participates even if one engine fails. Retire all
             # engines before propagating the failure out of the sharding context.
-            check_collective_error(self._engine, dist, generation_error, "generation")
+            try:
+                check_collective_error(self._engine, dist, generation_error, "generation")
+            except BaseException:
+                if shared_actor is not None and self._rank == 0:
+                    try:
+                        close_shared_queue(shared_actor)
+                    except Exception:
+                        pass
+                raise
+            if shared_actor is not None:
+                # All ranks have fetched their canonical results before this
+                # matched boundary, so the actor can release its object refs.
+                cleanup_error = None
+                try:
+                    if self._rank == 0:
+                        close_shared_queue(shared_actor)
+                except BaseException as error:
+                    cleanup_error = error
+                check_collective_error(self._engine, dist, cleanup_error, "shared queue cleanup")
             broadcast_error = None
             try:
                 output, engine_timing = broadcast_pyobj(
@@ -879,6 +990,14 @@ class SGLangRollout(BaseRollout):
                     output, idx, attention_mask, position_ids, non_tensor_batch,
                     eos_token_id, do_sample, expanded_sampling_seeds,
                 )
+                if shared_mode:
+                    if execution_ranks is None or len(execution_ranks) != result.batch["responses"].shape[0]:
+                        raise RuntimeError("shared queue execution ranks do not match the returned responses")
+                    # Rows return to their original owner for unchanged tensor
+                    # assembly; retain the GPU that actually generated each row.
+                    result.batch["rollout_rank"] = torch.tensor(
+                        execution_ranks, dtype=torch.int64, device=idx.device,
+                    )
             except BaseException as error:
                 assembly_error = error
             assembly_seconds = time.perf_counter() - assembly_started

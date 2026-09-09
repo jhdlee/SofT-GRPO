@@ -34,6 +34,7 @@ ARM_IDS = (
 )
 PHASES = ("production", "uninterrupted", "split", "resume", "full_dose", "zero_dose")
 ADMISSION_MODES = ("diagnostics", "direct_training")
+SOFT_ROLLOUT_DISPATCH_MODES = ("bounded_async", "shared_queue")
 RESOURCES = {"gpus": 4, "cpus": 56, "memory_gib": 768,
              "time_limit_seconds": 36 * 3600, "exclusive": False}
 PROLOGUE_LIMIT_SECONDS = 7200
@@ -103,6 +104,16 @@ def admission_mode(manifest: Mapping[str, Any]) -> str:
     if mode not in ADMISSION_MODES:
         raise ValueError("invalid production admission mode")
     return mode
+
+
+def _validate_soft_rollout_dispatch(value, options, admission):
+    if value not in SOFT_ROLLOUT_DISPATCH_MODES:
+        raise ValueError("invalid soft rollout dispatch mode")
+    if value == "shared_queue":
+        if options is None:
+            raise ValueError("shared_queue requires the LoRA/FA3 production profile")
+        if admission != "direct_training":
+            raise ValueError("shared_queue requires direct_training admission")
 
 
 def resolve_arm(identifier: str) -> study.ArmSpec:
@@ -178,10 +189,12 @@ def production_overrides(
     phase: str = "production", resume_from_path: Path | str | None = None,
     source_root: Path | str | None = None,
     training_options=None, runtime_manifest=None, site=None,
+    soft_rollout_dispatch="bounded_async", admission_mode="diagnostics",
 ) -> list[str]:
     """Emit unique Hydra overrides; invocation limits never shorten the horizon."""
     spec = resolve_arm(identifier)
     options = _options(training_options)
+    _validate_soft_rollout_dispatch(soft_rollout_dispatch, options, admission_mode)
     if site is not None:
         site = qwen_site.validate_site(site)
         qwen_site.validate_artifact_path(assets_root, site, "assets root")
@@ -235,7 +248,9 @@ def production_overrides(
         "trainer.rollout_integrity.completion_gate_enabled": False,
         "actor_rollout_ref.model.qwen_replay_backend": backend,
         "actor_rollout_ref.rollout.require_retained_support": spec.rollout_kind == "native_soft",
-        "actor_rollout_ref.rollout.dispatch_mode": "bounded_async" if spec.rollout_kind == "native_soft" else "legacy_batch",
+        "actor_rollout_ref.rollout.dispatch_mode": (
+            soft_rollout_dispatch if phase == "production" else "bounded_async"
+        ) if spec.rollout_kind == "native_soft" else "legacy_batch",
         "actor_rollout_ref.rollout.max_running_requests": 32,
         "actor_rollout_ref.rollout.async_queue_size": 64,
         "actor_rollout_ref.rollout.production_engine_isolation": spec.rollout_kind == "native_soft",
@@ -316,10 +331,12 @@ def _seal(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
                     parent_gitlink, soft_env, hard_env, assets_manifest, training_options=None,
-                    site=None, prologue_limit_seconds=None, admission_mode="diagnostics") -> dict[str, Any]:
+                    site=None, prologue_limit_seconds=None, admission_mode="diagnostics",
+                    soft_rollout_dispatch="bounded_async") -> dict[str, Any]:
     if admission_mode not in ADMISSION_MODES:
         raise ValueError("invalid production admission mode")
     options = _options(training_options)
+    _validate_soft_rollout_dispatch(soft_rollout_dispatch, options, admission_mode)
     profile_id = _profile(options)
     for name, value in (("parent_commit", parent_commit), ("fork_commit", fork_commit), ("parent_gitlink", parent_gitlink)):
         _commit(value, name)
@@ -371,6 +388,9 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
         base["site"] = site
     if admission_mode != "diagnostics":
         base["admission_mode"] = admission_mode
+    # Omit the default so historical manifest hashes and run IDs stay stable.
+    if soft_rollout_dispatch != "bounded_async":
+        base["soft_rollout_dispatch"] = soft_rollout_dispatch
     if options is not None:
         base.update(training_options=options.as_manifest(), runtime_manifest=runtime_manifest,
                     runtime_package_pins={kind: dict(SHARED_RUNTIME_PINS) for kind in ("soft", "hard")})
@@ -387,10 +407,13 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
             identity_inputs.append({"site": site, "prologue_limit_seconds": prologue_limit_seconds})
         if admission_mode != "diagnostics":
             identity_inputs.append({"admission_mode": admission_mode})
+        if soft_rollout_dispatch != "bounded_async" and spec.rollout_kind == "native_soft":
+            identity_inputs.append({"soft_rollout_dispatch": soft_rollout_dispatch})
         identity = canonical_sha256(identity_inputs)
         phases = {phase: phase_metadata(identifier, run_root, phase) for phase in PHASES}
         production = production_overrides(identifier, assets_root, run_root, source_root=source_root,
-                                          training_options=options, runtime_manifest=runtime_manifest, site=site)
+                                          training_options=options, runtime_manifest=runtime_manifest, site=site,
+                                          soft_rollout_dispatch=soft_rollout_dispatch, admission_mode=admission_mode)
         base["arms"].append({
             "arm_id": identifier, "account": contract["account"], "run_root": str(run_root),
             "environment_root": str(environment), "python_bin": str(environment / "bin/python"),
@@ -407,7 +430,8 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
 
 def build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
                    soft_env, hard_env, parent_gitlink=None, training_options=None,
-                   site=None, prologue_limit_seconds=None, admission_mode="diagnostics") -> dict[str, Any]:
+                   site=None, prologue_limit_seconds=None, admission_mode="diagnostics",
+                   soft_rollout_dispatch="bounded_async") -> dict[str, Any]:
     assets = qwen_training.verify(assets_root)
     _verify_source(_absolute(source_root), parent_commit, fork_commit)
     return _build_manifest(assets_root=assets_root, study_root=study_root, source_root=source_root,
@@ -415,7 +439,7 @@ def build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_
                            parent_gitlink=fork_commit if parent_gitlink is None else parent_gitlink,
                            soft_env=soft_env, hard_env=hard_env, assets_manifest=assets,
                            training_options=training_options, site=site, prologue_limit_seconds=prologue_limit_seconds,
-                           admission_mode=admission_mode)
+                           admission_mode=admission_mode, soft_rollout_dispatch=soft_rollout_dispatch)
 
 
 def _write_immutable(path: Path, payload: Mapping[str, Any]) -> None:
@@ -478,7 +502,8 @@ def verify_manifest(path: Path | str, *, verify_assets: bool = True, verify_sour
                                soft_env=manifest["runtime_environments"]["soft"], hard_env=manifest["runtime_environments"]["hard"], assets_manifest=assets,
                                training_options=manifest.get("training_options"), site=manifest.get("site"),
                                prologue_limit_seconds=manifest["prologue_limit_seconds"],
-                               admission_mode=admission_mode(manifest))
+                               admission_mode=admission_mode(manifest),
+                               soft_rollout_dispatch=manifest.get("soft_rollout_dispatch", "bounded_async"))
     if manifest != expected:
         raise ValueError("production manifest differs from the source/profile/asset contract")
     for arm in manifest["arms"]:
@@ -507,6 +532,8 @@ def phase_command(manifest: Mapping[str, Any], identifier: str, phase: str, *, r
         source_root=manifest["source_root"],
         training_options=manifest.get("training_options"), runtime_manifest=manifest.get("runtime_manifest"),
         site=manifest.get("site"),
+        soft_rollout_dispatch=manifest.get("soft_rollout_dispatch", "bounded_async"),
+        admission_mode=admission_mode(manifest),
     )]
 
 
@@ -540,6 +567,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                      help="seal a reviewed startup budget; H200 defaults to 10800 seconds")
     sub.add_argument("--admission-mode", choices=ADMISSION_MODES, default="diagnostics",
                      help="seal direct_training to skip diagnostic runs while retaining allocation/runtime checks")
+    sub.add_argument("--soft-rollout-dispatch", choices=SOFT_ROLLOUT_DISPATCH_MODES, default="bounded_async",
+                     help="shared_queue opts native-soft production into cross-GPU scheduling; requires LoRA/FA3 and direct_training")
     for name in ("verify", "overrides", "command"):
         sub = commands.add_parser(name)
         sub.add_argument("--manifest", type=Path, required=True)

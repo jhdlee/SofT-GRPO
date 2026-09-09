@@ -514,3 +514,157 @@ def test_local_hydra_output_override_composes_with_revised_profile(local_manifes
         config = hydra.compose(config_name="ppo_trainer", overrides=overrides, return_hydra_config=True)
     assert config.hydra.run.dir == str(inputs["study_root"] / "run/production/hydra")
     assert config.trainer.default_local_dir == str(inputs["study_root"] / "run/production/training")
+
+
+@pytest.fixture
+def shared_queue_inputs(local_manifest_inputs):
+    runtime = local_manifest_inputs["soft_env"]
+    runtime.mkdir()
+    payload = {"schema_version": 1, "cpu_ray_preflight": True,
+               "build_record": {"source": {key: local_manifest_inputs[key]
+                                          for key in ("parent_commit", "fork_commit")}}}
+    (runtime / "opd-runtime-manifest.json").write_text(json.dumps(production._seal(payload)))
+    return {**local_manifest_inputs, "hard_env": runtime,
+            "training_options": production.TrainingOptions(), "admission_mode": "direct_training"}
+
+
+def test_soft_dispatch_default_preserves_historical_and_revised_manifests(manifest_inputs, shared_queue_inputs):
+    for inputs in (manifest_inputs, shared_queue_inputs):
+        previous = production.build_manifest(**inputs)
+        assert "soft_rollout_dispatch" not in previous
+        explicit = production.build_manifest(**inputs, soft_rollout_dispatch="bounded_async")
+        assert explicit == previous
+
+
+@pytest.mark.parametrize("arm", production.ARM_IDS)
+def test_shared_queue_changes_only_native_soft_production_dispatch(shared_queue_inputs, arm):
+    inputs = shared_queue_inputs
+    run = inputs["study_root"] / "arms" / arm
+    for phase in production.PHASES:
+        if not production.phase_metadata(arm, run, phase)["applicable"]:
+            continue
+        kwargs = dict(phase=phase, training_options=inputs["training_options"], site=inputs["site"],
+                      admission_mode="direct_training",
+                      resume_from_path=run / "checkpoint" if phase == "resume" else None)
+        baseline = values(production.production_overrides(arm, inputs["assets_root"], run, **kwargs))
+        shared = values(production.production_overrides(
+            arm, inputs["assets_root"], run, soft_rollout_dispatch="shared_queue", **kwargs))
+        if phase == "production" and production.resolve_arm(arm).rollout_kind == "native_soft":
+            baseline["actor_rollout_ref.rollout.dispatch_mode"] = "shared_queue"
+        assert shared == baseline, (arm, phase)
+        assert shared["actor_rollout_ref.rollout.max_running_requests"] == 32
+        assert shared["actor_rollout_ref.rollout.async_queue_size"] == 64
+        assert shared["trainer.project_name"] == "soft-opd"
+
+
+def test_shared_queue_manifest_binds_selection_and_regenerates_phase_commands(shared_queue_inputs):
+    baseline = production.build_manifest(**shared_queue_inputs)
+    manifest = production.materialize_manifest(**shared_queue_inputs, soft_rollout_dispatch="shared_queue")
+    path = shared_queue_inputs["study_root"] / "manifest.json"
+    assert production.verify_manifest(path) == manifest
+    assert production.verify_manifest(path, verify_assets=False, verify_source=False) == manifest
+    assert manifest["soft_rollout_dispatch"] == "shared_queue"
+    assert manifest["manifest_content_sha256"] != baseline["manifest_content_sha256"]
+    for previous, row in zip(baseline["arms"], manifest["arms"]):
+        native = production.resolve_arm(row["arm_id"]).rollout_kind == "native_soft"
+        assert (row["wandb_run_id"] != previous["wandb_run_id"]) is native
+        assert row["contract"] == previous["contract"]
+        assert row["wandb_project"] == "soft-opd"
+        assert row["wandb_entity"] == "columbia-homies"
+        command = production.phase_command(manifest, row["arm_id"], "production")
+        assert command[3:] == row["production_overrides"]
+        assert canonical_sha256(command[3:]) == row["production_overrides_sha256"]
+        split = values(production.phase_command(manifest, row["arm_id"], "split")[3:])
+        assert split["actor_rollout_ref.rollout.dispatch_mode"] == ("bounded_async" if native else "legacy_batch")
+
+
+@pytest.mark.parametrize("mode", [None, False, "", "async", "legacy_batch"])
+def test_invalid_soft_dispatch_selection_is_rejected(shared_queue_inputs, mode):
+    with pytest.raises(ValueError, match="soft rollout dispatch mode"):
+        production.build_manifest(**shared_queue_inputs, soft_rollout_dispatch=mode)
+
+
+@pytest.mark.parametrize("revised,admission,message", [
+    (False, "diagnostics", "LoRA/FA3"),
+    (False, "direct_training", "LoRA/FA3"),
+    (True, "diagnostics", "direct_training"),
+])
+def test_shared_queue_rejects_unsupported_profile_and_admission(shared_queue_inputs, revised, admission, message):
+    kwargs = {**shared_queue_inputs, "training_options": production.TrainingOptions() if revised else None,
+              "admission_mode": admission, "soft_rollout_dispatch": "shared_queue"}
+    with pytest.raises(ValueError, match=message):
+        production.build_manifest(**kwargs)
+    with pytest.raises(ValueError, match=message):
+        production.production_overrides(production.ARM_IDS[1], kwargs["assets_root"], kwargs["study_root"],
+                                        training_options=kwargs["training_options"], admission_mode=admission,
+                                        soft_rollout_dispatch="shared_queue")
+
+
+@pytest.mark.parametrize("tamper", ["missing_selection", "unknown_selection", "dispatch_override", "admission"])
+def test_shared_queue_rejects_resealed_selection_and_override_tampering(shared_queue_inputs, tamper):
+    manifest = production.materialize_manifest(**shared_queue_inputs, soft_rollout_dispatch="shared_queue")
+    if tamper == "missing_selection":
+        manifest.pop("soft_rollout_dispatch")
+    elif tamper == "unknown_selection":
+        manifest["soft_rollout_dispatch"] = "automatic"
+    elif tamper == "admission":
+        manifest["admission_mode"] = "diagnostics"
+    else:
+        row = manifest["arms"][1]
+        row["production_overrides"] = [item.replace('dispatch_mode="shared_queue"', 'dispatch_mode="bounded_async"')
+                                       for item in row["production_overrides"]]
+        row["production_overrides_sha256"] = canonical_sha256(row["production_overrides"])
+    manifest.pop("manifest_content_sha256")
+    manifest = production._seal(manifest)
+    path = shared_queue_inputs["study_root"] / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    for row in manifest["arms"]:
+        arm_file = Path(row["run_root"]) / "profile.json"
+        arm_file.write_text(json.dumps(production._seal({
+            "profile_id": manifest["profile_id"], "study_manifest_content_sha256": manifest["manifest_content_sha256"],
+            "arm": row,
+        })))
+    with pytest.raises(ValueError):
+        production.verify_manifest(path)
+
+
+def test_shared_queue_verification_keeps_source_and_runtime_checks(shared_queue_inputs, monkeypatch):
+    manifest = production.materialize_manifest(**shared_queue_inputs, soft_rollout_dispatch="shared_queue")
+    path = Path(manifest["study_root"]) / "manifest.json"
+    def changed_source(*args):
+        raise ValueError("production source checkout changed")
+    with monkeypatch.context() as context:
+        context.setattr(production, "_verify_source", changed_source)
+        with pytest.raises(ValueError, match="source checkout changed"):
+            production.verify_manifest(path)
+    runtime = shared_queue_inputs["soft_env"] / "opd-runtime-manifest.json"
+    payload = json.loads(runtime.read_text())
+    payload.pop("manifest_content_sha256")
+    payload["build_record"]["source"]["fork_commit"] = "c" * 40
+    runtime.write_text(json.dumps(production._seal(payload)))
+    with pytest.raises(ValueError, match="runtime source"):
+        production.verify_manifest(path)
+
+
+def test_shared_queue_cli_and_hydra_composition(shared_queue_inputs, capsys):
+    import hydra
+
+    inputs = shared_queue_inputs
+    argv = ["materialize", "--profile", production.LORA_PROFILE_ID,
+            "--shared-env", str(inputs["soft_env"]), "--admission-mode", "direct_training",
+            "--soft-rollout-dispatch", "shared_queue", "--site", "mbzuai-h200",
+            "--artifact-root", inputs["site"]["artifact_root"]]
+    for key in ("assets_root", "study_root", "source_root", "parent_commit", "fork_commit"):
+        argv.extend(["--" + key.replace("_", "-"), str(inputs[key])])
+    assert production.main(argv) == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["soft_rollout_dispatch"] == "shared_queue"
+    overrides = production.phase_command(manifest, production.ARM_IDS[1], "production")[3:]
+    directory = Path(qwen_training.__file__).resolve().parents[1] / "verl-0.4.x/verl/trainer/config"
+    with hydra.initialize_config_dir(config_dir=str(directory), version_base=None):
+        config = hydra.compose(config_name="ppo_trainer", overrides=overrides)
+    assert config.actor_rollout_ref.rollout.dispatch_mode == "shared_queue"
+    assert config.trainer.project_name == "soft-opd"
+    with pytest.raises(SystemExit) as error:
+        production.main(argv + ["--soft-rollout-dispatch", "automatic"])
+    assert error.value.code == 2

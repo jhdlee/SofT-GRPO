@@ -122,7 +122,7 @@ actor_rollout_ref:
     max_num_batched_tokens: 8192
     max_model_len: null
     deterministic_sampling: false
-    dispatch_mode: legacy_batch # SGLang: legacy_batch | expanded_batch | bounded_async
+    dispatch_mode: legacy_batch # SGLang: legacy_batch | expanded_batch | bounded_async | shared_queue
     async_queue_size: 32 # frontend trajectory bound within one frozen-policy rollout
     require_retained_support: false # Qwen benchmark fails closed without observed top-p support
     max_running_requests: null # SGLang scheduler bound; null preserves engine default

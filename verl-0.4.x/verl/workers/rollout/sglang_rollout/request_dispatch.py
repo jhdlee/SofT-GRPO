@@ -13,7 +13,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-DISPATCH_MODES = ("legacy_batch", "expanded_batch", "bounded_async")
+LOCAL_DISPATCH_MODES = ("legacy_batch", "expanded_batch", "bounded_async")
+DISPATCH_MODES = (*LOCAL_DISPATCH_MODES, "shared_queue")
 
 
 def positive_integer(value: Any, name: str) -> int:
@@ -170,6 +171,8 @@ async def dispatch_generation(
     """Finish the entire frozen-policy batch, retaining canonical row order."""
 
     validate_dispatch_options(mode, queue_size, None)
+    if mode == "shared_queue":
+        raise ValueError("shared_queue requires the distributed shared-queue coordinator")
     require_idle_engine(engine)
     _, counts = _prompt_sampling_params(input_ids, image_data, sampling_params)
     request_count = sum(counts)

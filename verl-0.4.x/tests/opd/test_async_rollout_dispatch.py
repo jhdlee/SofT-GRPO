@@ -106,7 +106,7 @@ def test_dispatchers_preserve_seed_expansion_order_and_native_metadata(group_siz
     kwargs = request_arguments(group_size)
     original = copy.deepcopy(kwargs)
     outputs = {}
-    for mode in dispatch.DISPATCH_MODES:
+    for mode in dispatch.LOCAL_DISPATCH_MODES:
         engine = Engine()
         outputs[mode], timing = asyncio.run(dispatch.dispatch_generation(engine, mode=mode, **kwargs))
         assert timing["request_count"] == 2 * group_size
@@ -225,7 +225,7 @@ def test_caller_cancellation_retires_engine_and_leaves_no_frontend_tasks():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("mode", dispatch.DISPATCH_MODES)
+@pytest.mark.parametrize("mode", dispatch.LOCAL_DISPATCH_MODES)
 def test_invalid_completion_fails_entire_rollout(mode):
     class BadEngine(Engine):
         async def async_generate(self, **kwargs):
@@ -243,6 +243,12 @@ def test_invalid_queue_and_engine_bounds_are_rejected(value):
         dispatch.validate_dispatch_options("bounded_async", value, None)
     with pytest.raises(ValueError):
         dispatch.validate_dispatch_options("bounded_async", 32, value)
+
+
+def test_shared_dispatch_requires_coordinator_instead_of_silently_using_local_queue():
+    dispatch.validate_dispatch_options("shared_queue", 64, 32)
+    with pytest.raises(ValueError, match="coordinator"):
+        asyncio.run(dispatch.dispatch_generation(Engine(), mode="shared_queue", **request_arguments()))
 
 
 def test_warmup_cap_is_positive_bounded_and_does_not_mutate_metadata():
@@ -309,7 +315,7 @@ def load_adapter():
         "dist": LocalDist, "broadcast_pyobj": lambda data, **kwargs: data,
         **{name: getattr(dispatch, name) for name in (
             "benchmark_response_cap", "check_collective_error", "dispatch_generation",
-            "positive_integer", "validate_dispatch_options",
+            "positive_integer", "validate_dispatch_options", "expanded_requests", "poison_engine",
         )},
         "os": SimpleNamespace(environ={}),
         **{name: SEED_NS[name] for name in ("build_request_sampling_params", "expand_parallel_seeds")},
@@ -322,6 +328,7 @@ def load_adapter():
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SGLangRollout")
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in {
         "_batch_level_generate_sequences", "_assemble_single_turn_outputs", "update_sampling_params", "_init_inference_engine",
+        "_shared_queue_capacity", "_open_shared_queue",
     }]
     for method in methods:
         if method.name != "update_sampling_params":
@@ -339,6 +346,7 @@ def load_adapter():
     result.tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=2)
     result.pad_token_id = 0
     result._rank = result._tp_rank = 0
+    result._tp_size = 1
     result._device_mesh_cpu = {"tp": SimpleNamespace(get_group=lambda: None, mesh=torch.tensor([0]))}
     result._engine = Engine()
     result._test_namespace = namespace
@@ -363,6 +371,141 @@ def prompts(*, warmup=None, validate=False):
     return result
 
 
+def shared_adapter():
+    """Use the actual shared dispatcher and adapter with one CPU engine."""
+    from test_shared_rollout_queue import Client, shared
+
+    adapter = load_adapter()
+    adapter.config.update(dispatch_mode="shared_queue", max_running_requests=2, require_retained_support=True)
+    created, closed, aborted = [], [], []
+
+    class Distributed(LocalDist):
+        is_initialized = staticmethod(lambda: True)
+        get_world_size = staticmethod(lambda: 1)
+
+        @staticmethod
+        def all_gather_object(values, local):
+            values[:] = [local]
+
+        @staticmethod
+        def broadcast_object_list(handles, src):
+            assert src == 0 and handles[0] is not None
+
+    def create(world_size, capacity):
+        actor = shared.SharedRolloutQueue(world_size, capacity)
+        created.append(actor)
+        return actor
+
+    def abort(actor, rank, reason):
+        aborted.append(reason)
+        actor.fail(rank, reason)
+
+    adapter._test_namespace.update(
+        dist=Distributed, create_shared_queue=create, close_shared_queue=closed.append,
+        abort_shared_queue=abort, RayQueueClient=Client,
+        dispatch_shared_generation=shared.dispatch_shared_generation,
+    )
+    return adapter, created, closed, aborted
+
+
+@pytest.mark.parametrize("validate", [False, True])
+@pytest.mark.parametrize("group_size", [1, 8])
+def test_shared_adapter_preserves_canonical_seeds_groups_and_every_native_tensor(validate, group_size):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        reference = load_adapter()
+        reference.config.dispatch_mode = "bounded_async"
+        reference.sampling_params["n"] = group_size
+        expected = reference._batch_level_generate_sequences(prompts(validate=validate))
+        adapter, created, closed, aborted = shared_adapter()
+        adapter.sampling_params["n"] = group_size
+        actual = adapter._batch_level_generate_sequences(prompts(validate=validate))
+        assert set(actual.batch) == set(expected.batch)
+        for key in expected.batch:
+            assert torch.equal(actual.batch[key], expected.batch[key]), key
+        for key in expected.non_tensor_batch:
+            assert np.array_equal(actual.non_tensor_batch[key], expected.non_tensor_batch[key]), key
+        timing = actual.meta_info["rollout_timing"]
+        assert timing["dispatch_mode"] == "shared_queue"
+        assert timing["frontend_peak_pending"] <= 2  # Engine cap, not frontend queue size three.
+        assert timing["shared_queue_executed_request_count"] == actual.batch["responses"].shape[0]
+        assert len(created) == 1 and closed == created and not aborted
+        assert created[0].status()["state"] == "done"
+        assert adapter._engine.shutdown_calls == 0 and adapter._engine.flush_calls == 1
+        assert not adapter._engine._opd_batch_outstanding
+        assert adapter.sampling_params["n"] == group_size
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+@pytest.mark.parametrize("options,match", [
+    ({"tensor_model_parallel_size": 2}, "tensor_model_parallel_size"),
+    ({"mode": "async"}, "single-turn"),
+    ({"multi_turn": {"enable": True}}, "single-turn"),
+    ({"deterministic_sampling": False}, "sampling seeds"),
+    ({"max_running_requests": None}, "max_running_requests"),
+])
+def test_shared_adapter_rejects_unsupported_engine_modes(options, match):
+    adapter, *_ = shared_adapter()
+    adapter.config.update(options)
+    with pytest.raises(ValueError, match=match):
+        adapter._shared_queue_capacity()
+
+
+@pytest.mark.parametrize("failure", ["seed_preparation", "creation", "broadcast", "client", "engine", "cleanup", "metadata"])
+def test_shared_adapter_failure_retires_engine_and_closes_created_coordinator(failure):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        adapter, created, closed, aborted = shared_adapter()
+        batch = prompts()
+        ns = adapter._test_namespace
+
+        def fail(*args, **kwargs):
+            raise ValueError("injected " + failure)
+
+        if failure == "seed_preparation":
+            del batch.meta_info["rollout_seed"]
+        elif failure == "creation":
+            ns["create_shared_queue"] = fail
+        elif failure == "broadcast":
+            ns["dist"].broadcast_object_list = staticmethod(fail)
+        elif failure == "client":
+            ns["RayQueueClient"] = fail
+        elif failure == "cleanup":
+            ns["close_shared_queue"] = fail
+        elif failure == "engine":
+            async def generate(**kwargs):
+                fail()
+            adapter._engine.async_generate = generate
+        else:
+            original = adapter._engine.async_generate
+            async def malformed(**kwargs):
+                result = await original(**kwargs)
+                result["meta_info"].pop("output_topk_retained_mask_list")
+                return result
+            adapter._engine.async_generate = malformed
+
+        with pytest.raises(RuntimeError):
+            adapter._batch_level_generate_sequences(batch)
+        assert adapter._engine.shutdown_calls == 1
+        assert adapter._engine.flush_calls == 0
+        assert not getattr(adapter._engine, "_opd_batch_outstanding", False)
+        if failure in {"seed_preparation", "creation"}:
+            assert not created
+        elif failure != "cleanup":
+            assert closed == created and len(closed) == 1
+        if failure in {"client", "engine"}:
+            assert aborted
+            with pytest.raises(RuntimeError, match="failed"):
+                created[0].status()
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 @pytest.mark.parametrize("validate", [False, True])
 @pytest.mark.parametrize("group_size", [1, 8])
 def test_real_adapter_preserves_every_replay_tensor_and_validation_expansion(validate, group_size):
@@ -370,7 +513,7 @@ def test_real_adapter_preserves_every_replay_tensor_and_validation_expansion(val
     asyncio.set_event_loop(loop)
     try:
         result = {}
-        for mode in dispatch.DISPATCH_MODES:
+        for mode in dispatch.LOCAL_DISPATCH_MODES:
             adapter = load_adapter()
             adapter.config.dispatch_mode = mode
             adapter.sampling_params["n"] = group_size
@@ -447,7 +590,7 @@ def test_required_filter_metadata_failure_retires_entire_rollout(field):
         asyncio.set_event_loop(None)
 
 
-@pytest.mark.parametrize("mode", dispatch.DISPATCH_MODES)
+@pytest.mark.parametrize("mode", dispatch.LOCAL_DISPATCH_MODES)
 @pytest.mark.parametrize("defect", [
     "response_support_disagreement", "output_id_disagreement", "support_length",
     "perturbation_length", "noninteger_ids", "empty_response",
@@ -491,7 +634,7 @@ def test_contradictory_action_metadata_retires_entire_rollout(mode, defect):
         asyncio.set_event_loop(None)
 
 
-@pytest.mark.parametrize("mode", dispatch.DISPATCH_MODES)
+@pytest.mark.parametrize("mode", dispatch.LOCAL_DISPATCH_MODES)
 def test_actual_engine_transitions_reject_outstanding_dispatch(mode):
     tree = ast.parse((ROLLOUT / "sglang_rollout.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AsyncEngine")
