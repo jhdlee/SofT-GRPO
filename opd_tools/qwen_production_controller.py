@@ -1,7 +1,8 @@
 """Run bounded correctness admission, then authenticated Qwen3 production.
 
-Only clean iteration-boundary continuations return 75. Failed rollouts,
-prologues and uncertain submission outcomes never request a retry.
+Clean iteration-boundary continuations return 75. Production failures may
+requeue from a verified checkpoint with a bounded retry budget. Admission
+failures and uncertain submission outcomes never request a retry.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -21,6 +23,8 @@ from .manifest import canonical_sha256, file_sha256, validate_sealed_content, wr
 from .qwen_acceptance import validate_fsdp_probe, validate_measurement_physical_memory
 from .qwen_site import site_from_manifest, validate_artifact_path, validate_scheduler_allocation
 from .training_capacity import classify_failure, finite_snapshot
+
+MAX_FAILURE_RETRIES_WITHOUT_PROGRESS = 3
 
 
 def write_json(path, value, *, seal=False):
@@ -156,9 +160,13 @@ def validate_measurement(measured, manifest, row, phase, arguments):
                                          required=requires_semantic_checkpoint(manifest))
 
 
-def authenticate_checkpoint(root, step, *, arm_id, teacher=True, require_semantic=False):
+def authenticate_checkpoint(root, step, *, arm_id, teacher=True, require_semantic=False,
+                            expected_provenance=None):
     from verl.trainer.ppo.ray_trainer import _verify_checkpoint
-    manifest = _verify_checkpoint(str(Path(root) / f"global_step_{step}"), require_semantic=require_semantic)
+    options = {"require_semantic": require_semantic}
+    if expected_provenance is not None:
+        options["expected_provenance"] = expected_provenance
+    manifest = _verify_checkpoint(str(Path(root) / f"global_step_{step}"), **options)
     for key, value in {"global_step": step, "optimizer_step": 2 * step, "world_size": 4,
                        "total_rollout_iterations": 109, "next_rollout_iteration": step}.items():
         if manifest.get(key) != value:
@@ -416,6 +424,260 @@ def verify_continuation(manifest_path, manifest, row):
     return continuation
 
 
+def _recovery_expected_provenance(manifest, row):
+    """Recover the resolved production identity, independently of a clean exit.
+
+    The recorder publishes its resolved configuration before the first update.
+    Rebuild its provenance and check the sealed recipe overrides rather than
+    trusting a checkpoint's own claim about which run produced it.
+    """
+    from .qwen_production import _values
+    from verl.opd.provenance import build_checkpoint_provenance, assert_checkpoint_provenance_matches
+    directory = Path(row["phases"]["production"]["directory"])
+    paths = list(directory.glob("measurement*.json"))
+    def order(path):
+        suffix = path.stem.removeprefix("measurement-")
+        return int(suffix) if suffix.isdecimal() else -1
+    expected = _values(row["production_overrides"])
+    for path in sorted(paths, key=order, reverse=True):
+        measured = read_json(path)
+        if measured.get("phase") != "production" or measured.get("arm_id") != row["arm_id"]:
+            raise ValueError("recovery measurement belongs to another phase or arm")
+        config = measured.get("configuration")
+        if not isinstance(config, dict) or not measured.get("checkpoint_provenance"):
+            continue
+        for key, wanted in expected.items():
+            if key.startswith("hydra.") or key in {"trainer.resume_mode", "trainer.resume_from_path",
+                    "trainer.production_output", "trainer.requeue_signal_file"}:
+                continue
+            observed = config
+            for component in key.split("."):
+                if not isinstance(observed, dict) or component not in observed:
+                    raise ValueError(f"recovery configuration is missing {key}")
+                observed = observed[component]
+            # The trainer fills optimizer horizons after constructing the
+            # authenticated 109-batch dataloader.
+            if key in {"actor_rollout_ref.actor.optim.total_training_steps", "critic.optim.total_training_steps"}:
+                wanted = 109
+            if observed != wanted or (isinstance(wanted, bool) and type(observed) is not bool):
+                raise ValueError(f"recovery configuration differs from the sealed recipe: {key}")
+        provenance = build_checkpoint_provenance(config)
+        if provenance["source"]["commit"] != manifest["fork_commit"]:
+            raise ValueError("recovery training source differs from the submission")
+        assert_checkpoint_provenance_matches(measured["checkpoint_provenance"], provenance)
+        return provenance
+    raise ValueError("no resolved production provenance exists for checkpoint recovery")
+
+
+def _find_recovery_checkpoint(root, expected_provenance, *, require_semantic):
+    from verl.trainer.ppo.ray_trainer import _find_latest_committed_checkpoint
+    return _find_latest_committed_checkpoint(str(root), expected_provenance=expected_provenance,
+            return_manifest=True, require_semantic=require_semantic)
+
+
+def select_recovery_checkpoint(manifest_path, manifest, row):
+    """Select the newest intact production checkpoint; never use prologue state."""
+    admission = verify_admission(manifest_path, manifest, row)
+    root = Path(row["phases"]["production"]["run_dir"])
+    if root != Path(row["run_root"]) / "production" / "training":
+        raise ValueError("recovery checkpoint root is outside this arm's production directory")
+    validate_artifact_path(root, site_from_manifest(manifest), label="recovery checkpoints")
+    expected = _recovery_expected_provenance(manifest, row)
+    selected = _find_recovery_checkpoint(root, expected,
+                                         require_semantic=requires_semantic_checkpoint(manifest))
+    if selected is None:
+        raise ValueError("no valid production checkpoint exists; automatic recovery cannot start")
+    path, checkpoint = selected
+    step = checkpoint.get("global_step")
+    if type(step) is not int or not 1 <= step <= 109 or Path(path) != root / f"global_step_{step}":
+        raise ValueError("invalid production recovery boundary")
+    checkpoint = authenticate_checkpoint(root, step, arm_id=row["arm_id"],
+                    require_semantic=requires_semantic_checkpoint(manifest), expected_provenance=expected)
+    return {"global_step": step, "resume_from_path": str(path),
+            "checkpoint_manifest_sha256": file_sha256(Path(path) / "checkpoint_manifest.json"),
+            "admission_sha256": admission["manifest_content_sha256"],
+            "resume_provenance_sha256": checkpoint["resume_provenance_sha256"]}
+
+
+def finalize_recovered_checkpoint(manifest, row, recovery):
+    """Finish metadata publication and retention after a final-checkpoint crash.
+
+    The current allocation owns the training directory, but needs no workers:
+    every training update is already committed in the authenticated final state.
+    """
+    from .qwen_production import _values
+    from verl.trainer.ppo.ray_trainer import _repair_checkpoint_history, _prune_committed_checkpoints
+
+    root = Path(row["phases"]["production"]["run_dir"])
+    if root != Path(row["run_root"]) / "production" / "training":
+        raise ValueError("final recovery checkpoint root is outside this arm's production directory")
+    validate_artifact_path(root, site_from_manifest(manifest), label="final recovery checkpoints")
+    if (type(recovery.get("global_step")) is not int or recovery["global_step"] != 109
+            or recovery.get("resume_from_path") != str(root / "global_step_109")):
+        raise ValueError("final recovery requires the selected iteration-109 checkpoint")
+    expected = _recovery_expected_provenance(manifest, row)
+    checkpoint = authenticate_checkpoint(root, 109, arm_id=row["arm_id"],
+                    require_semantic=requires_semantic_checkpoint(manifest), expected_provenance=expected)
+    if (file_sha256(root / "global_step_109" / "checkpoint_manifest.json")
+            != recovery.get("checkpoint_manifest_sha256")
+            or checkpoint["resume_provenance_sha256"] != recovery.get("resume_provenance_sha256")):
+        raise ValueError("final recovery checkpoint differs from the selected state")
+    values = _values(row["production_overrides"])
+    repaired = _repair_checkpoint_history(str(root), resumed_manifest=checkpoint,
+                    best_mode=str(values.get("trainer.checkpoint_best_mode", "max")))
+    pruned = _prune_committed_checkpoints(str(root),
+                    keep_latest=int(values.get("trainer.checkpoint_keep_latest", 2)))
+    return {"status": "complete", "global_step": 109,
+            "history_removed": repaired, "retention_removed": pruned}
+
+
+def _recovery_segment(manifest_path, manifest, row, *, job_id, restart_count):
+    if not str(job_id).isdecimal() or type(restart_count) is not int or restart_count < 0:
+        raise ValueError("invalid recovery allocation identity")
+    path = Path(row["run_root"]) / f"segment-{restart_count}.json"
+    report = read_json(path)
+    expected = {"arm_id": row["arm_id"], "job_id": str(job_id), "restart_count": restart_count,
+                "submission_manifest_sha256": file_sha256(manifest_path),
+                "parent_commit": manifest["parent_commit"], "fork_commit": manifest["fork_commit"]}
+    if any(report.get(key) != value for key, value in expected.items()):
+        raise ValueError("recovery segment belongs to another source, arm or allocation")
+    return report
+
+
+def prepare_recovery(manifest_path, manifest, row, *, job_id, restart_count, failure_exit_code=None):
+    """Authorize at most three retries without a newer committed checkpoint.
+
+    The per-segment record makes the shell's request and the next allocation's
+    startup idempotent. A node failure can enter here without a shell request.
+    """
+    if failure_exit_code is not None and (type(failure_exit_code) is not int
+            or failure_exit_code <= 0 or failure_exit_code in {75, 130, 143}):
+        raise ValueError("successful completion, continuation and cancellation are not failure retries")
+    report = _recovery_segment(manifest_path, manifest, row, job_id=job_id, restart_count=restart_count)
+    if "production" not in report.get("phases", {}):
+        raise ValueError("automatic recovery requires a production attempt after accepted admission")
+    failure = report.get("failure", {})
+    message = str(failure.get("error", "")).lower()
+    if (report.get("cleanup_error") or report.get("persistence_error")
+            or failure.get("category") == "authentication"
+            or any(term in message for term in ("interrupted by signal 15", "interrupted by signal 2",
+                                                "keyboardinterrupt", "cancelled", "canceled"))):
+        raise ValueError("cancellation, authentication or cleanup failure cannot automatically retry")
+    selected = select_recovery_checkpoint(manifest_path, manifest, row)
+    identity = {"schema_version": 1, "arm_id": row["arm_id"], "job_id": str(job_id),
+                "restart_count": restart_count, "submission_manifest_sha256": file_sha256(manifest_path),
+                "parent_commit": manifest["parent_commit"], "fork_commit": manifest["fork_commit"], **selected}
+    directory = Path(row["run_root"]) / "recovery"
+    validate_artifact_path(directory, site_from_manifest(manifest), label="recovery records")
+    path = directory / f"restart-{restart_count}.json"
+    if path.exists():
+        existing = read_json(path, sealed=True)
+        if any(existing.get(key) != value for key, value in identity.items()):
+            raise ValueError("existing recovery request differs from the selected checkpoint or allocation")
+        if (type(existing.get("consecutive_failure_retries")) is not int
+                or not 1 <= existing["consecutive_failure_retries"] <= MAX_FAILURE_RETRIES_WITHOUT_PROGRESS):
+            raise ValueError("invalid existing recovery retry count")
+        return existing
+    count = 1
+    previous_path = directory / f"restart-{restart_count - 1}.json"
+    if previous_path.exists():
+        previous = read_json(previous_path, sealed=True)
+        for key in ("arm_id", "job_id", "submission_manifest_sha256", "parent_commit", "fork_commit"):
+            if previous.get(key) != identity[key]:
+                raise ValueError("previous recovery request has a different run identity")
+        previous_step, previous_count = previous.get("global_step"), previous.get("consecutive_failure_retries")
+        if type(previous_step) is not int or type(previous_count) is not int or not 1 <= previous_count <= MAX_FAILURE_RETRIES_WITHOUT_PROGRESS:
+            raise ValueError("invalid previous recovery progress or retry count")
+        # A rollback to an older checkpoint is not progress.
+        if selected["global_step"] <= previous_step:
+            count = previous_count + 1
+    if selected["global_step"] == 109:
+        count = 1  # A finished checkpoint needs no further training attempt.
+    if count > MAX_FAILURE_RETRIES_WITHOUT_PROGRESS:
+        raise ValueError("three failure retries without checkpoint progress have been exhausted")
+    result = {**identity, "status": "complete" if selected["global_step"] == 109 else "recovery_ready",
+              "consecutive_failure_retries": count, "max_failure_retries_without_progress": MAX_FAILURE_RETRIES_WITHOUT_PROGRESS,
+              "failure_exit_code": failure_exit_code,
+              "created_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    directory.mkdir(exist_ok=True)
+    write_json(path, result, seal=True)
+    return read_json(path, sealed=True)
+
+
+def _process_identity(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        return None
+    return {"pid": pid, "process_group": int(stat[2]), "start_ticks": int(stat[19]),
+            "hostname": socket.gethostname(), "state": stat[0]}
+
+
+def _owned_group_survives(group, owner):
+    """Identify surviving descendants even after their session leader exited."""
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    found = False
+    token = ("OPD_QPROD_TRAINER_OWNER=" + owner).encode()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            process = _process_identity(int(entry.name))
+            if process is None or process["process_group"] != group or process["state"] == "Z":
+                continue
+            if entry.stat().st_uid != os.getuid() or token not in (entry / "environ").read_bytes().split(b"\0"):
+                raise ValueError("surviving trainer group contains a process with different ownership")
+            found = True
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return found
+
+
+def cleanup_trainer(manifest_path, manifest, row, *, job_id, restart_count):
+    """Stop only the recorded trainer session belonging to this allocation."""
+    report = _recovery_segment(manifest_path, manifest, row, job_id=job_id, restart_count=restart_count)
+    owned = report.get("child_process")
+    if owned is None:
+        if report.get("status") in {"complete", "continuation_ready", "failed"}:
+            return {"status": "no_recorded_trainer"}
+        raise ValueError("trainer ownership is missing after an interrupted controller")
+    if (type(owned.get("pid")) is not int or owned["pid"] <= 1
+            or owned.get("process_group") != owned["pid"] or owned.get("hostname") != socket.gethostname()):
+        raise ValueError("recorded trainer session identity is invalid")
+    pid = owned["pid"]
+    current = _process_identity(pid)
+    expected_owner = f"{file_sha256(manifest_path)}:{job_id}:{restart_count}"
+    if current is None or current["start_ticks"] != owned.get("start_ticks"):
+        if not _owned_group_survives(pid, expected_owner):
+            return {"status": "recorded_trainer_exited"}
+    else:
+        if current["process_group"] != pid or Path(f"/proc/{pid}").stat().st_uid != os.getuid():
+            raise ValueError("recorded trainer session ownership differs")
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        if current["state"] != "Z" and ("OPD_QPROD_TRAINER_OWNER=" + expected_owner).encode() not in environ:
+            raise ValueError("recorded trainer belongs to another allocation")
+        # A zombie leader no longer has environment bytes; its descendants
+        # still have to prove allocation ownership before a group signal.
+        if current["state"] == "Z" and not _owned_group_survives(pid, expected_owner):
+            return {"status": "recorded_trainer_exited"}
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return {"status": "trainer_stopped"}
+            time.sleep(.1)
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return {"status": "trainer_stopped"}
+
+
 class ProductionController:
     def __init__(self, args):
         from .qwen_production import verify_manifest, PRODUCTION_PROJECT
@@ -497,6 +759,8 @@ class ProductionController:
                            WANDB_NAME=self.args.arm if phase == "production" else self.args.arm + "-" + phase,
                            WANDB_PROJECT=project,
                            OPD_PRODUCTION_STARTED=str(time.time()))
+        environment["OPD_QPROD_TRAINER_OWNER"] = (
+            f"{self.report['submission_manifest_sha256']}:{self.report.get('job_id', '')}:{self.restart}")
         if phase == "production":
             command.append("trainer.requeue_signal_file=" + json.dumps(str(self.args.signal_file)))
         # Python -m prepends cwd to sys.path. Keep the revised study outside
@@ -518,6 +782,9 @@ class ProductionController:
             with log_path.open("x") as log:
                 self.child = subprocess.Popen(command, cwd=working_directory,
                                               env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                if isinstance(getattr(self.child, "pid", None), int):
+                    self.report["child_process"] = _process_identity(self.child.pid)
+                    self.persist()
                 remaining = None if phase == "production" else max(0.01, self.deadline - time.monotonic() - 30)
                 code = self.child.wait(timeout=remaining)
             if code:
@@ -603,8 +870,35 @@ class ProductionController:
         try:
             resume = None
             if self.restart:
-                continuation = verify_continuation(self.args.manifest, self.manifest, self.row)
-                resume = Path(self.row["phases"]["production"]["run_dir"]) / f"global_step_{continuation['global_step']}"
+                continuation_path = self.root / "continuation.json"
+                candidate = None
+                if continuation_path.exists():
+                    try:
+                        candidate = read_json(continuation_path, sealed=True)
+                    except (ValueError, OSError) as error:
+                        self.report["unusable_continuation"] = str(error)
+                if (candidate is not None and candidate.get("restart_count") == self.restart - 1
+                        and candidate.get("job_id") == self.report["job_id"]):
+                    try:
+                        continuation = verify_continuation(self.args.manifest, self.manifest, self.row)
+                        resume = Path(self.row["phases"]["production"]["run_dir"]) / f"global_step_{continuation['global_step']}"
+                        self.report["resume_reason"] = "clean_continuation"
+                    except (ValueError, OSError, RuntimeError) as error:
+                        self.report["unusable_continuation"] = str(error)
+                if resume is None:
+                    recovery = prepare_recovery(self.args.manifest, self.manifest, self.row,
+                                    job_id=self.report["job_id"], restart_count=self.restart - 1)
+                    self.report["recovery"] = recovery
+                    self.report["resume_reason"] = "latest_valid_checkpoint"
+                    if recovery["global_step"] == 109:
+                        self.report["final_checkpoint_repair"] = finalize_recovered_checkpoint(
+                            self.manifest, self.row, recovery)
+                        self.report["status"] = "complete"
+                        self.report["recovered_completed_checkpoint"] = True
+                        return 0
+                    resume = Path(recovery["resume_from_path"])
+                self.report["resume_from_path"] = str(resume)
+                self.persist()
                 if self.args.signal_file.exists():
                     self.args.signal_file.unlink()
             else:
@@ -662,16 +956,28 @@ class ProductionController:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "verify-continuation"))
+    parser.add_argument("command", choices=("run", "verify-continuation", "verify-recovery", "cleanup-trainer"))
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--arm", required=True)
     parser.add_argument("--prologue-limit-seconds", type=int)
     parser.add_argument("--signal-file", type=Path)
+    parser.add_argument("--failure-exit-code", type=int)
     args = parser.parse_args(argv)
     from .qwen_production import verify_manifest
-    if args.command == "verify-continuation":
+    if args.command != "run":
         manifest = verify_manifest(args.manifest)
-        print(json.dumps(verify_continuation(args.manifest, manifest, select_arm(manifest, args.arm)), sort_keys=True))
+        row = select_arm(manifest, args.arm)
+        if args.command == "verify-continuation":
+            result = verify_continuation(args.manifest, manifest, row)
+        else:
+            allocation = {"job_id": os.environ.get("SLURM_JOB_ID", ""),
+                          "restart_count": int(os.environ.get("SLURM_RESTART_COUNT", "0"))}
+            if args.command == "cleanup-trainer":
+                result = cleanup_trainer(args.manifest, manifest, row, **allocation)
+            else:
+                result = prepare_recovery(args.manifest, manifest, row, **allocation,
+                                          failure_exit_code=args.failure_exit_code)
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.signal_file is None:
         parser.error("run requires --signal-file")

@@ -10,6 +10,7 @@ import shutil
 import stat
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Mapping, Optional, Sequence
 
 import numpy as np
@@ -48,6 +49,9 @@ FUNCTIONS = {
     "_verify_initial_best_reference",
     "_write_initial_best_reference",
     "_maybe_update_best_checkpoint",
+    "_remove_stale_checkpoint_trees",
+    "_retire_checkpoint",
+    "_repair_checkpoint_history",
     "_prune_committed_checkpoints",
     "_requeue_requested",
     "_consume_requeue_request",
@@ -619,6 +623,247 @@ def test_retention_keeps_latest_two_and_older_best(tmp_path, checkpoint_helpers)
         "global_step_4",
     }
     assert (tmp_path / "best_checkpointed_iteration.txt").read_text().strip() == "1"
+
+
+@pytest.mark.parametrize("failure", ["payload", "manifest", "non_object_manifest", "missing"])
+def test_auto_resume_falls_back_to_newest_valid_checkpoint(tmp_path, checkpoint_helpers, failure):
+    helpers = checkpoint_helpers
+    earlier = _stage_checkpoint(helpers, tmp_path, 25)
+    newest = _stage_checkpoint(helpers, tmp_path, 50)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("50\n")
+    if failure == "payload":
+        (newest / "data.pt").write_bytes(b"broken")
+    elif failure == "manifest":
+        (newest / "checkpoint_manifest.json").write_text("{")
+    elif failure == "non_object_manifest":
+        (newest / "checkpoint_manifest.json").write_text("[]")
+    else:
+        shutil.rmtree(newest)
+    selected, manifest = helpers["_find_latest_committed_checkpoint"](
+        str(tmp_path), return_manifest=True, expected_provenance=_test_provenance()
+    )
+    assert selected == str(earlier)
+    assert manifest["global_step"] == 25
+    # Resolution does not mutate evidence or trackers before state loads.
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "50\n"
+    assert newest.exists() == (failure != "missing")
+
+
+def test_auto_resume_never_silently_starts_fresh_after_all_checkpoints_fail(tmp_path, checkpoint_helpers):
+    checkpoint = _stage_checkpoint(checkpoint_helpers, tmp_path, 25)
+    (checkpoint / "data.pt").write_bytes(b"broken")
+    with pytest.raises(RuntimeError, match="no valid committed checkpoint remains"):
+        checkpoint_helpers["_find_latest_committed_checkpoint"](str(tmp_path))
+
+
+@pytest.mark.parametrize("contents", [b"", b"not-a-step\n", b"\xff\xfe"])
+def test_auto_resume_ignores_damaged_latest_tracker_with_valid_checkpoint(tmp_path, checkpoint_helpers, contents):
+    checkpoint = _stage_checkpoint(checkpoint_helpers, tmp_path, 25)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_bytes(contents)
+    assert checkpoint_helpers["_find_latest_committed_checkpoint"](str(tmp_path)) == str(checkpoint)
+
+
+def test_damaged_latest_tracker_without_checkpoint_does_not_start_fresh(tmp_path, checkpoint_helpers):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("broken")
+    with pytest.raises(RuntimeError, match="damaged latest checkpoint tracker has no retained checkpoint"):
+        checkpoint_helpers["_find_latest_committed_checkpoint"](str(tmp_path))
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_latest_tracker_symlink_is_rejected_even_with_valid_checkpoint(tmp_path, checkpoint_helpers, broken):
+    _stage_checkpoint(checkpoint_helpers, tmp_path, 25)
+    target = tmp_path / "target"
+    if not broken:
+        target.write_text("25\n")
+    (tmp_path / "latest_checkpointed_iteration.txt").symlink_to(target)
+    with pytest.raises(RuntimeError, match="invalid checkpoint tracker"):
+        checkpoint_helpers["_find_latest_committed_checkpoint"](str(tmp_path))
+
+
+def test_load_rejects_foreign_checkpoint_before_removing_abandoned_writes(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    foreign = _stage_checkpoint(helpers, tmp_path, 25, provenance=_test_provenance(source_commit="a" * 40))
+    abandoned = tmp_path / f".global_step_50.incomplete.{uuid.uuid4().hex}"
+    abandoned.mkdir()
+    (abandoned / "evidence").write_bytes(b"must remain until checkpoint verification succeeds")
+    parsed = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
+    method = next(
+        member for node in parsed.body if isinstance(node, ast.ClassDef)
+        for member in node.body if isinstance(member, ast.FunctionDef) and member.name == "_load_checkpoint"
+    )
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), "exec"), helpers)
+    trainer = SimpleNamespace(
+        checkpoint_provenance=_test_provenance(),
+        config=SimpleNamespace(trainer=SimpleNamespace(
+            default_local_dir=str(tmp_path), default_hdfs_dir=None,
+            resume_mode="resume_path", resume_from_path=str(foreign),
+        )),
+    )
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        helpers["_load_checkpoint"](trainer)
+    assert abandoned.is_dir()
+    assert foreign.is_dir()
+
+
+def test_auto_resume_rejects_authenticated_foreign_newest_checkpoint(tmp_path, checkpoint_helpers):
+    _stage_checkpoint(checkpoint_helpers, tmp_path, 25)
+    foreign = _stage_checkpoint(
+        checkpoint_helpers, tmp_path, 50, provenance=_test_provenance(source_commit="a" * 40)
+    )
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        checkpoint_helpers["_find_latest_committed_checkpoint"](
+            str(tmp_path), expected_provenance=_test_provenance()
+        )
+    assert foreign.exists()
+
+
+def test_auto_resume_preserves_required_semantic_verification(tmp_path, checkpoint_helpers):
+    older = _stage_checkpoint(checkpoint_helpers, tmp_path, 25, semantic_state=True)
+    _stage_checkpoint(checkpoint_helpers, tmp_path, 50)
+    assert checkpoint_helpers["_find_latest_committed_checkpoint"](
+        str(tmp_path), require_semantic=True
+    ) == str(older)
+
+
+def test_interrupted_retention_unpublishes_before_deleting(tmp_path, checkpoint_helpers, monkeypatch):
+    helpers = checkpoint_helpers
+    old = _stage_checkpoint(helpers, tmp_path, 25)
+    latest = _stage_checkpoint(helpers, tmp_path, 50)
+    real_rmtree = shutil.rmtree
+    def interrupted(path):
+        assert not old.exists()
+        assert ".retired." in str(path)
+        raise OSError("interrupted deletion")
+    monkeypatch.setattr(shutil, "rmtree", interrupted)
+    with pytest.raises(OSError, match="interrupted deletion"):
+        helpers["_prune_committed_checkpoints"](str(tmp_path), keep_latest=1)
+    assert helpers["_find_latest_committed_checkpoint"](str(tmp_path)) == str(latest)
+    assert len(list(tmp_path.glob(".global_step_25.retired.*"))) == 1
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    helpers["_remove_stale_checkpoint_trees"](str(tmp_path))
+    assert not list(tmp_path.glob(".global_step_25.retired.*"))
+
+
+def test_stale_tree_cleanup_only_removes_owned_temporary_directories(tmp_path, checkpoint_helpers):
+    stale = tmp_path / f".global_step_50.incomplete.{uuid.uuid4().hex}"
+    stale.mkdir()
+    (stale / "large-payload").write_bytes(b"abandoned")
+    preserved = tmp_path / ".global_step_50.incomplete.manual-evidence"
+    preserved.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / f".global_step_51.incomplete.{uuid.uuid4().hex}"
+    link.symlink_to(outside, target_is_directory=True)
+    assert checkpoint_helpers["_remove_stale_checkpoint_trees"](str(tmp_path)) == [str(stale)]
+    assert preserved.exists() and outside.exists() and link.is_symlink()
+
+
+def test_in_place_rollback_rebuilds_best_and_frees_future_checkpoint_names(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    for step, metric in [(25, 0.8), (50, 0.7), (75, 0.9)]:
+        _stage_checkpoint(helpers, tmp_path, step, metric=metric)
+    (tmp_path / "best_checkpointed_iteration.txt").write_text("75\n")
+    resumed = helpers["_verify_checkpoint"](str(tmp_path / "global_step_50"))
+    removed = helpers["_repair_checkpoint_history"](
+        str(tmp_path), resumed_manifest=resumed, best_mode="max"
+    )
+    assert str(tmp_path / "global_step_75") in removed
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text() == "25\n"
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "50\n"
+    assert not (tmp_path / "checkpoint_recovery_step.txt").exists()
+    # Repeating the discarded step can now publish its checkpoint successfully.
+    _stage_checkpoint(helpers, tmp_path, 75, metric=0.85)
+
+
+def test_recovery_finishes_best_update_after_commit_without_tracker_update(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    _stage_checkpoint(helpers, tmp_path, 25, metric=0.7)
+    newest = _stage_checkpoint(helpers, tmp_path, 50, metric=0.9)
+    (tmp_path / "best_checkpointed_iteration.txt").write_text("25\n")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("25\n")
+    helpers["_repair_checkpoint_history"](
+        str(tmp_path), resumed_manifest=helpers["_verify_checkpoint"](str(newest)), best_mode="max"
+    )
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text() == "50\n"
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "50\n"
+
+
+def test_final_commit_recovery_repairs_selection_and_finishes_retention(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    for step, metric in [(25, 0.7), (75, 0.6), (100, 0.65), (109, 0.9)]:
+        _stage_checkpoint(helpers, tmp_path, step, metric=metric)
+    # The final checkpoint was committed, but publication of BEST/latest and
+    # pruning never ran. An older interrupted write also still occupies disk.
+    (tmp_path / "best_checkpointed_iteration.txt").write_text("25\n")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("100\n")
+    stale = tmp_path / f".global_step_109.incomplete.{uuid.uuid4().hex}"
+    stale.mkdir()
+    (stale / "abandoned-payload").write_bytes(b"unfinished")
+    final = tmp_path / "global_step_109"
+    before = {path: path.read_bytes() for path in final.rglob("*") if path.is_file()}
+    checkpoint = helpers["_verify_checkpoint"](str(final))
+    helpers["_repair_checkpoint_history"](
+        str(tmp_path), resumed_manifest=checkpoint, best_mode="max"
+    )
+    helpers["_prune_committed_checkpoints"](str(tmp_path), keep_latest=2)
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text() == "109\n"
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "109\n"
+    assert {path.name for path in tmp_path.glob("global_step_*")} == {"global_step_100", "global_step_109"}
+    assert not stale.exists()
+    assert not (tmp_path / "checkpoint_recovery_step.txt").exists()
+    assert {path: path.read_bytes() for path in final.rglob("*") if path.is_file()} == before
+    assert helpers["_verify_checkpoint"](str(final)) == checkpoint
+
+
+def test_recovery_removes_corrupt_best_and_preserves_initial_policy_selection(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    helpers["_write_initial_best_reference"](
+        str(tmp_path), metric_name="val/math_verify/mean_at_1", metric_value=0.8,
+        tiebreak_metric_name=None, tiebreak_metric_value=None, provenance=_test_provenance(),
+    )
+    resumed = _stage_checkpoint(helpers, tmp_path, 25, metric=0.7)
+    corrupt = _stage_checkpoint(helpers, tmp_path, 50, metric=0.9)
+    (corrupt / "data.pt").write_bytes(b"broken")
+    (tmp_path / "best_checkpointed_iteration.txt").write_text("50\n")
+    helpers["_repair_checkpoint_history"](
+        str(tmp_path), resumed_manifest=helpers["_verify_checkpoint"](str(resumed)), best_mode="max"
+    )
+    assert not corrupt.exists()
+    assert (tmp_path / "best_checkpointed_iteration.txt").read_text() == "0\n"
+    assert helpers["_find_latest_committed_checkpoint"](str(tmp_path)) == str(resumed)
+
+
+def test_recovery_never_deletes_authenticated_foreign_future_history(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    resumed = _stage_checkpoint(helpers, tmp_path, 25, metric=0.7)
+    foreign = _stage_checkpoint(
+        helpers, tmp_path, 50, metric=0.9, provenance=_test_provenance(source_commit="a" * 40)
+    )
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        helpers["_repair_checkpoint_history"](
+            str(tmp_path), resumed_manifest=helpers["_verify_checkpoint"](str(resumed)), best_mode="max"
+        )
+    assert resumed.exists() and foreign.exists()
+    assert not (tmp_path / "checkpoint_recovery_step.txt").exists()
+
+
+def test_interrupted_rollback_cannot_resume_from_superseded_future(tmp_path, checkpoint_helpers):
+    helpers = checkpoint_helpers
+    resumed = _stage_checkpoint(helpers, tmp_path, 25, metric=0.7)
+    future = _stage_checkpoint(helpers, tmp_path, 50, metric=0.9)
+    retire = helpers["_retire_checkpoint"]
+    def interrupted(path):
+        raise OSError("interrupted retirement")
+    helpers["_retire_checkpoint"] = interrupted
+    manifest = helpers["_verify_checkpoint"](str(resumed))
+    with pytest.raises(OSError, match="interrupted retirement"):
+        helpers["_repair_checkpoint_history"](str(tmp_path), resumed_manifest=manifest, best_mode="max")
+    assert future.exists()
+    assert helpers["_find_latest_committed_checkpoint"](str(tmp_path)) == str(resumed)
+    helpers["_retire_checkpoint"] = retire
+    helpers["_repair_checkpoint_history"](str(tmp_path), resumed_manifest=manifest, best_mode="max")
+    assert not future.exists()
+    assert not (tmp_path / "checkpoint_recovery_step.txt").exists()
 
 
 def test_initial_validation_competes_in_best_with_secondary_tie_break(

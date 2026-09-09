@@ -104,6 +104,7 @@ WorkerType = Type[Worker]
 _CHECKPOINT_MANIFEST = "checkpoint_manifest.json"
 _CHECKPOINT_ROLLOUT_METADATA = "rollout_metadata.json"
 _CHECKPOINT_TRACKER = "latest_checkpointed_iteration.txt"
+_CHECKPOINT_ROLLBACK_TRACKER = "checkpoint_recovery_step.txt"
 _BEST_CHECKPOINT_TRACKER = "best_checkpointed_iteration.txt"
 _INITIAL_BEST_RECORD = "initial_best_reference.json"
 _CHECKPOINT_SCHEMA_VERSION = 2
@@ -126,6 +127,7 @@ _CHECKPOINT_ROLLOUT_FIELDS = (
     *_CHECKPOINT_CONTINUOUS_ROLLOUT_FIELDS,
 )
 _COMMITTED_CHECKPOINT_RE = re.compile(r"^global_step_([0-9]+)$")
+_CHECKPOINT_GARBAGE_RE = re.compile(r"^\.global_step_[0-9]+\.(?:incomplete|retired)\.[0-9a-f]{32}$")
 
 
 def _fsync_directory(path: str) -> None:
@@ -602,6 +604,8 @@ def _verify_checkpoint(
         raise RuntimeError(f"checkpoint is not committed: {checkpoint_dir}")
     with open(manifest_path, encoding="utf-8") as handle:
         manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise RuntimeError("checkpoint manifest must be an object")
     if manifest.get("schema_version") != _CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported checkpoint manifest schema: {manifest.get('schema_version')}")
     checkpoint_name = manifest.get("checkpoint_name")
@@ -720,8 +724,14 @@ def _find_latest_committed_checkpoint(
     *,
     expected_provenance: Optional[Mapping[str, object]] = None,
     return_manifest: bool = False,
+    require_semantic: bool = False,
 ):
-    """Resolve the newest atomically committed checkpoint, including stale trackers."""
+    """Resolve the newest valid checkpoint without trusting the latest tracker.
+
+    Interrupted/corrupt payloads can fall back to retained checkpoints. An
+    authenticated checkpoint from a different run is still a hard error.
+    Resolution is read-only; the sole training writer repairs history on load.
+    """
 
     checkpoint_root = os.path.abspath(checkpoint_root)
     if not os.path.isdir(checkpoint_root):
@@ -734,28 +744,49 @@ def _find_latest_committed_checkpoint(
 
     tracker_path = os.path.join(checkpoint_root, _CHECKPOINT_TRACKER)
     tracker_step = None
-    if os.path.exists(tracker_path):
+    tracker_error = None
+    if os.path.lexists(tracker_path):
         if not os.path.isfile(tracker_path) or os.path.islink(tracker_path):
             raise RuntimeError(f"invalid checkpoint tracker: {tracker_path}")
-        with open(tracker_path, encoding="utf-8") as handle:
-            tracker_value = handle.read().strip()
-        if not tracker_value.isdigit():
-            raise RuntimeError(f"invalid checkpoint tracker contents: {tracker_value!r}")
-        tracker_step = int(tracker_value)
+        try:
+            with open(tracker_path, encoding="utf-8") as handle:
+                tracker_value = handle.read().strip()
+            if re.fullmatch(r"[0-9]+", tracker_value) is None:
+                raise ValueError(f"invalid checkpoint tracker contents: {tracker_value!r}")
+            tracker_step = int(tracker_value)
+        except (OSError, ValueError) as error:
+            tracker_error = error
+            print(f"Ignoring damaged latest checkpoint tracker {tracker_path}: {error}")
 
     candidate_steps = committed_steps + ([] if tracker_step is None else [tracker_step])
+    # A crash while retiring several future checkpoints must not undo a rollback
+    # whose driver state was already restored and whose cleanup was in progress.
+    recovery_step = _read_step_tracker(os.path.join(checkpoint_root, _CHECKPOINT_ROLLBACK_TRACKER))
+    if recovery_step is not None:
+        candidate_steps = [step for step in candidate_steps if step <= recovery_step]
+        if recovery_step < 1 or not candidate_steps:
+            raise RuntimeError("checkpoint recovery marker has no retained checkpoint")
     if not candidate_steps:
+        if tracker_error is not None:
+            raise RuntimeError("damaged latest checkpoint tracker has no retained checkpoint") from tracker_error
         return None
-    latest_step = max(candidate_steps)
-    checkpoint_dir = os.path.join(checkpoint_root, f"global_step_{latest_step}")
-    manifest = _verify_checkpoint(
-        checkpoint_dir, expected_provenance=expected_provenance
-    )
-    if manifest["global_step"] != latest_step:
-        raise RuntimeError("latest committed checkpoint has inconsistent step metadata")
-    if return_manifest:
-        return checkpoint_dir, manifest
-    return checkpoint_dir
+    failures = []
+    for latest_step in sorted(set(candidate_steps), reverse=True):
+        checkpoint_dir = os.path.join(checkpoint_root, f"global_step_{latest_step}")
+        try:
+            manifest = _verify_checkpoint(checkpoint_dir, require_semantic=require_semantic)
+        except (RuntimeError, ValueError, OSError, TypeError, KeyError) as error:
+            failures.append(f"{checkpoint_dir}: {error}")
+            print(f"Skipping unusable checkpoint {checkpoint_dir}: {error}")
+            continue
+        if expected_provenance is not None:
+            assert_checkpoint_provenance_matches(manifest["provenance"], expected_provenance)
+        if manifest["global_step"] != latest_step:
+            raise RuntimeError("latest committed checkpoint has inconsistent step metadata")
+        if return_manifest:
+            return checkpoint_dir, manifest
+        return checkpoint_dir
+    raise RuntimeError("no valid committed checkpoint remains: " + "; ".join(failures))
 
 
 def _verified_actor_state_digest(checkpoint_dir: str) -> str:
@@ -979,6 +1010,122 @@ def _maybe_update_best_checkpoint(
     return is_better
 
 
+def _remove_stale_checkpoint_trees(checkpoint_root: str) -> list[str]:
+    """Reclaim abandoned writes/deletions while holding the run's writer slot.
+
+    These UUID-named directories are never resumable. Only the training driver
+    may call this, after workers from the previous invocation have exited.
+    """
+
+    removed = []
+    if not os.path.isdir(checkpoint_root):
+        return removed
+    for name in os.listdir(checkpoint_root):
+        path = os.path.join(checkpoint_root, name)
+        if _CHECKPOINT_GARBAGE_RE.fullmatch(name) and os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+            removed.append(path)
+    if removed:
+        _fsync_directory(checkpoint_root)
+    return removed
+
+
+def _retire_checkpoint(checkpoint_dir: str) -> None:
+    """Unpublish before deleting, so interrupted pruning cannot look committed."""
+
+    checkpoint_root = os.path.dirname(os.path.abspath(checkpoint_dir))
+    name = os.path.basename(checkpoint_dir)
+    _checkpoint_step_from_name(name)
+    if not os.path.isdir(checkpoint_dir) or os.path.islink(checkpoint_dir):
+        raise RuntimeError(f"refusing to retire a non-directory checkpoint: {checkpoint_dir}")
+    retired = os.path.join(checkpoint_root, f".{name}.retired.{uuid.uuid4().hex}")
+    os.replace(checkpoint_dir, retired)
+    _fsync_directory(checkpoint_root)
+    shutil.rmtree(retired)
+    _fsync_directory(checkpoint_root)
+
+
+def _repair_checkpoint_history(
+    checkpoint_root: str,
+    *,
+    resumed_manifest: Mapping[str, object],
+    best_mode: str,
+) -> list[str]:
+    """Repair an in-place restart after its verified state has loaded.
+
+    Reconstruct BEST from retained usable history, including a checkpoint whose
+    commit succeeded before its BEST update. Retire corrupt or superseded trees
+    before training reaches their names again. External resume sources do not
+    call this helper and retain their history.
+    """
+
+    step = int(resumed_manifest["global_step"])
+    provenance = resumed_manifest["provenance"]
+    candidates = []
+    obsolete = []
+    for name in os.listdir(checkpoint_root):
+        match = _COMMITTED_CHECKPOINT_RE.fullmatch(name)
+        if match is None:
+            continue
+        path = os.path.join(checkpoint_root, name)
+        if not os.path.isdir(path) or os.path.islink(path):
+            raise RuntimeError(f"checkpoint history contains a non-directory: {path}")
+        candidate_step = int(match.group(1))
+        try:
+            manifest = _verify_checkpoint(path)
+        except (RuntimeError, ValueError, OSError, TypeError, KeyError):
+            if candidate_step == step:
+                raise
+            obsolete.append(path)
+            continue
+        assert_checkpoint_provenance_matches(manifest["provenance"], provenance)
+        if candidate_step > step:
+            obsolete.append(path)
+            continue
+        candidates.append((candidate_step, manifest))
+    if step not in {candidate_step for candidate_step, _ in candidates}:
+        raise RuntimeError("resumed checkpoint disappeared before history repair")
+    if best_mode not in {"max", "min"}:
+        raise ValueError("checkpoint_best_mode must be 'max' or 'min'")
+
+    best_path = os.path.join(checkpoint_root, _BEST_CHECKPOINT_TRACKER)
+    initial_path = os.path.join(checkpoint_root, _INITIAL_BEST_RECORD)
+    initial = None
+    if os.path.lexists(initial_path):
+        if not os.path.isfile(initial_path) or os.path.islink(initial_path):
+            raise RuntimeError("initial BEST reference path is not a regular file")
+        with open(initial_path, encoding="utf-8") as handle:
+            initial = _verify_initial_best_reference(json.load(handle), expected_provenance=provenance)
+    recovery_path = os.path.join(checkpoint_root, _CHECKPOINT_ROLLBACK_TRACKER)
+    _atomic_write_text(recovery_path, f"{step}\n")
+    # Publish an accurate BEST before removing any checkpoint it formerly named.
+    if initial is not None:
+        _atomic_write_text(best_path, "0\n")
+    elif os.path.lexists(best_path):
+        if not os.path.isfile(best_path) or os.path.islink(best_path):
+            raise RuntimeError("BEST tracker path is not a regular file")
+        os.unlink(best_path)
+        _fsync_directory(checkpoint_root)
+    for candidate_step, manifest in sorted(candidates):
+        _maybe_update_best_checkpoint(
+            checkpoint_root,
+            global_step=candidate_step,
+            metric_name=manifest.get("selection_metric_name"),
+            metric_value=manifest.get("selection_metric_value"),
+            mode=best_mode,
+            tiebreak_metric_name=manifest.get("selection_tiebreak_metric_name"),
+            tiebreak_metric_value=manifest.get("selection_tiebreak_metric_value"),
+            verified_candidate_manifest=manifest,
+        )
+    _atomic_write_text(os.path.join(checkpoint_root, _CHECKPOINT_TRACKER), f"{step}\n")
+    for path in obsolete:
+        _retire_checkpoint(path)
+    removed = obsolete + _remove_stale_checkpoint_trees(checkpoint_root)
+    os.unlink(recovery_path)
+    _fsync_directory(checkpoint_root)
+    return removed
+
+
 def _prune_committed_checkpoints(checkpoint_root: str, keep_latest: int) -> list[str]:
     """Remove only older committed checkpoints, preserving latest and BEST."""
 
@@ -1009,7 +1156,7 @@ def _prune_committed_checkpoints(checkpoint_root: str, keep_latest: int) -> list
     for step, path in candidates:
         if step in protected_steps:
             continue
-        shutil.rmtree(path)
+        _retire_checkpoint(path)
         removed.append(path)
     if removed:
         _fsync_directory(checkpoint_root)
@@ -2040,6 +2187,7 @@ class RayPPOTrainer:
 
         checkpoint_root = os.path.abspath(self.config.trainer.default_local_dir)
         BaseCheckpointManager.local_mkdir(checkpoint_root)
+        _remove_stale_checkpoint_trees(checkpoint_root)
         checkpoint_name = f"global_step_{self.global_steps}"
         final_checkpoint_dir = os.path.join(checkpoint_root, checkpoint_name)
         if os.path.lexists(final_checkpoint_dir):
@@ -2176,8 +2324,10 @@ class RayPPOTrainer:
                 checkpoint_folder,
                 expected_provenance=self.checkpoint_provenance,
                 return_manifest=True,
+                require_semantic=self.config.trainer.get("checkpoint_semantics") == "qwen_semantic_v1",
             )
             if resolved_checkpoint is None:
+                _remove_stale_checkpoint_trees(checkpoint_folder)
                 print("Training from scratch")
                 return 0
             global_step_folder, manifest = resolved_checkpoint
@@ -2269,10 +2419,17 @@ class RayPPOTrainer:
             random.setstate(rng_state["python"])
             np.random.set_state(rng_state["numpy"])
             torch.set_rng_state(rng_state["torch_cpu"])
-        _atomic_write_text(
-            os.path.join(os.path.dirname(global_step_folder), _CHECKPOINT_TRACKER),
-            f"{self.global_steps}\n",
-        )
+        checkpoint_root = os.path.dirname(os.path.abspath(global_step_folder))
+        if os.path.realpath(checkpoint_root) == os.path.realpath(self.config.trainer.default_local_dir):
+            _repair_checkpoint_history(
+                checkpoint_root,
+                resumed_manifest=manifest,
+                best_mode=str(self.config.trainer.get("checkpoint_best_mode", "max")),
+            )
+            _prune_committed_checkpoints(
+                checkpoint_root,
+                keep_latest=int(self.config.trainer.get("checkpoint_keep_latest", 2)),
+            )
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
