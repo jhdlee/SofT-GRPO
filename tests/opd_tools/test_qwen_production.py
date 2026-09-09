@@ -255,6 +255,36 @@ def test_manifest_materialization_authenticates_source_assets_order_and_environm
     assert changed["arms"][0]["wandb_run_id"] != manifest["arms"][0]["wandb_run_id"]
 
 
+def test_direct_training_is_explicit_sealed_and_keeps_the_full_recipe(manifest_inputs):
+    historical = production.build_manifest(**manifest_inputs)
+    assert "admission_mode" not in historical
+    assert production.build_manifest(**manifest_inputs, admission_mode="diagnostics") == historical
+    direct = production.materialize_manifest(**manifest_inputs, admission_mode="direct_training")
+    assert production.verify_manifest(manifest_inputs["study_root"] / "manifest.json") == direct
+    assert direct["admission_mode"] == "direct_training"
+    for previous, current in zip(historical["arms"], direct["arms"]):
+        assert previous["wandb_run_id"] != current["wandb_run_id"]
+        assert previous["contract"] == current["contract"]
+        assert previous["production_overrides"] == current["production_overrides"]
+        config = values(production.phase_command(direct, current["arm_id"], "production")[3:])
+        assert config["trainer.max_rollout_iterations_per_invocation"] is None
+        assert config["trainer.save_freq"] == 25
+
+
+@pytest.mark.parametrize("mode", [None, "skip", "passed", False])
+def test_invalid_admission_mode_is_rejected(manifest_inputs, mode):
+    with pytest.raises(ValueError, match="admission mode"):
+        production.build_manifest(**manifest_inputs, admission_mode=mode)
+
+
+def test_direct_training_cli_seals_the_selected_policy(manifest_inputs, capsys):
+    arguments = ["materialize", "--admission-mode", "direct_training"]
+    for key, value in manifest_inputs.items():
+        arguments.extend(["--" + key.replace("_", "-"), str(value)])
+    assert production.main(arguments) == 0
+    assert json.loads(capsys.readouterr().out)["admission_mode"] == "direct_training"
+
+
 def test_revised_manifest_binds_one_environment_and_all_phase_options(manifest_inputs):
     runtime = manifest_inputs["soft_env"]
     runtime.mkdir()

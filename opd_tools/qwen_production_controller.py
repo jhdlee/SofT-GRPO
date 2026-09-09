@@ -1,4 +1,4 @@
-"""Run bounded correctness admission, then authenticated Qwen3 production.
+"""Run authenticated Qwen3 production under the manifest's admission policy.
 
 Clean iteration-boundary continuations return 75. Production failures may
 requeue from a verified checkpoint with a bounded retry budget. Admission
@@ -21,6 +21,7 @@ import time
 
 from .manifest import canonical_sha256, file_sha256, validate_sealed_content, write_manifest_atomic
 from .qwen_acceptance import validate_fsdp_probe, validate_measurement_physical_memory
+from .qwen_production import admission_mode
 from .qwen_site import site_from_manifest, validate_artifact_path, validate_scheduler_allocation
 from .training_capacity import classify_failure, finite_snapshot
 
@@ -274,7 +275,7 @@ def verify_hard_long_replay(manifest_path, manifest, row, record):
 
 
 def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count):
-    """Bind four real GPU preflight results to this source and Slurm segment."""
+    """Bind allocation/runtime checks and any required diagnostics to this segment."""
     if not requires_semantic_checkpoint(manifest):
         return None
     if not isinstance(job_id, str) or not job_id.isdecimal() or type(restart_count) is not int or restart_count < 0:
@@ -296,7 +297,6 @@ def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count
     runtime = record.get("runtime", {})
     if not isinstance(runtime, dict):
         raise ValueError("GPU allocation runtime record is malformed")
-    validate_fsdp_probe(runtime.get("native_lora_fsdp_acceptance"), world_size=4)
     unified = runtime.get("unified")
     if not isinstance(unified, dict):
         raise ValueError("GPU allocation lacks the sealed unified runtime")
@@ -305,6 +305,21 @@ def verify_gpu_allocation(manifest_path, manifest, row, *, job_id, restart_count
             or unified.get("build_record", {}).get("source") != {
                 "parent_commit": manifest["parent_commit"], "fork_commit": manifest["fork_commit"]}):
         raise ValueError("GPU allocation runtime differs from the source-bound study runtime")
+    if admission_mode(manifest) == "direct_training":
+        if (record.get("admission_mode") != "direct_training"
+                or type(record.get("diagnostic_budget_seconds")) is not int
+                or record["diagnostic_budget_seconds"] != 0):
+            raise ValueError("GPU allocation differs from the sealed direct-training policy")
+        devices = record.get("devices")
+        gpu = site_from_manifest(manifest)["gpu"]
+        if not isinstance(devices, list) or len(devices) != 4 or any(
+                not isinstance(device, dict) or gpu["name_contains"] not in str(device.get("name"))
+                or ("site" in manifest and device.get("compute_capability") != gpu["compute_capability"])
+                for device in devices):
+            raise ValueError("GPU allocation differs from the sealed four-device contract")
+        return {"path": relative, "sha256": file_sha256(path), "job_id": job_id,
+                "restart_count": restart_count, "device_count": 4}
+    validate_fsdp_probe(runtime.get("native_lora_fsdp_acceptance"), world_size=4)
     devices, acceptance = record.get("devices"), runtime.get("native_fa3_acceptance")
     if (not isinstance(devices, list) or len(devices) != 4 or not isinstance(acceptance, list)
             or len(acceptance) != 4 or any(not isinstance(item, dict) or type(item.get("device")) is not int for item in acceptance)
@@ -359,7 +374,8 @@ def verify_gpu_evidence(manifest_path, manifest, row, record, *, restart_count):
 def verify_admission(manifest_path, manifest, row):
     path = Path(row["run_root"]) / "admission.json"
     admission = read_json(path, sealed=True)
-    if (admission.get("status") != "passed" or admission.get("arm_id") != row["arm_id"]
+    direct = admission_mode(manifest) == "direct_training"
+    if (admission.get("status") != ("skipped" if direct else "passed") or admission.get("arm_id") != row["arm_id"]
             or admission.get("submission_manifest_sha256") != file_sha256(manifest_path)
             or admission.get("parent_commit") != manifest["parent_commit"]
             or admission.get("fork_commit") != manifest["fork_commit"]):
@@ -372,6 +388,12 @@ def verify_admission(manifest_path, manifest, row):
         if (path.is_symlink() or not path.resolve().is_relative_to(Path(row["run_root"]).resolve())
                 or not path.is_file() or file_sha256(path) != digest):
             raise ValueError("admission evidence changed")
+    if direct:
+        if (admission.get("mode") != "direct_training" or admission.get("reason") != "explicit_launch_policy"
+                or "resume_parity" in admission or "zero_dose_parity" in admission):
+            raise ValueError("direct training requires an explicit skipped diagnostic record")
+        verify_gpu_evidence(manifest_path, manifest, row, admission, restart_count=0)
+        return admission
     if admission["resume_parity"].get("passed") is not True:
         raise ValueError("exact next-update resume was not accepted")
     if requires_semantic_checkpoint(manifest) and admission["resume_parity"].get("schema") != "qwen_semantic_v1":
@@ -823,6 +845,19 @@ class ProductionController:
             raise ValueError("initial allocation must not reuse an old prologue")
         allocation = verify_gpu_allocation(self.args.manifest, self.manifest, self.row,
                                            job_id=self.report["job_id"], restart_count=self.restart)
+        if admission_mode(self.manifest) == "direct_training":
+            result = {"schema_version": 1, "status": "skipped", "mode": "direct_training",
+                      "reason": "explicit_launch_policy", "arm_id": self.args.arm,
+                      "submission_manifest_sha256": self.report["submission_manifest_sha256"],
+                      "parent_commit": self.manifest["parent_commit"], "fork_commit": self.manifest["fork_commit"],
+                      "job_id": self.report["job_id"], "wall_seconds": time.monotonic() - self.started,
+                      "evidence_files": {}}
+            if allocation is not None:
+                result["gpu_allocation"] = allocation
+                result["evidence_files"][allocation["path"]] = allocation["sha256"]
+            write_json(self.root / "admission.json", result, seal=True)
+            self.report["admission_mode"] = "direct_training"
+            return result
         self.invoke("uninterrupted")
         self.invoke("split")
         split_root = Path(self.row["phases"]["split"]["run_dir"])
@@ -904,7 +939,8 @@ class ProductionController:
             else:
                 if self.args.signal_file.exists():
                     raise ValueError("initial allocation has a stale checkpoint signal")
-                signal.setitimer(signal.ITIMER_REAL, max(0.01, self.deadline - time.monotonic() - 30))
+                if admission_mode(self.manifest) != "direct_training":
+                    signal.setitimer(signal.ITIMER_REAL, max(0.01, self.deadline - time.monotonic() - 30))
                 self.admission()
                 signal.setitimer(signal.ITIMER_REAL, 0)
             measured = self.invoke("production", resume_from_path=resume)

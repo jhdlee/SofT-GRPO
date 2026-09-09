@@ -189,7 +189,7 @@ def test_admission_authenticates_evidence_not_only_status(tmp_path):
 def test_admission_failure_prevents_production_invocation(tmp_path, monkeypatch):
     controller=ProductionController.__new__(ProductionController)
     controller.args=SimpleNamespace(signal_file=tmp_path/'signal',arm='softgrpo_math_opd_s11')
-    controller.root=tmp_path; controller.child=None; controller.restart=0
+    controller.root=tmp_path; controller.child=None; controller.restart=0; controller.manifest={}
     controller.report={}; controller.phase='uninterrupted'; controller.deadline=10**12
     controller.persist=lambda:None
     def fail(): raise ValueError('exact next-update parity failed')
@@ -238,6 +238,117 @@ def gpu_allocation(tmp_path, *, job_id='470999', restart=0):
     path = tmp_path / f'segments/allocation-{job_id}-{restart}.json'
     path.parent.mkdir(exist_ok=True); path.write_text(json.dumps(result))
     return manifest_path, manifest, row, path, result
+
+
+def direct_allocation(tmp_path, *, job_id='470999', restart=0):
+    manifest_path, manifest, row, path, record = gpu_allocation(tmp_path, job_id=job_id, restart=restart)
+    manifest['admission_mode'] = 'direct_training'
+    row['phases']['production'].update(directory=str(tmp_path / 'production'),
+                                      run_dir=str(tmp_path / 'production/training'))
+    manifest['arms'] = [row]
+    write_json(manifest_path, manifest)
+    record.update(admission_mode='direct_training', diagnostic_budget_seconds=0,
+                  manifest_sha256=file_sha256(manifest_path))
+    record['runtime'] = {'unified': record['runtime']['unified']}
+    write_json(path, record)
+    for phase, details in row['phases'].items():
+        if phase != 'production':
+            Path(details['output']).unlink()
+    return manifest_path, manifest, row, path, record
+
+
+@pytest.mark.parametrize('mutation', [None, 'mode', 'budget', 'bool_budget', 'device_count', 'device_kind', 'runtime', 'arm', 'manifest'])
+def test_direct_allocation_still_requires_source_bound_runtime_and_four_devices(tmp_path, mutation):
+    manifest_path, manifest, row, path, record = direct_allocation(tmp_path)
+    if mutation == 'mode': del record['admission_mode']
+    elif mutation == 'budget': record['diagnostic_budget_seconds'] = 7200
+    elif mutation == 'bool_budget': record['diagnostic_budget_seconds'] = False
+    elif mutation == 'device_count': record['devices'].pop()
+    elif mutation == 'device_kind': record['devices'][0]['name'] = 'NVIDIA V100'
+    elif mutation == 'runtime': record['runtime'] = {}
+    elif mutation == 'arm': record['arm_id'] = 'softopd_math_s11'
+    elif mutation == 'manifest': record['manifest_sha256'] = 'f' * 64
+    write_json(path, record)
+    if mutation:
+        with pytest.raises(ValueError):
+            verify_gpu_allocation(manifest_path, manifest, row, job_id='470999', restart_count=0)
+    else:
+        assert verify_gpu_allocation(manifest_path, manifest, row, job_id='470999', restart_count=0)['device_count'] == 4
+
+
+def make_direct_controller(tmp_path, monkeypatch):
+    manifest_path, manifest, row, path, record = direct_allocation(tmp_path)
+    monkeypatch.setenv('SLURM_JOB_ID', '470999')
+    monkeypatch.setenv('SLURM_RESTART_COUNT', '0')
+    monkeypatch.setattr('opd_tools.qwen_production.verify_manifest', lambda path: manifest)
+    args = SimpleNamespace(manifest=manifest_path, arm=row['arm_id'], signal_file=tmp_path / 'signal')
+    return ProductionController(args), record
+
+
+def test_direct_initial_segment_invokes_only_full_training_and_records_no_parity_claim(tmp_path, monkeypatch):
+    controller, _ = make_direct_controller(tmp_path, monkeypatch)
+    # A diagnostic deadline must not interrupt a direct full-training launch.
+    controller.deadline = time.monotonic() - 10
+    invoked = []
+    controller.invoke = lambda phase, **kwargs: invoked.append((phase, kwargs)) or {'iterations': [{'rollout_iteration': 108}]}
+    monkeypatch.setattr('opd_tools.qwen_production_controller.authenticate_checkpoint', lambda *args, **kwargs: {})
+    assert controller.run() == 0
+    assert invoked == [('production', {'resume_from_path': None})]
+    admission = verify_admission(controller.args.manifest, controller.manifest, controller.row)
+    assert admission['status'] == 'skipped' and admission['mode'] == 'direct_training'
+    assert admission['reason'] == 'explicit_launch_policy'
+    assert 'resume_parity' not in admission and 'zero_dose_parity' not in admission
+    assert len(admission['evidence_files']) == 1
+
+
+@pytest.mark.parametrize('mutation', ['status', 'mode', 'reason', 'parity', 'source', 'arm', 'manifest', 'unbound'])
+def test_direct_admission_rejects_forged_or_unbound_skip_records(tmp_path, monkeypatch, mutation):
+    controller, _ = make_direct_controller(tmp_path, monkeypatch)
+    admission = controller.admission()
+    if mutation == 'status': admission['status'] = 'passed'
+    elif mutation == 'mode': admission.pop('mode')
+    elif mutation == 'reason': admission['reason'] = 'diagnostics_passed'
+    elif mutation == 'parity': admission['resume_parity'] = {'passed': True}
+    elif mutation == 'source': admission['fork_commit'] = 'f' * 40
+    elif mutation == 'arm': admission['arm_id'] = 'softopd_math_s11'
+    elif mutation == 'manifest': admission['submission_manifest_sha256'] = 'f' * 64
+    elif mutation == 'unbound': controller.manifest.pop('admission_mode')
+    write_json(tmp_path / 'admission.json', admission, seal=True)
+    with pytest.raises(ValueError):
+        verify_admission(controller.args.manifest, controller.manifest, controller.row)
+
+
+def test_direct_failure_recovers_latest_checkpoint_without_rerunning_diagnostics(tmp_path, monkeypatch):
+    from opd_tools import qwen_production_controller as module
+    controller, allocation = make_direct_controller(tmp_path, monkeypatch)
+    def failed_production(phase, **kwargs):
+        assert phase == 'production'
+        controller.report['phases'][phase] = {'status': 'failed'}
+        raise RuntimeError('transient trainer failure')
+    controller.invoke = failed_production
+    assert controller.run() == 1
+    path = tmp_path / 'production/training/global_step_25'
+    path.mkdir(parents=True)
+    write_json(path / 'checkpoint_manifest.json', {'global_step': 25})
+    provenance = {'resume_identity_sha256': 'd' * 64}
+    monkeypatch.setattr(module, '_recovery_expected_provenance', lambda *args: provenance)
+    monkeypatch.setattr(module, '_find_recovery_checkpoint', lambda *args, **kwargs: (str(path), {'global_step': 25}))
+    monkeypatch.setattr(module, 'authenticate_checkpoint', lambda *args, **kwargs:
+                        {'resume_provenance_sha256': provenance['resume_identity_sha256']})
+    recovery = module.prepare_recovery(controller.args.manifest, controller.manifest, controller.row,
+                                       job_id='470999', restart_count=0, failure_exit_code=1)
+    assert recovery['resume_from_path'] == str(path)
+    assert recovery['consecutive_failure_retries'] == 1
+    allocation['restart_count'] = 1
+    write_json(tmp_path / 'segments/allocation-470999-1.json', allocation)
+    monkeypatch.setenv('SLURM_RESTART_COUNT', '1')
+    restarted = ProductionController(controller.args)
+    invoked = []
+    restarted.invoke = lambda phase, **kwargs: invoked.append((phase, kwargs)) or {'iterations': [{'rollout_iteration': 108}]}
+    assert restarted.run() == 0
+    assert invoked == [('production', {'resume_from_path': path})]
+    assert restarted.report['resume_reason'] == 'latest_valid_checkpoint'
+    assert verify_admission(controller.args.manifest, controller.manifest, controller.row)['status'] == 'skipped'
 
 
 def test_four_gpu_preflight_identity_and_controlled_lora_evidence(tmp_path):
@@ -387,8 +498,9 @@ def test_invocation_project_and_import_path_match_manifest_and_phase(tmp_path, m
     assert invocation['working_directory'] == str(captured['working_directory'])
 
 
-def test_real_admission_publishes_gpu_certificate_and_continuation_reuses_it(tmp_path, monkeypatch):
-    manifest_path, manifest, row, path, _ = gpu_allocation(tmp_path)
+@pytest.mark.parametrize('direct', [False, True])
+def test_real_admission_publishes_gpu_certificate_and_continuation_reuses_it(tmp_path, monkeypatch, direct):
+    manifest_path, manifest, row, path, _ = (direct_allocation if direct else gpu_allocation)(tmp_path)
     row['phases'] = {phase: {'output': str(tmp_path / phase / 'measurement.json'),
                              'run_dir': str(tmp_path / phase / 'training')}
                      for phase in ('uninterrupted', 'split', 'resume', 'full_dose', 'zero_dose', 'production')}

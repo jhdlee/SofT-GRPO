@@ -33,6 +33,7 @@ ARM_IDS = (
     "softgrpo_math_opd_current_s11", "softgrpo_math_opd_beta0p1_s11",
 )
 PHASES = ("production", "uninterrupted", "split", "resume", "full_dose", "zero_dose")
+ADMISSION_MODES = ("diagnostics", "direct_training")
 RESOURCES = {"gpus": 4, "cpus": 56, "memory_gib": 768,
              "time_limit_seconds": 36 * 3600, "exclusive": False}
 PROLOGUE_LIMIT_SECONDS = 7200
@@ -93,6 +94,14 @@ def _options(value):
 
 def _profile(options):
     return LORA_PROFILE_ID if options is not None else PROFILE_ID
+
+
+def admission_mode(manifest: Mapping[str, Any]) -> str:
+    """Historical manifests require diagnostics; only an explicit policy skips them."""
+    mode = manifest.get("admission_mode", "diagnostics")
+    if mode not in ADMISSION_MODES:
+        raise ValueError("invalid production admission mode")
+    return mode
 
 
 def resolve_arm(identifier: str) -> study.ArmSpec:
@@ -301,7 +310,9 @@ def _seal(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
                     parent_gitlink, soft_env, hard_env, assets_manifest, training_options=None,
-                    site=None, prologue_limit_seconds=None) -> dict[str, Any]:
+                    site=None, prologue_limit_seconds=None, admission_mode="diagnostics") -> dict[str, Any]:
+    if admission_mode not in ADMISSION_MODES:
+        raise ValueError("invalid production admission mode")
     options = _options(training_options)
     profile_id = _profile(options)
     for name, value in (("parent_commit", parent_commit), ("fork_commit", fork_commit), ("parent_gitlink", parent_gitlink)):
@@ -352,6 +363,8 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
     }
     if site is not None:
         base["site"] = site
+    if admission_mode != "diagnostics":
+        base["admission_mode"] = admission_mode
     if options is not None:
         base.update(training_options=options.as_manifest(), runtime_manifest=runtime_manifest,
                     runtime_package_pins={kind: dict(SHARED_RUNTIME_PINS) for kind in ("soft", "hard")})
@@ -366,6 +379,8 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
                            assets_manifest["manifest_content_sha256"], str(run_root), str(environment), contract]
         if site is not None:
             identity_inputs.append({"site": site, "prologue_limit_seconds": prologue_limit_seconds})
+        if admission_mode != "diagnostics":
+            identity_inputs.append({"admission_mode": admission_mode})
         identity = canonical_sha256(identity_inputs)
         phases = {phase: phase_metadata(identifier, run_root, phase) for phase in PHASES}
         production = production_overrides(identifier, assets_root, run_root, source_root=source_root,
@@ -386,14 +401,15 @@ def _build_manifest(*, assets_root, study_root, source_root, parent_commit, fork
 
 def build_manifest(*, assets_root, study_root, source_root, parent_commit, fork_commit,
                    soft_env, hard_env, parent_gitlink=None, training_options=None,
-                   site=None, prologue_limit_seconds=None) -> dict[str, Any]:
+                   site=None, prologue_limit_seconds=None, admission_mode="diagnostics") -> dict[str, Any]:
     assets = qwen_training.verify(assets_root)
     _verify_source(_absolute(source_root), parent_commit, fork_commit)
     return _build_manifest(assets_root=assets_root, study_root=study_root, source_root=source_root,
                            parent_commit=parent_commit, fork_commit=fork_commit,
                            parent_gitlink=fork_commit if parent_gitlink is None else parent_gitlink,
                            soft_env=soft_env, hard_env=hard_env, assets_manifest=assets,
-                           training_options=training_options, site=site, prologue_limit_seconds=prologue_limit_seconds)
+                           training_options=training_options, site=site, prologue_limit_seconds=prologue_limit_seconds,
+                           admission_mode=admission_mode)
 
 
 def _write_immutable(path: Path, payload: Mapping[str, Any]) -> None:
@@ -455,7 +471,8 @@ def verify_manifest(path: Path | str, *, verify_assets: bool = True, verify_sour
     expected = _build_manifest(**{key: manifest[key] for key in ("assets_root", "study_root", "source_root", "parent_commit", "fork_commit", "parent_gitlink")},
                                soft_env=manifest["runtime_environments"]["soft"], hard_env=manifest["runtime_environments"]["hard"], assets_manifest=assets,
                                training_options=manifest.get("training_options"), site=manifest.get("site"),
-                               prologue_limit_seconds=manifest["prologue_limit_seconds"])
+                               prologue_limit_seconds=manifest["prologue_limit_seconds"],
+                               admission_mode=admission_mode(manifest))
     if manifest != expected:
         raise ValueError("production manifest differs from the source/profile/asset contract")
     for arm in manifest["arms"]:
@@ -515,6 +532,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_argument("--wandb-entity", help="explicit W&B account/team; H200 default uses the authenticated user")
     sub.add_argument("--prologue-limit-seconds", type=int, choices=(7200, 10800),
                      help="seal a reviewed startup budget; H200 defaults to 10800 seconds")
+    sub.add_argument("--admission-mode", choices=ADMISSION_MODES, default="diagnostics",
+                     help="seal direct_training to skip diagnostic runs while retaining allocation/runtime checks")
     for name in ("verify", "overrides", "command"):
         sub = commands.add_parser(name)
         sub.add_argument("--manifest", type=Path, required=True)
