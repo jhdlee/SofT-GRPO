@@ -34,7 +34,7 @@ def test_revised_profile_composes_native_training_and_independent_reference_kl(t
     assert config.trainer.training_profile == production.LORA_PROFILE_ID
     assert config.trainer.checkpoint_semantics == config.actor_rollout_ref.checkpoint_semantics == "qwen_semantic_v1"
     assert dict(config.trainer.resource_policy) == {
-        "mode": "physical_device_v1", "max_device_used_fraction": 0.98,
+        "mode": "physical_device_monitor_v1", "max_device_used_fraction": 0.98,
         "sample_interval_seconds": 0.1,
     }
     assert config.actor_rollout_ref.model.lora_rank == (32 if finetuning == "lora" else 0)
@@ -63,7 +63,9 @@ def test_revised_prologue_inherits_lora_and_kl_options(tmp_path, arm):
         assert results[phase]["actor_rollout_ref.model.lora_alpha"] == 32
         assert not results[phase]["actor_rollout_ref.actor.use_kl_loss"]
         assert results[phase]["trainer.total_training_steps"] is None
-        assert results[phase]["trainer.resource_policy.mode"] == "physical_device_v1"
+        assert results[phase]["trainer.resource_policy.mode"] == (
+            "physical_device_monitor_v1" if phase == "production" else "physical_device_v1"
+        )
     assert not results["zero_dose"]["algorithm.opd.enabled"]
     assert results["full_dose"]["algorithm.opd.schedule"] == "constant"
     assert results["full_dose"]["algorithm.opd.beta_base"] == production.resolve_arm(arm).beta_base

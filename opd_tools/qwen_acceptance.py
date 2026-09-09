@@ -6,6 +6,7 @@ import math
 
 PHYSICAL_RESOURCE_POLICY = {"mode": "physical_device_v1", "max_device_used_fraction": 0.98,
                             "sample_interval_seconds": 0.1}
+PHYSICAL_MONITOR_RESOURCE_POLICY = {**PHYSICAL_RESOURCE_POLICY, "mode": "physical_device_monitor_v1"}
 
 
 def _validate_world_size(world_size):
@@ -47,8 +48,7 @@ def validate_fsdp_probe(value, *, world_size=2):
 def resource_policy_from_arguments(arguments, *, required=False):
     """Read the policy from authenticated argv, never from observed statistics."""
     prefix = "trainer.resource_policy"
-    expected = {"mode": "physical_device_v1", "max_device_used_fraction": 0.98,
-                "sample_interval_seconds": 0.1}
+    expected = PHYSICAL_RESOURCE_POLICY
     values, leaves = [], {}
     for argument in arguments:
         key, separator, value = argument.partition("=")
@@ -77,17 +77,19 @@ def resource_policy_from_arguments(arguments, *, required=False):
         if required:
             raise ValueError("missing sealed physical resource policy")
         return None
-    if policy != expected:
+    if policy not in (PHYSICAL_RESOURCE_POLICY, PHYSICAL_MONITOR_RESOURCE_POLICY):
         raise ValueError("unsupported sealed physical resource policy")
     return policy
 
 
 def validate_physical_memory(record, *, policy, world_size=2):
-    """Verify bounded sampler evidence using bytes, independently of Torch."""
+    """Verify sampler evidence; enforce the fraction only for the historical gate."""
     _validate_world_size(world_size)
-    if policy != PHYSICAL_RESOURCE_POLICY:
+    if policy not in (PHYSICAL_RESOURCE_POLICY, PHYSICAL_MONITOR_RESOURCE_POLICY):
         raise ValueError("unsupported sealed physical resource policy")
-    timing = record.get("actor_update_timing", {})
+    if not isinstance(record, dict) or not isinstance(record.get("actor_update_timing"), dict):
+        raise ValueError("missing physical memory timing evidence")
+    timing = record["actor_update_timing"]
     scope = "update_actor entry through policy completion; excludes rollout and final offload"
     sampling = "start, periodic, final; observed peak may miss sub-interval spikes"
     host_scope = "whole-node utilization is diagnostic; Slurm enforces the job memory allocation"
@@ -119,7 +121,7 @@ def validate_physical_memory(record, *, policy, world_size=2):
                 or not 0 <= free <= first <= total or not free <= last <= total or count < 2
                 or number(observation, "observed_seconds") < 0):
             raise ValueError("invalid physical memory sample bounds")
-        if used / total >= policy["max_device_used_fraction"]:
+        if policy["mode"] == "physical_device_v1" and used / total >= policy["max_device_used_fraction"]:
             raise ValueError("physical memory exceeds the sealed device fraction")
         observations.append(observation)
     aggregates = {

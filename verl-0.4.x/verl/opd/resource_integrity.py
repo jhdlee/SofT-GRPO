@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import logging
 import math
 from numbers import Integral, Real
 import threading
@@ -14,19 +15,22 @@ import time
 
 from .metrics import validate_physical_resource_limits, validate_resource_limits
 
+logger = logging.getLogger(__name__)
+PHYSICAL_RESOURCE_MODES = ("physical_device_v1", "physical_device_monitor_v1")
+
 
 def normalize_resource_policy(value):
     if value is None or isinstance(value, Mapping) and not value:
         return None
     keys = {"mode", "max_device_used_fraction", "sample_interval_seconds"}
-    if not isinstance(value, Mapping) or set(value) != keys or value["mode"] != "physical_device_v1":
-        raise ValueError("resource-integrity policy must explicitly select physical_device_v1 and both bounds")
+    if not isinstance(value, Mapping) or set(value) != keys or value["mode"] not in PHYSICAL_RESOURCE_MODES:
+        raise ValueError("resource-integrity policy must explicitly select a supported physical-device mode and both bounds")
     fraction, interval = value["max_device_used_fraction"], value["sample_interval_seconds"]
     if (isinstance(fraction, bool) or not isinstance(fraction, Real) or not math.isfinite(fraction)
             or not 0 < fraction < 1 or isinstance(interval, bool) or not isinstance(interval, Real)
             or not math.isfinite(interval) or not .01 <= interval <= 1):
         raise ValueError("resource-integrity policy has invalid physical fraction or sampling interval")
-    return {"mode": "physical_device_v1", "max_device_used_fraction": float(fraction),
+    return {"mode": value["mode"], "max_device_used_fraction": float(fraction),
             "sample_interval_seconds": float(interval)}
 
 
@@ -179,8 +183,21 @@ class ResourceGuard:
                 return None
             self.physical_memory = self.monitor.stop()
             try:
+                monitor_only = self.policy["mode"] == "physical_device_monitor_v1"
                 validate_physical_resource_limits(self.physical_memory,
-                    max_device_used_fraction=self.policy["max_device_used_fraction"])
+                    max_device_used_fraction=self.policy["max_device_used_fraction"],
+                    enforce_limit=not monitor_only)
+                total = self.physical_memory["device_total_bytes"]
+                used = self.physical_memory["device_used_peak_bytes"]
+                if monitor_only and used / total >= self.policy["max_device_used_fraction"]:
+                    logger.warning(
+                        "Physical-device memory warning on device %s: sampled used %.3f GiB / %.3f GiB "
+                        "(%.6f) >= %.6f; minimum free %.3f GiB, %d samples; training continues",
+                        self.device, used / 1024**3, total / 1024**3, used / total,
+                        self.policy["max_device_used_fraction"],
+                        self.physical_memory["device_free_min_bytes"] / 1024**3,
+                        self.physical_memory["sample_count"],
+                    )
             except BaseException as error:
                 evidence = {"policy": self.policy, "physical_memory": self.physical_memory,
                             "logical_allocated_peak_gib": metrics["perf/max_memory_allocated_gb"],

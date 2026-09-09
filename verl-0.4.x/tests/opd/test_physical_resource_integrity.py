@@ -12,6 +12,7 @@ from verl.opd.resource_integrity import PhysicalMemorySampler, ResourceGuard, no
 from test_actor_update_timing import Config, Data, Sharding, Timer, load_worker_method
 
 POLICY = {"mode": "physical_device_v1", "max_device_used_fraction": .98, "sample_interval_seconds": .1}
+MONITOR_POLICY = {**POLICY, "mode": "physical_device_monitor_v1"}
 
 
 @pytest.mark.parametrize("value", [None, {}])
@@ -24,6 +25,19 @@ def test_absent_policy_preserves_legacy(value):
     {"sample_interval_seconds": 0}, {"sample_interval_seconds": float("inf")}, {"extra": 1}])
 def test_policy_rejects_unbounded_or_ambiguous_settings(changes):
     with pytest.raises(ValueError): normalize_resource_policy({**POLICY, **changes})
+
+
+def test_monitor_policy_keeps_its_explicit_mode_and_sampling_contract():
+    assert normalize_resource_policy(MONITOR_POLICY) == MONITOR_POLICY
+
+
+@pytest.mark.parametrize("changes", [{"device_total_bytes": float("nan")}, {"device_used_peak_bytes": 101},
+    {"device_free_min_bytes": 0}, {"sample_count": 1}, {"sample_count": 2.0}, {"device_used_peak_bytes": True}])
+def test_monitor_only_validation_still_rejects_malformed_telemetry(changes):
+    observed = {"device_total_bytes": 100, "device_used_peak_bytes": 99,
+                "device_free_min_bytes": 1, "sample_count": 2, **changes}
+    with pytest.raises(RuntimeError, match="invalid sampled memory evidence"):
+        validate_physical_resource_limits(observed, max_device_used_fraction=.98, enforce_limit=False)
 
 
 def test_sampler_observes_transient_pressure_between_entry_and_exit():
@@ -151,6 +165,42 @@ def test_logical_oversubscription_and_whole_node_host_usage_are_diagnostic(cpu_c
     assert all(row["physical_memory"]["sample_count"] >= 2 for row in timing["ranks"])
 
 
+@pytest.mark.parametrize("minimum_free", [2, 1, 0])
+def test_monitor_warning_preserves_peak_and_allows_scheduler_offload_and_next_update(cpu_cuda, monkeypatch, caplog, minimum_free):
+    from verl.opd.chat import QWEN3_TRAINING_PROFILE
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (minimum_free if device else 40, 100))
+    events = []; exchanges = Exchanges()
+    workers = [worker(rank, exchanges, events, policy=MONITOR_POLICY, profile=QWEN3_TRAINING_PROFILE) for rank in range(2)]
+    outputs, errors = run_ranks([item[1] for item in workers])
+    assert errors == [None, None]
+    assert sum(event[1] == "scheduler" for event in events) == 2
+    assert sum(event[1] == "offload" for event in events) == 2
+    assert not any(getattr(item[0], "_opd_resource_failure", None) for item in workers)
+    timing = outputs[0].meta_info["actor_update_timing"]
+    assert timing["resource_policy"] == MONITOR_POLICY
+    assert timing["physical_device_used_fraction_peak"] == (100 - minimum_free) / 100
+    assert timing["ranks"][1]["physical_memory"]["device_free_min_bytes"] == minimum_free
+    assert "Physical-device memory warning on device 1" in caplog.text
+    assert "training continues" in caplog.text
+    caplog.clear()
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (40, 100))
+    outputs, errors = run_ranks([item[1] for item in workers])
+    assert errors == [None, None]
+    assert outputs[0].meta_info["actor_update_timing"]["physical_device_used_fraction_peak"] == .6
+    assert sum(event[1] == "scheduler" for event in events) == 4
+    assert sum(event[1] == "offload" for event in events) == 4
+    assert not caplog.records
+
+
+def test_monitor_mode_retains_collective_nonfinite_metric_failure(cpu_cuda):
+    events = []; exchanges = Exchanges()
+    workers = [worker(rank, exchanges, events, policy=MONITOR_POLICY, metrics_error=rank == 1) for rank in range(2)]
+    _, errors = run_ranks([item[1] for item in workers])
+    assert all(isinstance(error, RuntimeError) and "finite nonnegative metric" in str(error) for error in errors)
+    assert not any(event[1] in ("scheduler", "offload") for event in events)
+    assert all(getattr(item[0], "_opd_resource_failure", None) for item in workers)
+
+
 @pytest.mark.parametrize("fault", ["physical", "metric", "legacy"])
 def test_one_rank_resource_failure_collectively_blocks_scheduler_and_offload(cpu_cuda, monkeypatch, fault):
     if fault == "physical":
@@ -182,12 +232,15 @@ def test_one_rank_start_failure_blocks_all_optimizers(cpu_cuda, monkeypatch, fau
     assert not events
 
 
-def test_actor_failure_keeps_original_error_and_stops_sampler(cpu_cuda):
-    obj = SimpleNamespace(config=Config(resource_policy=POLICY, rollout_integrity={"enabled": True}))
+@pytest.mark.parametrize("policy", [POLICY, MONITOR_POLICY])
+@pytest.mark.parametrize("failure", [RuntimeError("original actor failure"), torch.cuda.OutOfMemoryError("CUDA out of memory")])
+def test_actor_failure_keeps_original_error_and_stops_sampler(cpu_cuda, policy, failure):
+    obj = SimpleNamespace(config=Config(resource_policy=policy, rollout_integrity={"enabled": True}))
     dist = SimpleNamespace(is_initialized=lambda: False)
     guard = ResourceGuard(obj, distributed=dist, device=0)
-    with pytest.raises(RuntimeError, match="original actor failure"):
-        with guard: raise RuntimeError("original actor failure")
+    with pytest.raises(type(failure)) as raised:
+        with guard: raise failure
+    assert raised.value is failure
     assert guard.monitor.stopped and not guard.monitor.thread.is_alive()
 
 

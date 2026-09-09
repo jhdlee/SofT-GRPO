@@ -101,13 +101,15 @@ def test_production_admission_rejects_changed_recipe_and_policies(tmp_path, key,
 
 
 @pytest.mark.parametrize("owner", ["trainer", "actor_rollout_ref"])
+@pytest.mark.parametrize("phase", ["production", "uninterrupted"])
 @pytest.mark.parametrize("policy", [None, {}, {"mode": "legacy_allocator_v1"},
     {"mode": "physical_device_v1", "max_device_used_fraction": 1.0, "sample_interval_seconds": 0.1},
     {"mode": "physical_device_v1", "max_device_used_fraction": 0.98, "sample_interval_seconds": 10.0}])
-def test_revised_profile_rejects_missing_or_changed_resource_policy(tmp_path, owner, policy):
-    trainer = trainer_stub(tmp_path)
+def test_revised_profile_rejects_missing_or_changed_resource_policy(tmp_path, owner, policy, phase):
+    trainer = trainer_stub(tmp_path, phase)
     trainer.config.trainer.training_profile = "qwen3-math-seven-arm-lora-fa3-v1"
-    expected = {"mode": "physical_device_v1", "max_device_used_fraction": 0.98, "sample_interval_seconds": 0.1}
+    expected = {"mode": "physical_device_monitor_v1" if phase == "production" else "physical_device_v1",
+                "max_device_used_fraction": 0.98, "sample_interval_seconds": 0.1}
     trainer.config.trainer.resource_policy = expected
     trainer.config.actor_rollout_ref.resource_policy = expected
     if policy is None:
@@ -119,16 +121,34 @@ def test_revised_profile_rejects_missing_or_changed_resource_policy(tmp_path, ow
     assert not (tmp_path / "measurement.json").exists()
 
 
-def test_revised_profile_records_independent_physical_resource_policy(tmp_path):
-    trainer = trainer_stub(tmp_path)
+@pytest.mark.parametrize("phase", ["production", "uninterrupted"])
+def test_revised_profile_records_independent_physical_resource_policy(tmp_path, phase):
+    trainer = trainer_stub(tmp_path, phase)
     trainer.config.trainer.training_profile = "qwen3-math-seven-arm-lora-fa3-v1"
-    expected = {"mode": "physical_device_v1", "max_device_used_fraction": 0.98, "sample_interval_seconds": 0.1}
+    expected = {"mode": "physical_device_monitor_v1" if phase == "production" else "physical_device_v1",
+                "max_device_used_fraction": 0.98, "sample_interval_seconds": 0.1}
     trainer.config.trainer.resource_policy = expected
     trainer.config.actor_rollout_ref.resource_policy = expected
     attach_production_recorder(trainer)
     measured = json.loads((tmp_path / "measurement.json").read_text())
     assert measured["acceptance_policy"]["resource_policy"] == expected
     assert measured["acceptance_policy"]["optimizer_clip_norm"] == 1.0
+
+
+@pytest.mark.parametrize("phase", ["production", "uninterrupted"])
+@pytest.mark.parametrize("owner", ["trainer", "actor_rollout_ref"])
+def test_revised_profile_rejects_wrong_memory_enforcement_mode(tmp_path, phase, owner):
+    trainer = trainer_stub(tmp_path, phase)
+    trainer.config.trainer.training_profile = "qwen3-math-seven-arm-lora-fa3-v1"
+    mode = "physical_device_monitor_v1" if phase == "production" else "physical_device_v1"
+    policy = {"mode": mode, "max_device_used_fraction": .98, "sample_interval_seconds": .1}
+    trainer.config.trainer.resource_policy = policy
+    trainer.config.actor_rollout_ref.resource_policy = policy
+    trainer.config[owner].resource_policy.mode = (
+        "physical_device_v1" if phase == "production" else "physical_device_monitor_v1"
+    )
+    with pytest.raises(ValueError, match="physical-device resource policy"):
+        attach_production_recorder(trainer)
 
 
 def test_recorder_does_not_overwrite_a_prior_invocation(tmp_path):

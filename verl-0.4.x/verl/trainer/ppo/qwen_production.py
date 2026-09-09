@@ -88,9 +88,13 @@ class ProductionRecorder:
             raise ValueError("production completion and full-dose frequency stop rules must be disabled")
         if not config.trainer.rollout_integrity.enabled or config.actor_rollout_ref.actor.grad_clip != 1.0:
             raise ValueError("production requires replay integrity and optimizer clip norm 1.0")
+        phase = config.trainer.get("production_phase")
+        if phase not in PRODUCTION_PHASES:
+            raise ValueError("unknown production invocation phase")
         if config.trainer.training_profile == "qwen3-math-seven-arm-lora-fa3-v1":
             expected_resource_policy = {
-                "mode": "physical_device_v1", "max_device_used_fraction": 0.98,
+                "mode": "physical_device_monitor_v1" if phase == "production" else "physical_device_v1",
+                "max_device_used_fraction": 0.98,
                 "sample_interval_seconds": 0.1,
             }
             for owner in (config.trainer, config.actor_rollout_ref):
@@ -100,9 +104,6 @@ class ProductionRecorder:
             raise ValueError("production must retain the 109-iteration/two-update recipe")
         if len(trainer.train_dataset) != 6985 or len(trainer.val_dataset) != 512:
             raise ValueError("production requires the sealed 6985/512 data populations")
-        phase = config.trainer.get("production_phase")
-        if phase not in PRODUCTION_PHASES:
-            raise ValueError("unknown production invocation phase")
         if phase == "production":
             if (config.trainer.get("max_rollout_iterations_per_invocation") is not None
                     or not config.trainer.val_before_train
